@@ -1,0 +1,153 @@
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "Organization",
+      "@id": "https://vertexrank.vercel.app/#organization",
+      "name": "VertexRank",
+      "url": "https://vertexrank.vercel.app/",
+      "logo": {
+        "@type": "ImageObject",
+        "url": "https://vertexrank.vercel.app/assets/img/icon-512.png",
+        "width": 512,
+        "height": 512
+      },
+      "sameAs": [
+        "https://github.com/atinocaro01-rgb/VertexRank"
+      ]
+    },
+    {
+      "@type": "WebSite",
+      "@id": "https://vertexrank.vercel.app/#website",
+      "url": "https://vertexrank.vercel.app/",
+      "name": "VertexRank",
+      "description": "Audit your site, find keyword opportunities and get cited by AI answers. VertexRank brings SEO, AEO and GEO together in one dashboard.",
+      "inLanguage": "en",
+      "publisher": {
+        "@id": "https://vertexrank.vercel.app/#organization"
+      }
+    },
+    {
+      "@type": "WebPage",
+      "@id": "https://vertexrank.vercel.app/#webpage",
+      "url": "https://vertexrank.vercel.app/",
+      "name": "VertexRank \u2013 AI SEO, AEO & GEO Optimization Platform",
+      "description": "Audit your site, find keyword opportunities and get cited by AI answers. VertexRank brings SEO, AEO and GEO together in one dashboard.",
+      "inLanguage": "en",
+      "isPartOf": {
+        "@id": "https://vertexrank.vercel.app/#website"
+      },
+      "about": {
+        "@id": "https://vertexrank.vercel.app/#software"
+      },
+      "primaryImageOfPage": {
+        "@type": "ImageObject",
+        "url": "https://vertexrank.vercel.app/assets/img/og-image.png",
+        "width": 1200,
+        "height": 630
+      }
+    },
+    {
+      "@type": "SoftwareApplication",
+      "@id": "https://vertexrank.vercel.app/#software",
+      "name": "VertexRank",
+      "url": "https://vertexrank.vercel.app/",
+      "applicationCategory": "BusinessApplication",
+      "operatingSystem": "Web",
+      "browserRequirements": "Requires JavaScript",
+      "description": "VertexRank is an AI-powered SEO, AEO and GEO optimization platform that audits your website and recommends how to rank in search and be cited in AI answers.",
+      "featureList": [
+        "SEO Audit",
+        "Action Center",
+        "Keyword Intelligence",
+        "AEO",
+        "GEO / AI Visibility",
+        "Competitors",
+        "Content Planner",
+        "Internal Links",
+        "Backlink Radar"
+      ],
+      "publisher": {
+        "@id": "https://vertexrank.vercel.app/#organization"
+      }
+    },
+    {
+      "@type": "FAQPage",
+      "@id": "https://vertexrank.vercel.app/#faq",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "What is VertexRank?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "VertexRank is an AI-powered SEO, AEO and GEO optimization platform. You add a website, run a scan, and get an audit plus recommendations that cover traditional search, answer engines and generative AI."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What is AEO (answer engine optimization)?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "AEO is the practice of structuring your content so search engines and assistants can pull a direct answer from it, for example in featured snippets, voice results and AI summaries. It usually means clear questions and answers, concise definitions, strong headings and structured data."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What is GEO (generative engine optimization)?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "GEO focuses on being mentioned and cited in answers written by generative AI tools such as ChatGPT, Gemini and Perplexity. It relies on clear entities, authoritative content and consistent signals about who you are and what you do. The GEO / AI Visibility module in VertexRank helps you work on this."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "How is VertexRank different from a traditional SEO tool?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Many SEO tools stop at rankings, keywords and backlinks. VertexRank covers those too, and adds AEO and GEO so you can also optimize for direct answers and AI citations, all in the same workspace."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "What does the SEO audit check?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "The SEO audit scans the website you add for technical and on-page issues and explains each one in plain language. Findings feed into the Action Center so you can turn them into tasks."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Do I need to install anything?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "No. VertexRank runs in your browser. Open the dashboard, add a website and run your first scan."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Where is my data stored?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Your workspace is saved in your browser, and you can remove it at any time with the Clear all data option in the sidebar. Read the privacy policy for details."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Can I share results with my team?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "Yes. Pages with analysis have a Copy all button that copies everything on the page as Markdown, and the dashboard has Copy full report, which combines every page into one document. Individual cards also have their own copy buttons."
+          }
+        },
+        {
+          "@type": "Question",
+          "name": "Where can I follow development or report a problem?",
+          "acceptedAnswer": {
+            "@type": "Answer",
+            "text": "VertexRank is developed on GitHub. Open an issue there to report a bug, ask a question or suggest a feature."
+          }
+        }
+      ]
+    }
+  ]
+}

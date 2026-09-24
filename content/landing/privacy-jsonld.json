@@ -1,0 +1,32 @@
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Home",
+          "item": "https://vertexrank.vercel.app/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Privacy policy",
+          "item": "https://vertexrank.vercel.app/privacy"
+        }
+      ]
+    },
+    {
+      "@type": "WebPage",
+      "@id": "https://vertexrank.vercel.app/privacy#webpage",
+      "url": "https://vertexrank.vercel.app/privacy",
+      "name": "Privacy policy",
+      "isPartOf": {
+        "@id": "https://vertexrank.vercel.app/#website"
+      },
+      "inLanguage": "en"
+    }
+  ]
+}

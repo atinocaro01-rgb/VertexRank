@@ -1,0 +1,25 @@
+# VertexRank
+
+> VertexRank is an AI-powered SEO, AEO and GEO optimization platform. Add a website, run a scan, and get a technical and on-page SEO audit plus recommendations for ranking in search, earning direct answers and being cited by generative AI.
+
+## Key pages
+
+- [Home](https://vertexrank.vercel.app/): What VertexRank does, how it works, the nine analysis modules and answers to common questions
+- [Privacy policy](https://vertexrank.vercel.app/privacy): How data is handled on the website and in the app
+- [Terms of service](https://vertexrank.vercel.app/terms): Terms for using the website and app
+
+## Modules
+
+- SEO Audit: Scan your site for technical and on-page issues and see exactly what to fix, explained in plain language.
+- Action Center: Turn audit findings and recommendations into a clear list of actions you can work through and copy into your tracker.
+- Keyword Intelligence: Find keyword opportunities worth targeting, with analysis that shows where you can realistically gain ground.
+- AEO: Answer engine optimization: shape your content so search engines and assistants can pull direct answers from it.
+- GEO / AI Visibility: See how visible your brand and entities are in generative AI answers, and get recommendations to be cited more often.
+- Competitors: Compare your site with competitors to spot gaps in content and keywords you can close.
+- Content Planner: Get content ideas built from your keyword and competitor insights, ready to copy into your editorial plan.
+- Internal Links: Find internal linking improvements that help visitors and crawlers reach the pages that matter.
+- Backlink Radar: Keep an eye on your backlinks and spot link opportunities worth pursuing.
+
+## Project
+
+- [VertexRank on GitHub](https://github.com/atinocaro01-rgb/VertexRank): Source code and issue tracker
