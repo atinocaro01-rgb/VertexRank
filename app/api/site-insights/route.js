@@ -1,35 +1,16 @@
 import { callOpenRouterJson } from "../../../lib/openrouter";
-import { crawlSite } from "../../../lib/siteCrawler";
-import { extractKeywordCandidates, computeAeoSignals, computeGeoSignals, scoreFromFlags } from "../../../lib/textIntelligence";
-import { aggregateSiteFlags } from "../../../lib/siteSignals";
+import { truncate } from "../../../lib/textIntelligence";
 
-// Site-wide competitor analysis: crawls the COMPETITOR's whole site (the
-// client's own site should already have been crawled via /api/site-scan and
-// is passed in as `ourCrawl`) and compares them — content gaps, topic
-// overlap, AEO/GEO differences, and opportunities. The single-page
-// /api/competitor-scan route already does a lighter version of this for one
-// page each; this is the full-site version.
-//
-// Time budget: this route does its OWN crawl (of the competitor) inside an
-// already-60s-limited function, so the competitor crawl gets a tighter
-// internal budget than /api/site-scan's default, leaving real headroom for
-// the AI comparison call afterward.
+// Site-wide counterpart to /api/ai-insights: instead of reasoning about one
+// scanned page, this reads the full-site crawl (every page's real technical/
+// on-page issues, already computed deterministically by lib/siteCrawler.js)
+// plus whichever other site-wide modules (AEO, GEO, keyword clustering,
+// internal linking) have already been run, and writes ONE executive summary
+// across all of it. It's a roll-up of real, already-computed findings —
+// never a fresh guess at facts the crawl and other modules didn't produce.
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
-
-const AEO_WEIGHTS = { hasFaqSchema: 18, hasHowToSchema: 6, hasQaSchema: 6, hasAnySchema: 8, hasListMarkup: 10, hasTableMarkup: 6, hasMultipleHeadings: 12, hasQuestionHeading: 12, hasDirectAnswerParagraph: 10, hasExistingQuestionsInBody: 6, contentDepthOk: 6 };
-const GEO_WEIGHTS = { hasOrganizationSchema: 16, hasProductOrServiceSchema: 10, hasArticleOrAuthorSchema: 6, hasContactSignal: 12, hasAboutSignal: 12, hasLocationSignal: 10, hasAudienceSignal: 10, hasCredentialSignal: 8, hasSocialProofSignal: 10, hasPolicySignal: 4, hasClearProductNaming: 2 };
-
-function topicSet(pages, limit) {
-  const scores = new Map();
-  for (const page of pages) {
-    for (const c of extractKeywordCandidates(page, 30)) {
-      scores.set(c.keyword, (scores.get(c.keyword) || 0) + (c.score || 0));
-    }
-  }
-  return new Map([...scores.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit));
-}
 
 export async function POST(req) {
   let body;
@@ -39,106 +20,75 @@ export async function POST(req) {
     return Response.json({ error: "Invalid request." }, { status: 400 });
   }
 
-  const { competitorUrl, ourCrawl } = body || {};
-  if (!competitorUrl?.trim()) return Response.json({ error: "A competitor URL is required." }, { status: 400 });
-  if (!ourCrawl?.pages?.length) return Response.json({ error: "Crawl your own site first before comparing competitors." }, { status: 400 });
-
-  const competitorCrawl = await crawlSite(competitorUrl, { maxPages: 25, timeBudgetMs: 35000 });
-  if (competitorCrawl.error) return Response.json({ error: competitorCrawl.error }, { status: 400 });
-  if (competitorCrawl.pagesCrawled === 0) {
-    return Response.json({ error: "Couldn't reach any pages on the competitor's site. Check the URL and try again." }, { status: 502 });
+  const { crawl, siteAeoAnalysis, siteGeoAnalysis, siteKeywordClusters, internalLinkRecs } = body || {};
+  if (!crawl?.domain || !Array.isArray(crawl.pages)) {
+    return Response.json({ error: "A full-site crawl is required. Run one from Websites first." }, { status: 400 });
   }
 
-  // ---- deterministic, site-wide comparison (no AI) ----
-  const ourTopics = topicSet(ourCrawl.pages, 60);
-  const competitorTopics = topicSet(competitorCrawl.pages, 60);
-  const sharedTopics = [...competitorTopics.keys()].filter((k) => ourTopics.has(k));
-  const competitorOnlyTopics = [...competitorTopics.keys()].filter((k) => !ourTopics.has(k));
-  const ourOnlyTopics = [...ourTopics.keys()].filter((k) => !competitorTopics.has(k));
+  const sw = crawl.siteWide || {};
+  const homepage = crawl.pages.find((p) => p.url === crawl.startUrl) || crawl.pages[0] || {};
 
-  const ourAeo = aggregateSiteFlags(ourCrawl.pages, computeAeoSignals);
-  const compAeo = aggregateSiteFlags(competitorCrawl.pages, computeAeoSignals);
-  const ourGeo = aggregateSiteFlags(ourCrawl.pages, computeGeoSignals);
-  const compGeo = aggregateSiteFlags(competitorCrawl.pages, computeGeoSignals);
+  const recurringIssuesList = (sw.recurringIssues || [])
+    .slice(0, 8)
+    .map((i) => `- [${i.severity}] ${i.title} — affects ${i.count} pages — ${i.why}`)
+    .join("\n") || "(none found)";
 
-  const ourSchema = [...new Set(ourCrawl.pages.flatMap((p) => p.schemaTypes || []))];
-  const compSchema = [...new Set(competitorCrawl.pages.flatMap((p) => p.schemaTypes || []))];
+  const siteLevelFacts = [
+    sw.orphanPages?.length ? `${sw.orphanPages.length} orphan page(s) with no internal links pointing to them` : null,
+    sw.weakLinkedPages?.length ? `${sw.weakLinkedPages.length} page(s) with only one internal link pointing to them` : null,
+    sw.duplicateTitles?.length ? `${sw.duplicateTitles.length} group(s) of pages sharing a duplicate title` : null,
+    sw.duplicateMetaDescriptions?.length ? `${sw.duplicateMetaDescriptions.length} group(s) of pages sharing a duplicate meta description` : null,
+    sw.nearDuplicateContentPairs?.length ? `${sw.nearDuplicateContentPairs.length} pair(s) of near-duplicate content pages` : null,
+  ].filter(Boolean).join("; ") || "none detected";
 
-  const avgWords = (pages) => (pages.length ? Math.round(pages.reduce((s, p) => s + (p.wordCount || 0), 0) / pages.length) : 0);
-  const orphanRatio = (crawl) => (crawl.pagesCrawled ? Math.round(((crawl.siteWide?.orphanPages?.length || 0) / crawl.pagesCrawled) * 100) : 0);
+  const modulesSummary = [
+    siteAeoAnalysis ? `AEO readiness score: ${siteAeoAnalysis.readinessScore}/100. Top content gap: ${siteAeoAnalysis.contentRecommendations?.[0]?.recommendation || "none flagged"}.` : "Site-wide AEO analysis not run yet.",
+    siteGeoAnalysis ? `GEO visibility score: ${siteGeoAnalysis.visibilityScore}/100. Top opportunity: ${siteGeoAnalysis.opportunities?.[0]?.title || "none flagged"}.` : "Site-wide GEO analysis not run yet.",
+    siteKeywordClusters ? `${siteKeywordClusters.clusterCount} keyword clusters found, ${siteKeywordClusters.cannibalizationCount} with cannibalization risk.` : "Site-wide keyword clustering not run yet.",
+    internalLinkRecs ? `${internalLinkRecs.orphanPageCount} orphan / ${internalLinkRecs.weakLinkedPageCount} weakly-linked pages with recommended internal links generated.` : "Internal-link recommendations not run yet.",
+  ].join("\n");
 
-  const observed = {
-    ourDomain: ourCrawl.domain,
-    competitorDomain: competitorCrawl.domain,
-    ourPagesCrawled: ourCrawl.pages.length,
-    competitorPagesCrawled: competitorCrawl.pages.length,
-    sharedTopics: sharedTopics.slice(0, 25),
-    competitorOnlyTopics: competitorOnlyTopics.slice(0, 25),
-    ourOnlyTopics: ourOnlyTopics.slice(0, 25),
-    comparison: {
-      avgWordCount: { ours: avgWords(ourCrawl.pages), competitor: avgWords(competitorCrawl.pages) },
-      schemaTypes: { ours: ourSchema, competitor: compSchema },
-      orphanPageRatioPct: { ours: orphanRatio(ourCrawl), competitor: orphanRatio(competitorCrawl) },
-      aeoReadiness: { ours: scoreFromFlags(ourAeo.siteFlags, AEO_WEIGHTS).score, competitor: scoreFromFlags(compAeo.siteFlags, AEO_WEIGHTS).score },
-      geoVisibility: { ours: scoreFromFlags(ourGeo.siteFlags, GEO_WEIGHTS).score, competitor: scoreFromFlags(compGeo.siteFlags, GEO_WEIGHTS).score },
-    },
-  };
+  const system = `You are VertexRank AI, a precise, detail-oriented SEO analyst reasoning about an ENTIRE crawled website, not one page. You never invent facts, page counts, traffic numbers, or search volumes beyond what's given. If a module below says it hasn't been run yet, don't pretend to know its results — you can note that running it would help, but don't guess its outcome. Your tone is direct and specific, like a consultant who actually read the crawl.`;
 
-  // ---- AI layer ----
-  const system = `You are VertexRank AI comparing two real, freshly crawled websites at the site level. Everything you say must be grounded in the real observed comparison data given — topic lists, schema types, scores. You never claim to know search rankings, traffic, or backlink counts for either site, and you never invent topics not in the lists given.`;
+  const prompt = `Website: ${crawl.domain}
+Pages crawled: ${crawl.pagesCrawled} of ${crawl.pagesDiscovered} discovered (${crawl.truncated ? "crawl was truncated by the page/time limit" : "complete"})
+Site technical score: ${crawl.siteScores?.technical ?? "n/a"}/100 · Site content score: ${crawl.siteScores?.content ?? "n/a"}/100
+Homepage title: "${homepage.title || "(missing)"}"
+Homepage meta description: "${homepage.metaDescription || "(missing)"}"
+Homepage text (truncated): "${truncate(homepage.fullText, 1200)}"
 
-  const prompt = `Our site: ${ourCrawl.domain} (${ourCrawl.pages.length} pages crawled)
-Competitor: ${competitorCrawl.domain} (${competitorCrawl.pages.length} pages crawled)
+Recurring technical/on-page issues across the site:
+${recurringIssuesList}
 
-Shared topics (both sites appear to cover): ${sharedTopics.slice(0, 20).join(", ") || "(none detected)"}
-Topics only the competitor covers: ${competitorOnlyTopics.slice(0, 20).join(", ") || "(none detected)"}
-Topics only we cover: ${ourOnlyTopics.slice(0, 20).join(", ") || "(none detected)"}
+Site-structure findings: ${siteLevelFacts}
 
-Average word count per page — ours: ${observed.comparison.avgWordCount.ours}, competitor: ${observed.comparison.avgWordCount.competitor}
-Schema types used — ours: ${ourSchema.join(", ") || "none"}; competitor: ${compSchema.join(", ") || "none"}
-Orphan page rate — ours: ${observed.comparison.orphanPageRatioPct.ours}%, competitor: ${observed.comparison.orphanPageRatioPct.competitor}%
-Site-wide AEO readiness score (0-100) — ours: ${observed.comparison.aeoReadiness.ours}, competitor: ${observed.comparison.aeoReadiness.competitor}
-Site-wide GEO visibility score (0-100) — ours: ${observed.comparison.geoVisibility.ours}, competitor: ${observed.comparison.geoVisibility.competitor}
+Other site-wide modules:
+${modulesSummary}
 
-Write:
-1. A 3-4 sentence factual comparison summary grounded in the data above.
-2. Up to 8 content-gap recommendations for our site — prioritize topics the competitor covers that we don't, each with: gap, evidence (cite the real data above), recommendedAction, priority (Critical|High|Medium|Low).
-3. Up to 4 AEO/GEO-specific differences worth acting on, grounded in the score/schema comparison above.
+Do three things:
 
-Respond with ONLY a JSON object, no markdown fences, no commentary:
+1. SUMMARY: In 2-4 sentences, describe what this website/business does and who it's for, based only on the homepage content above. If there isn't enough here to say something specific, say so honestly.
+
+2. QUICK WINS: Pick the 2-4 most impactful findings from the recurring issues and site-structure findings above (not the "other site-wide modules" section, since those aren't detailed here) and write a concrete fix for each. Use "before"/"after" only when you can ground "before" in real text given above (e.g. the homepage title/description) — otherwise describe the real absence (e.g. "no canonical tag found on these pages") rather than inventing a "before".
+
+3. STRATEGIC INSIGHT: One paragraph, 120-180 words, direct and opinionated, weighing the technical/on-page findings against whichever of the other site-wide modules have actually been run (mention plainly if a relevant module hasn't been run yet and would sharpen this). No invented numbers beyond what's given above.
+
+Respond with ONLY a JSON object, no markdown code fences, no commentary, in exactly this shape:
 {
   "summary": "string",
-  "gaps": [ { "gap": "string", "evidence": "string", "recommendedAction": "string", "priority": "string" } ],
-  "aeoGeoDifferences": [ { "difference": "string", "recommendedAction": "string", "priority": "string" } ]
+  "quickWins": [
+    { "title": "string", "category": "string", "severity": "string", "why": "string", "before": "string", "after": "string" }
+  ],
+  "strategicInsight": "string"
 }`;
 
-  // The full competitor crawl (not just the derived `observed` summary) is
-  // returned alongside the comparison so the client can feed it straight
-  // into /api/backlink-opportunities to auto-discover backlink prospects
-  // from THIS competitor without a second crawl and without the user
-  // manually entering a URL anywhere — see the "Discover from this
-  // competitor" flow in the Competitors tab.
   try {
-    const interpretation = await callOpenRouterJson({ system, prompt, maxTokens: 2000, temperature: 0.5 });
-    return Response.json({
-      result: {
-        observed,
-        interpretation: {
-          summary: interpretation.summary || "",
-          gaps: (interpretation.gaps || []).map((g, idx) => ({ id: `scgap_${idx}`, ...g, source: "VertexRank AI Interpretation" })),
-          aeoGeoDifferences: (interpretation.aeoGeoDifferences || []).map((d, idx) => ({ id: `scaeo_${idx}`, ...d, source: "VertexRank AI Interpretation" })),
-        },
-        generatedAt: new Date().toISOString(),
-      },
-      competitorCrawl,
-    });
+    const insights = await callOpenRouterJson({ system, prompt, maxTokens: 2200, temperature: 0.55 });
+    if (!insights.summary || !Array.isArray(insights.quickWins) || !insights.strategicInsight) {
+      throw new Error("VertexRank AI's response was missing required fields.");
+    }
+    return Response.json({ insights });
   } catch (err) {
-    // The real crawl comparison never depended on the AI step, so it's
-    // still returned even if the interpretation call fails.
-    return Response.json({
-      result: { observed, interpretation: null, generatedAt: new Date().toISOString() },
-      warning: err.message || "VertexRank AI couldn't generate an interpretation, but the observed comparison above is real crawl data.",
-      competitorCrawl,
-    });
+    return Response.json({ error: err.message || "VertexRank AI couldn't generate site-wide insights. Try again." }, { status: 502 });
   }
 }
