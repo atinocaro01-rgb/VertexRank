@@ -2,12 +2,11 @@ import { callOpenRouterJson } from "../../../lib/openrouter";
 import { computeAeoSignals, extractExistingQuestions, scoreFromFlags, truncate } from "../../../lib/textIntelligence";
 import { aggregateSiteFlags, rankPagesByScore, samplePagesForPrompt } from "../../../lib/siteSignals";
 
-// Site-wide counterpart to /api/aeo-analysis. That route judges whether ONE
-// page answers buyer questions; this route judges whether the SITE AS A
-// WHOLE does — the same buyer question might be answered by a different
-// page than the one someone happens to be viewing, and a single-page
-// analysis has no way to see that. See lib/siteSignals.js for why "does the
-// site have X" is defined as "does ANY page have X", not an average.
+// Site-wide AEO analysis: judges whether the SITE AS A WHOLE answers buyer
+// questions — the same buyer question might be answered by a different page
+// than whichever one a naive check would look at. See lib/siteSignals.js for
+// why "does the site have X" is defined as "does ANY page have X", not an
+// average.
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
