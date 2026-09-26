@@ -1,13 +1,13 @@
 import { callOpenRouterJson } from "../../../lib/openrouter";
 import { truncate } from "../../../lib/textIntelligence";
 
-// Site-wide counterpart to /api/ai-insights: instead of reasoning about one
-// scanned page, this reads the full-site crawl (every page's real technical/
-// on-page issues, already computed deterministically by lib/siteCrawler.js)
-// plus whichever other site-wide modules (AEO, GEO, keyword clustering,
-// internal linking) have already been run, and writes ONE executive summary
-// across all of it. It's a roll-up of real, already-computed findings —
-// never a fresh guess at facts the crawl and other modules didn't produce.
+// Site-wide AI Insights: reads the full-site crawl (every page's real
+// technical/on-page issues, already computed deterministically by
+// lib/siteCrawler.js) plus whichever other site-wide modules (AEO, GEO,
+// keyword clustering, internal linking) have already been run, and writes
+// ONE executive summary across all of it. It's a roll-up of real,
+// already-computed findings — never a fresh guess at facts the crawl and
+// other modules didn't produce.
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
