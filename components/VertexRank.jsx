@@ -12,9 +12,8 @@ import {
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
 import {
   GEO_FACTORS, AEO_SIGNAL_LABELS, GEO_AUTHORITY_LABELS, PAGE_EXPORTERS, exportFullReport, buildUnifiedRecs,
-  formatRecommendation, formatCompetitor, formatContentIdea, formatIssue, formatAction,
-  sectionUnifiedRecs, sectionAiInsights, sectionEntities, sectionKeywordOpportunities, sectionKeywordTable,
-  sectionAeoRecommendations, sectionAeoQuestions, sectionGeoOpportunities, sectionSimulator, copyTextToClipboard,
+  formatRecommendation, formatCompetitor, formatContentIdea, formatAction,
+  sectionUnifiedRecs, sectionAiInsights, sectionSimulator, computeSiteAuditIssues, copyTextToClipboard,
 } from "../lib/copyExport";
 
 /* ============================== helpers ============================== */
@@ -101,6 +100,29 @@ function computeOpportunityScore(opportunities) {
 
 function sortByPriority(list) {
   return [...list].sort((a, b) => (PRIORITY_RANK[a.priority] ?? 4) - (PRIORITY_RANK[b.priority] ?? 4));
+}
+
+/** Derives a homepage-shaped content object (domain/title/meta/H1/body text)
+ *  from a full-site crawl, for the AI modules that reason about one
+ *  representative page's real text (AI Visibility Simulator, competitor
+ *  suggestions, content ideas) — VertexRank is crawl-only now, so this is the
+ *  single source those modules read from instead of a standalone page scan. */
+function siteMetaFrom(b) {
+  const crawl = b?.siteCrawl;
+  if (!crawl?.domain) return null;
+  const homepage = crawl.pages?.find((p) => p.url === crawl.startUrl) || crawl.pages?.[0];
+  if (!homepage) return { domain: crawl.domain };
+  return {
+    domain: crawl.domain, title: homepage.title, metaDescription: homepage.metaDescription,
+    h1Text: homepage.h1Text, fullText: homepage.fullText,
+  };
+}
+
+/** Flat keyword list from the site-wide keyword clusters, for AI modules
+ *  (AEO, competitor comparison) that just want known target keywords as
+ *  context. Empty until Keyword Intelligence has been run at least once. */
+function siteKeywordList(b) {
+  return (b?.siteKeywordClusters?.clusters || []).flatMap((c) => c.keywords || []);
 }
 
 /* ============================== constants ============================== */
@@ -196,26 +218,17 @@ function mapBacklinkDestinationType(destinationType) {
   }
 }
 
-/** A clean, empty per-website bundle. Technical/Content scores and issues get
- *  filled in from a real scan (see app/api/scan/route.js). AEO, GEO, and Keyword
- *  scores stay null — there's no free source for those yet — and every list
- *  starts empty so users build real data through the CRUD tools instead of
- *  seeing fabricated placeholders. */
+/** A clean, empty per-website bundle. Technical/Content scores come from the
+ *  automatic full-site crawl (see app/api/site-scan/route.js). AEO, GEO, and
+ *  Keyword scores stay null until each site-wide AI module is run, and every
+ *  list starts empty so users build real data through the CRUD tools instead
+ *  of seeing fabricated placeholders. */
 function emptyBundle() {
   return {
     scores: { overall: null, aeo: null, geo: null, technical: null, keyword: null, content: null },
-    issues: [],
-    positives: [],
-    aiInsights: null,
     keywords: [],
     aeoQuestions: [],
     geoFactors: {},
-    // Crawl-grounded AI intelligence modules (null until the user runs each
-    // analysis). Kept separate from the manual `keywords` / `aeoQuestions`
-    // trackers above so existing manually-entered data is never touched.
-    keywordIntel: null,
-    aeoAnalysis: null,
-    geoAnalysis: null,
     aiVisibility: null,
     competitorSuggestions: [],
     competitors: [],
@@ -223,11 +236,9 @@ function emptyBundle() {
     internalLinks: [],
     backlinks: [],
     actions: [],
-    scanMeta: { live: false },
-    // Site-wide (full-crawl) intelligence — all null/empty until the user runs
-    // a full-site crawl from Websites, then each module below. Kept separate
-    // from the single-page modules above so neither overwrites the other.
-    siteCrawl: null, // raw multi-page crawl (lib/siteCrawler.js output) — the shared input every site-wide module below reads from
+    // Site-wide (full-crawl) intelligence — all null/empty until the automatic
+    // full-site crawl completes, then as each AI module below is run.
+    siteCrawl: null, // raw multi-page crawl (lib/siteCrawler.js output) — the shared input every module below reads from
     siteKeywordClusters: null,
     siteAeoAnalysis: null,
     siteGeoAnalysis: null,
@@ -279,9 +290,6 @@ function loadPersistedState() {
         ...base,
         ...(b && typeof b === "object" ? b : {}),
         scores: { ...base.scores, ...(b && typeof b.scores === "object" ? b.scores : {}) },
-        scanMeta: { ...base.scanMeta, ...(b && typeof b.scanMeta === "object" ? b.scanMeta : {}) },
-        issues: Array.isArray(b?.issues) ? b.issues : [],
-        positives: Array.isArray(b?.positives) ? b.positives : [],
         keywords: Array.isArray(b?.keywords) ? b.keywords : [],
         aeoQuestions: Array.isArray(b?.aeoQuestions) ? b.aeoQuestions : [],
         competitors: Array.isArray(b?.competitors) ? b.competitors : [],
@@ -811,8 +819,8 @@ function AiFixModal({ issue, meta, onClose, onApply }) {
 /* ============================== Dashboard ============================== */
 
 /** Shared renderer for a generated AI Insights payload ({summary, quickWins,
- *  strategicInsight, generatedAt}) — used for both the site-wide and
- *  single-page tabs on the Dashboard so the two stay visually identical. */
+ *  strategicInsight, generatedAt}) — used by the Dashboard's site-wide AI
+ *  Insights card. */
 function AiInsightsBody({ data, error }) {
   return (
     <div className="space-y-5 pt-3">
@@ -862,55 +870,32 @@ function AiInsightsBody({ data, error }) {
 function Dashboard() {
   const { websites, bundle, setBundles, setView, currentWebsiteId, toast, addAction } = useApp();
   const b = bundle();
-  const [insightsTab, setInsightsTab] = useState("site");
-  const [insightsLoading, setInsightsLoading] = useState(false);
-  const [insightsError, setInsightsError] = useState("");
   const [siteInsightsLoading, setSiteInsightsLoading] = useState(false);
   const [siteInsightsError, setSiteInsightsError] = useState("");
 
   // Unified AI Recommendation Engine: merges the grounded opportunities
-  // already produced by Keyword Intelligence, AEO, and GEO (site-wide
-  // versions preferred once they've been run — see buildUnifiedRecs) into
-  // one prioritized list, each traceable back to its module and evidence.
-  // This MUST run before the early-return guard below — every hook in a
-  // component has to run on every render, or React throws "Rendered more
-  // hooks than during the previous render" (error #310) the moment
-  // currentWebsiteId flips from null to set, which happens on every reload
-  // once a website is saved.
-  const unifiedRecs = useMemo(() => buildUnifiedRecs(b, 8), [b.keywordIntel, b.aeoAnalysis, b.geoAnalysis, b.siteKeywordClusters, b.siteAeoAnalysis, b.siteGeoAnalysis]);
+  // already produced by site-wide Keyword Intelligence, AEO, and GEO (see
+  // buildUnifiedRecs) into one prioritized list, each traceable back to its
+  // module and evidence. This MUST run before the early-return guard below —
+  // every hook in a component has to run on every render, or React throws
+  // "Rendered more hooks than during the previous render" (error #310) the
+  // moment currentWebsiteId flips from null to set, which happens on every
+  // reload once a website is saved.
+  const unifiedRecs = useMemo(() => buildUnifiedRecs(b, 8), [b.siteKeywordClusters, b.siteAeoAnalysis, b.siteGeoAnalysis]);
 
   if (!currentWebsiteId) {
     return <EmptyState icon={Globe2} title="No website yet" body="Add a website — a full-site crawl starts automatically and powers the real technical and on-page audit." action={<Button icon={Plus} onClick={() => setView("scanner")}>Add a website</Button>} />;
   }
   const scores = websites.find((w) => w.id === currentWebsiteId)?.scores || {};
   const crawled = !!b.siteCrawl;
-  const scanned = !!b.scanMeta?.live;
-  const crawlIssues = (b.siteCrawl?.siteWide?.recurringIssues || []).map((e, idx) => ({ ...e, id: `dash_ci_${idx}` }));
-  const issueSource = crawlIssues.length ? crawlIssues : b.issues;
+  const issueSource = (b.siteCrawl?.siteWide?.recurringIssues || []).map((e, idx) => ({ ...e, id: `dash_ci_${idx}` }));
   const critical = issueSource.filter((i) => i.severity === "Critical" || i.severity === "High").slice(0, 4);
   const quickWins = issueSource.filter((i) => i.severity === "Low" || i.severity === "Medium").slice(0, 4);
   const recentActions = [...b.actions].sort((a, c) => new Date(c.createdAt) - new Date(a.createdAt)).slice(0, 5);
 
-  async function generateInsights() {
-    setInsightsLoading(true);
-    setInsightsError("");
-    try {
-      const data = await postJson("/api/ai-insights", { meta: b.scanMeta, issues: b.issues, positives: b.positives });
-      setBundles((prev) => {
-        const site = prev[currentWebsiteId] || emptyBundle();
-        return { ...prev, [currentWebsiteId]: { ...site, aiInsights: { ...data.insights, generatedAt: new Date().toISOString() } } };
-      });
-      toast("Insights generated by VertexRank AI");
-    } catch (err) {
-      setInsightsError(err.message || "VertexRank AI couldn't generate insights.");
-    } finally {
-      setInsightsLoading(false);
-    }
-  }
-
   // Site-wide AI Insights: rolls up the full-site crawl plus whichever
   // site-wide AEO/GEO/keyword-clustering/internal-linking modules have
-  // already been run into one executive summary. This is the default tab.
+  // already been run into one executive summary.
   async function generateSiteInsights() {
     setSiteInsightsLoading(true);
     setSiteInsightsError("");
@@ -963,7 +948,7 @@ function Dashboard() {
         <div className="flex flex-wrap items-center gap-6 justify-around">
           <div className="flex flex-col items-center gap-1">
             <ScoreDial label="Overall SEO" value={scores.overall} size={104} accent={BRAND.primary} />
-            <span className="text-[10px] font-medium" style={{ color: BRAND.inkSoft }}>{crawled ? "From Technical + Content" : scanned ? "From Technical + Content" : "Not scanned"}</span>
+            <span className="text-[10px] font-medium" style={{ color: BRAND.inkSoft }}>{crawled ? "From Technical + Content" : "Not crawled"}</span>
           </div>
           <div className="flex flex-col items-center gap-1">
             <ScoreDial label="AEO" value={scores.aeo} accent={BRAND.visibility} />
@@ -975,7 +960,7 @@ function Dashboard() {
           </div>
           <div className="flex flex-col items-center gap-1">
             <ScoreDial label="Technical" value={scores.technical} accent={BRAND.amber} />
-            <span className="text-[10px] font-medium" style={{ color: crawled ? BRAND.visibility : scanned ? BRAND.visibility : BRAND.inkSoft }}>{crawled ? "Site-wide avg." : scanned ? "Live (single page)" : "Not scanned"}</span>
+            <span className="text-[10px] font-medium" style={{ color: crawled ? BRAND.visibility : BRAND.inkSoft }}>{crawled ? "Site-wide avg." : "Not crawled"}</span>
           </div>
           <div className="flex flex-col items-center gap-1">
             <ScoreDial label="Keyword" value={scores.keyword} accent={BRAND.amber} />
@@ -983,7 +968,7 @@ function Dashboard() {
           </div>
           <div className="flex flex-col items-center gap-1">
             <ScoreDial label="Content" value={scores.content} accent={BRAND.amber} />
-            <span className="text-[10px] font-medium" style={{ color: crawled ? BRAND.visibility : scanned ? BRAND.visibility : BRAND.inkSoft }}>{crawled ? "Site-wide avg." : scanned ? "Live (single page)" : "Not scanned"}</span>
+            <span className="text-[10px] font-medium" style={{ color: crawled ? BRAND.visibility : BRAND.inkSoft }}>{crawled ? "Site-wide avg." : "Not crawled"}</span>
           </div>
         </div>
       </Card>
@@ -994,58 +979,31 @@ function Dashboard() {
             <Sparkles size={16} style={{ color: BRAND.primary }} />
             <h3 className="font-semibold vr-display">VertexRank AI Insights</h3>
           </div>
-          {(insightsTab === "site" ? b.siteInsights : b.aiInsights) && (
+          {b.siteInsights && (
             <div className="flex items-center gap-1">
-              <CopyButton label="Copy" title="Copy the AI Insights" getText={() => sectionAiInsights(insightsTab === "site" ? b.siteInsights : b.aiInsights)} />
-              <Button size="sm" variant="ghost" icon={RefreshCw} onClick={insightsTab === "site" ? generateSiteInsights : generateInsights} disabled={insightsTab === "site" ? siteInsightsLoading : insightsLoading}>
-                {(insightsTab === "site" ? siteInsightsLoading : insightsLoading) ? "Regenerating…" : "Regenerate"}
+              <CopyButton label="Copy" title="Copy the AI Insights" getText={() => sectionAiInsights(b.siteInsights)} />
+              <Button size="sm" variant="ghost" icon={RefreshCw} onClick={generateSiteInsights} disabled={siteInsightsLoading}>
+                {siteInsightsLoading ? "Regenerating…" : "Regenerate"}
               </Button>
             </div>
           )}
         </div>
-        <div className="flex gap-1 rounded-lg p-1 w-fit mt-2 mb-1" style={{ background: BRAND.canvas }}>
-          {[["site", "Site-wide"], ["page", "Single-page"]].map(([id, label]) => (
-            <button key={id} onClick={() => setInsightsTab(id)} className="vr-focus text-xs font-medium rounded-md px-2.5 py-1"
-              style={{ background: insightsTab === id ? BRAND.surface : "transparent", color: insightsTab === id ? BRAND.primary : BRAND.inkSoft, boxShadow: insightsTab === id ? `0 1px 2px rgba(0,0,0,0.06)` : "none" }}>
-              {label}
-            </button>
-          ))}
-        </div>
 
-        {insightsTab === "site" ? (
-          !crawled ? (
-            <p className="text-sm mt-2" style={{ color: BRAND.inkSoft }}>Run a full-site crawl first — from Websites (one starts automatically when you add a site).</p>
-          ) : siteInsightsLoading ? (
-            <div className="flex flex-col items-center py-8 gap-3">
-              <Loader2 className="vr-spin" size={24} style={{ color: BRAND.primary }} />
-              <p className="text-sm" style={{ color: BRAND.inkSoft }}>VertexRank AI is reading the crawl and writing site-wide insights…</p>
-            </div>
-          ) : !b.siteInsights ? (
-            <div className="pt-2">
-              <p className="text-sm mb-3" style={{ color: BRAND.inkSoft }}>VertexRank AI will read this site's real crawl results — plus any site-wide AEO, GEO, keyword-clustering, and internal-linking analyses you've already run — and write one plain-language summary, a few grounded quick wins, and strategic advice for the whole site.</p>
-              <Button icon={Sparkles} onClick={generateSiteInsights}>Generate AI Insights</Button>
-              {siteInsightsError && <p className="text-xs mt-2" style={{ color: BRAND.red }}>{siteInsightsError}</p>}
-            </div>
-          ) : (
-            <AiInsightsBody data={b.siteInsights} error={siteInsightsError} />
-          )
+        {!crawled ? (
+          <p className="text-sm mt-2" style={{ color: BRAND.inkSoft }}>Run a full-site crawl first — from Websites (one starts automatically when you add a site).</p>
+        ) : siteInsightsLoading ? (
+          <div className="flex flex-col items-center py-8 gap-3">
+            <Loader2 className="vr-spin" size={24} style={{ color: BRAND.primary }} />
+            <p className="text-sm" style={{ color: BRAND.inkSoft }}>VertexRank AI is reading the crawl and writing site-wide insights…</p>
+          </div>
+        ) : !b.siteInsights ? (
+          <div className="pt-2">
+            <p className="text-sm mb-3" style={{ color: BRAND.inkSoft }}>VertexRank AI will read this site's real crawl results — plus any site-wide AEO, GEO, keyword-clustering, and internal-linking analyses you've already run — and write one plain-language summary, a few grounded quick wins, and strategic advice for the whole site.</p>
+            <Button icon={Sparkles} onClick={generateSiteInsights}>Generate AI Insights</Button>
+            {siteInsightsError && <p className="text-xs mt-2" style={{ color: BRAND.red }}>{siteInsightsError}</p>}
+          </div>
         ) : (
-          !scanned ? (
-            <p className="text-sm mt-2" style={{ color: BRAND.inkSoft }}>Run a single-page scan first — from Websites.</p>
-          ) : insightsLoading ? (
-            <div className="flex flex-col items-center py-8 gap-3">
-              <Loader2 className="vr-spin" size={24} style={{ color: BRAND.primary }} />
-              <p className="text-sm" style={{ color: BRAND.inkSoft }}>VertexRank AI is reading the page and writing insights…</p>
-            </div>
-          ) : !b.aiInsights ? (
-            <div className="pt-2">
-              <p className="text-sm mb-3" style={{ color: BRAND.inkSoft }}>VertexRank AI will read this one page's real content and audit results, then write a plain-language summary, a few grounded quick wins, and strategic advice.</p>
-              <Button icon={Sparkles} onClick={generateInsights}>Generate AI Insights</Button>
-              {insightsError && <p className="text-xs mt-2" style={{ color: BRAND.red }}>{insightsError}</p>}
-            </div>
-          ) : (
-            <AiInsightsBody data={b.aiInsights} error={insightsError} />
-          )
+          <AiInsightsBody data={b.siteInsights} error={siteInsightsError} />
         )}
       </Card>
 
@@ -1085,7 +1043,7 @@ function Dashboard() {
             <h3 className="font-semibold vr-display">Opportunity by area</h3>
             <span className="text-xs" style={{ color: BRAND.inkSoft }}>Points available · Technical &amp; Content only</span>
           </div>
-          {crawled || scanned ? (
+          {crawled ? (
             <ResponsiveContainer width="100%" height={220}>
               <BarChart data={oppData} margin={{ left: -20 }}>
                 <CartesianGrid vertical={false} stroke={BRAND.line} />
@@ -1117,7 +1075,7 @@ function Dashboard() {
         </Card>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <Card className="p-5">
           <div className="flex items-center gap-2 mb-3">
             <AlertTriangle size={16} style={{ color: BRAND.red }} />
@@ -1126,7 +1084,7 @@ function Dashboard() {
           <div className="space-y-2.5">
             {critical.length === 0 && (
               <p className="text-sm" style={{ color: BRAND.inkSoft }}>
-                {crawled || scanned ? "Nothing critical outstanding — nice work." : "Add a website to see issues here — a crawl starts automatically."}
+                {crawled ? "Nothing critical outstanding — nice work." : "Add a website to see issues here — a crawl starts automatically."}
               </p>
             )}
             {critical.map((i) => (
@@ -1145,32 +1103,13 @@ function Dashboard() {
           <div className="space-y-2.5">
             {quickWins.length === 0 && (
               <p className="text-sm" style={{ color: BRAND.inkSoft }}>
-                {crawled || scanned ? "No quick wins outstanding." : "Add a website to see issues here — a crawl starts automatically."}
+                {crawled ? "No quick wins outstanding." : "Add a website to see issues here — a crawl starts automatically."}
               </p>
             )}
             {quickWins.map((i) => (
               <div key={i.id} className="flex items-center justify-between gap-2 rounded-lg px-3 py-2" style={{ background: BRAND.canvas }}>
                 <span className="text-sm">{i.title}</span>
                 <SeverityBadge severity={i.severity} />
-              </div>
-            ))}
-          </div>
-        </Card>
-        <Card className="p-5">
-          <div className="flex items-center gap-2 mb-3">
-            <CheckCircle2 size={16} style={{ color: BRAND.visibility }} />
-            <h3 className="font-semibold vr-display">What's working well</h3>
-          </div>
-          <div className="space-y-2.5">
-            {b.positives.length === 0 && (
-              <p className="text-sm" style={{ color: BRAND.inkSoft }}>
-                {scanned ? "Nothing passing yet — see the issues list." : "Run a single-page scan to see what's already working (this list isn't produced by the crawl)."}
-              </p>
-            )}
-            {b.positives.slice(0, 6).map((p, idx) => (
-              <div key={idx} className="rounded-lg px-3 py-2" style={{ background: BRAND.visibilitySoft }}>
-                <p className="text-sm font-medium">{p.title}</p>
-                <p className="text-xs mt-0.5" style={{ color: BRAND.inkSoft }}>{p.detail}</p>
               </div>
             ))}
           </div>
@@ -1187,8 +1126,6 @@ function ScannerView() {
   const [modal, setModal] = useState(null); // {mode:'add'|'edit', website}
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [form, setForm] = useState({ url: "", country: COUNTRIES[0] });
-  const [scanningId, setScanningId] = useState(null);
-  const [progress, setProgress] = useState(0);
   const [crawlingId, setCrawlingId] = useState(null);
   const [crawlProgress, setCrawlProgress] = useState(0);
 
@@ -1198,7 +1135,7 @@ function ScannerView() {
   function saveForm() {
     if (!form.url.trim()) return;
     if (modal.mode === "add") {
-      const w = { id: uid("site"), url: form.url.replace(/^https?:\/\//, ""), country: form.country, status: "new", lastScan: null, scores: null };
+      const w = { id: uid("site"), url: form.url.replace(/^https?:\/\//, ""), country: form.country, scores: null };
       setWebsites((ws) => [...ws, w]);
       setBundles((b) => ({ ...b, [w.id]: emptyBundle() }));
       toast(`Added ${w.url} — starting a full-site crawl…`);
@@ -1221,92 +1158,10 @@ function ScannerView() {
     toast("Website removed");
   }
 
-  async function startScan(w) {
-    setScanningId(w.id);
-    setProgress(6);
-    setWebsites((ws) => ws.map((x) => (x.id === w.id ? { ...x, status: "scanning" } : x)));
-
-    // Climb the bar while the real request is in flight — we don't know exactly
-    // how long the target site will take to respond, so this just shows motion.
-    const ticker = setInterval(() => {
-      setProgress((p) => (p < 88 ? p + randInt(rngFor(w.id + p), 3, 9) : p));
-    }, 350);
-
-    try {
-      const res = await fetch("/api/scan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: w.url }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "The scan couldn't be completed.");
-
-      clearInterval(ticker);
-      setProgress(100);
-
-      // Only the real scan results (issues, technical/content scores) get
-      // written here. Anything the user has manually added — keywords,
-      // competitors, content ideas, internal links, backlinks — is preserved
-      // across rescans instead of being wiped.
-      const existing = bundles[w.id] || emptyBundle();
-      const technical = data.scores.technical;
-      const content = data.scores.content;
-      const scores = {
-        ...existing.scores,
-        overall: Math.round((technical + content) / 2),
-        technical,
-        content,
-      };
-      const realIssues = data.issues.map((i) => ({
-        id: uid("iss"), websiteId: w.id, category: i.category, title: i.title, why: i.why,
-        fix: i.fix, severity: i.severity, status: "New", affectedUrls: i.affectedUrls, before: i.before, aiFix: null, source: "live",
-      }));
-
-      const bundle = {
-        ...existing,
-        issues: realIssues,
-        positives: data.positives || [],
-        aiInsights: null, // stale after a fresh scan — user can regenerate
-        // Keyword/AEO/GEO/simulator results were computed from the previous
-        // crawl, so they're stale too — clear them and let the user re-run.
-        keywordIntel: null,
-        aeoAnalysis: null,
-        geoAnalysis: null,
-        aiVisibility: null,
-        scores,
-        scanMeta: {
-          live: true, statusCode: data.statusCode, loadTimeMs: data.loadTimeMs,
-          wordCount: data.meta.wordCount, fetchedAt: data.fetchedAt,
-          // Real scraped content, reused by the AI Fix Generator, AI Insights,
-          // and the Keyword/AEO/GEO intelligence modules so they all reason
-          // about this actual site instead of a generic template.
-          title: data.meta.title, metaDescription: data.meta.metaDescription,
-          h1Text: data.meta.h1Text, h1Texts: data.meta.h1Texts, h2Texts: data.meta.h2Texts, h3Texts: data.meta.h3Texts,
-          altTexts: data.meta.altTexts, anchorTexts: data.meta.anchorTexts,
-          bodySnippet: data.meta.bodySnippet, fullText: data.meta.fullText, domain: data.meta.domain,
-          schemaTypes: data.meta.schemaTypes, schemaRaw: data.meta.schemaRaw,
-          listItemCount: data.meta.listItemCount, tableCount: data.meta.tableCount,
-        },
-      };
-      setBundles((b) => ({ ...b, [w.id]: bundle }));
-      setWebsites((ws) => ws.map((x) => (x.id === w.id ? { ...x, status: "scanned", lastScan: data.fetchedAt, scores } : x)));
-      toast(`Live scan complete for ${w.url}`);
-    } catch (err) {
-      clearInterval(ticker);
-      setProgress(0);
-      setWebsites((ws) => ws.map((x) => (x.id === w.id ? { ...x, status: "new" } : x)));
-      toast(err.message || "Couldn't reach that site — check the URL and try again.", "error");
-    } finally {
-      setScanningId(null);
-    }
-  }
-
-  // Full-site crawl (up to ~30-60 pages) that powers every "site-wide"
-  // module — site-wide Competitor comparison, AEO, GEO, keyword clustering,
-  // internal-link recommendations, and backlink-opportunity discovery. This
-  // is deliberately separate from the single-page `startScan` above: it
-  // takes longer, and a lot of the single-page audit/keyword/AEO/GEO tools
-  // work fine without it.
+  // Full-site crawl (up to ~30-60 pages) — the single way any website's data
+  // enters VertexRank now. It powers the Dashboard's headline scores, the
+  // Site-wide Audit, and every AI module (Keyword Intelligence, AEO, GEO,
+  // Competitor comparison, internal-link recs, backlink discovery).
   async function startSiteCrawl(w) {
     setCrawlingId(w.id);
     setCrawlProgress(6);
@@ -1337,7 +1192,7 @@ function ScannerView() {
       // The site-wide Technical/Content scores (averaged across every
       // crawled page) become this website's headline scores on the
       // Dashboard — more representative than one page, and available the
-      // moment the crawl finishes with no separate single-page scan needed.
+      // moment the crawl finishes.
       if (data.siteScores) {
         const technical = data.siteScores.technical;
         const content = data.siteScores.content;
@@ -1362,7 +1217,7 @@ function ScannerView() {
 
       {websites.length === 0 ? (
         <Card>
-          <EmptyState icon={Globe2} title="No websites added" body="Add your first website and country to run a simulated scan across technical, content, AEO, and GEO signals." action={<Button icon={Plus} onClick={openAdd}>Add website</Button>} />
+          <EmptyState icon={Globe2} title="No websites added" body="Add your first website and country — a full-site crawl starts automatically and powers technical, content, AEO, and GEO analysis." action={<Button icon={Plus} onClick={openAdd}>Add website</Button>} />
         </Card>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -1379,35 +1234,14 @@ function ScannerView() {
                 </div>
               </div>
 
-              {w.status === "scanning" || scanningId === w.id ? (
-                <div>
-                  <div className="h-1.5 rounded-full overflow-hidden" style={{ background: BRAND.line }}>
-                    <div className="h-full rounded-full" style={{ width: `${progress}%`, background: BRAND.primary, transition: "width .3s ease" }} />
-                  </div>
-                  <p className="text-xs mt-1.5 flex items-center gap-1" style={{ color: BRAND.inkSoft }}>
-                    <Loader2 size={12} className="vr-spin" /> Scanning… {progress}%
-                  </p>
-                </div>
-              ) : w.status === "scanned" ? (
+              {w.scores?.overall != null && crawlingId !== w.id && (
                 <div className="flex items-center justify-between">
-                  <div>
-                    <p className="vr-mono font-semibold text-lg">{w.scores.overall}</p>
-                    <p className="text-xs" style={{ color: BRAND.inkSoft }}>Last scan {fmtDate(w.lastScan)}</p>
-                    {bundles[w.id]?.scanMeta?.live ? (
-                      <p className="text-[11px] mt-0.5 flex items-center gap-1" style={{ color: BRAND.visibility }}>
-                        <CheckCircle2 size={11} /> Live · HTTP {bundles[w.id].scanMeta.statusCode} · {bundles[w.id].scanMeta.loadTimeMs}ms · {bundles[w.id].scanMeta.wordCount} words
-                      </p>
-                    ) : (
-                      <p className="text-[11px] mt-0.5" style={{ color: BRAND.inkSoft }}>Simulated demo data</p>
-                    )}
-                  </div>
-                  <Button size="sm" variant="soft" icon={RefreshCw} onClick={() => startScan(w)}>Rescan</Button>
+                  <p className="vr-mono font-semibold text-lg">{w.scores.overall}</p>
+                  <p className="text-xs" style={{ color: BRAND.inkSoft }}>Overall SEO score</p>
                 </div>
-              ) : (
-                <Button size="sm" icon={Zap} onClick={() => startScan(w)}>Start scan</Button>
               )}
 
-              <div className="pt-2.5 mt-1" style={{ borderTop: `1px solid ${BRAND.line}` }}>
+              <div className="pt-2.5" style={{ borderTop: w.scores?.overall != null ? `1px solid ${BRAND.line}` : "none" }}>
                 {crawlingId === w.id ? (
                   <div>
                     <div className="h-1.5 rounded-full overflow-hidden" style={{ background: BRAND.line }}>
@@ -1428,7 +1262,7 @@ function ScannerView() {
                   <Button size="sm" variant="soft" icon={RadarIcon} onClick={() => startSiteCrawl(w)}>Full-site crawl</Button>
                 )}
                 {!bundles[w.id]?.siteCrawl && crawlingId !== w.id && (
-                  <p className="text-[11px] mt-1.5" style={{ color: BRAND.inkSoft }}>Crawls the whole site — unlocks site-wide Competitor comparison, AEO, GEO, keyword clustering, internal-link recs, and backlink discovery.</p>
+                  <p className="text-[11px] mt-1.5" style={{ color: BRAND.inkSoft }}>Crawls the whole site — unlocks the Dashboard, Site-wide Audit, Competitor comparison, AEO, GEO, keyword clustering, internal-link recs, and backlink discovery.</p>
                 )}
               </div>
 
@@ -1455,7 +1289,7 @@ function ScannerView() {
       </Modal>
 
       <ConfirmDialog open={!!confirmDelete} onClose={() => setConfirmDelete(null)} title="Delete website"
-        body={`This removes ${confirmDelete?.url} and all of its simulated audit data.`}
+        body={`This removes ${confirmDelete?.url} and all of its crawled audit data.`}
         onConfirm={() => deleteWebsite(confirmDelete.id)} />
     </div>
   );
@@ -1465,34 +1299,22 @@ function ScannerView() {
 
 function AuditView() {
   const { currentWebsiteId } = useApp();
-  const [tab, setTab] = useState("site");
   if (!currentWebsiteId) return <EmptyState icon={Globe2} title="Select a website" body="Choose a website from the top bar to see its audit." />;
   return (
     <div className="space-y-4">
-      <div className="flex gap-1 rounded-lg p-1 w-fit" style={{ background: BRAND.canvas }}>
-        {[["site", "Site-wide Audit"], ["page", "Single-page Audit"]].map(([id, label]) => (
-          <button key={id} onClick={() => setTab(id)} className="vr-focus text-sm font-medium rounded-md px-3 py-1.5"
-            style={{ background: tab === id ? BRAND.surface : "transparent", color: tab === id ? BRAND.primary : BRAND.inkSoft, boxShadow: tab === id ? `0 1px 2px rgba(0,0,0,0.06)` : "none" }}>
-            {label}
-          </button>
-        ))}
-      </div>
-      {tab === "site" ? <SiteAuditPanel /> : <PageAuditPanel />}
+      <SiteAuditPanel />
     </div>
   );
 }
 
-const SEVERITY_RANK = { Critical: 0, High: 1, Medium: 2, Low: 3 };
-
 /** Site-wide SEO Audit — entirely derived from the full-site crawl, with NO
- *  extra AI call: every crawled page already ran through the exact same
- *  deterministic issue rules as a single-page scan (see
- *  lib/siteCrawler.js's detectPageIssues, kept deliberately parallel to
- *  app/api/scan/route.js), so this just groups those real per-page issues
- *  across the whole site plus the issues only visible with 2+ pages
- *  (duplicate titles, orphan pages, near-duplicate content...). "Generate AI
- *  Fix" still calls VertexRank AI, but only to word one concrete fix for one
- *  real affected page — the finding itself is never invented. */
+ *  extra AI call: every crawled page already runs through the same
+ *  deterministic issue rules (see lib/siteCrawler.js's detectPageIssues), so
+ *  this just groups those real per-page issues across the whole site plus
+ *  the issues only visible with 2+ pages (duplicate titles, orphan pages,
+ *  near-duplicate content...). "Generate AI Fix" still calls VertexRank AI,
+ *  but only to word one concrete fix for one real affected page — the
+ *  finding itself is never invented. */
 function SiteAuditPanel() {
   const { bundle, currentWebsiteId, toast, addAction } = useApp();
   const b = bundle();
@@ -1501,43 +1323,7 @@ function SiteAuditPanel() {
 
   const crawl = b.siteCrawl;
 
-  const allIssues = useMemo(() => {
-    if (!crawl) return [];
-    const sw = crawl.siteWide;
-    const siteLevel = [];
-    if (sw.orphanPages.length > 0) siteLevel.push({
-      id: "site_orphan", category: "Internal Linking", severity: "Medium",
-      title: `${sw.orphanPages.length} orphan page${sw.orphanPages.length === 1 ? "" : "s"} — no internal links point to them`,
-      why: "A page nothing else on the site links to is hard for search engines (and visitors) to find, even if it's in the sitemap.",
-      fix: "Add at least one contextual internal link to each orphan page from a related page.", urls: sw.orphanPages,
-    });
-    if (sw.weakLinkedPages.length > 0) siteLevel.push({
-      id: "site_weak", category: "Internal Linking", severity: "Low",
-      title: `${sw.weakLinkedPages.length} page${sw.weakLinkedPages.length === 1 ? "" : "s"} with only one internal link pointing to them`,
-      why: "A page with only one inbound internal link passes very little authority and is easy to lose track of.",
-      fix: "Add a second contextual internal link from another related page.", urls: sw.weakLinkedPages,
-    });
-    sw.duplicateTitles.forEach((g, idx) => siteLevel.push({
-      id: `site_duptitle_${idx}`, category: "On-Page", severity: "High",
-      title: `Duplicate page title used on ${g.urls.length} pages: "${g.value}"`,
-      why: "Identical titles make it hard for search engines to tell these pages apart, and one may simply be ignored.",
-      fix: "Write a unique, specific title for each of these pages.", urls: g.urls,
-    }));
-    sw.duplicateMetaDescriptions.forEach((g, idx) => siteLevel.push({
-      id: `site_dupmeta_${idx}`, category: "On-Page", severity: "Medium",
-      title: `Duplicate meta description used on ${g.urls.length} pages`,
-      why: "A duplicated description wastes the chance to differentiate each page in search results.",
-      fix: "Write a unique meta description for each page summarizing what's actually on it.", urls: g.urls,
-    }));
-    sw.nearDuplicateContentPairs.forEach((p, idx) => siteLevel.push({
-      id: `site_dupcontent_${idx}`, category: "Content", severity: "Medium",
-      title: `Near-duplicate content (${p.similarity}% similar)`,
-      why: "Two pages that say almost the same thing compete with each other in search instead of ranking together for more.",
-      fix: "Differentiate the two pages' angle and content, or merge them and redirect one to the other.", urls: [p.urlA, p.urlB],
-    }));
-    const recurring = sw.recurringIssues.map((e, idx) => ({ ...e, id: `rec_${idx}` }));
-    return [...siteLevel, ...recurring].sort((a, c) => (SEVERITY_RANK[a.severity] ?? 9) - (SEVERITY_RANK[c.severity] ?? 9) || c.urls.length - a.urls.length);
-  }, [crawl]);
+  const allIssues = useMemo(() => computeSiteAuditIssues(crawl), [crawl]);
 
   const worstPages = useMemo(() => {
     if (!crawl) return [];
@@ -1547,7 +1333,7 @@ function SiteAuditPanel() {
       .slice(0, 8);
   }, [crawl]);
 
-  if (!crawl) return <SiteCrawlGate body="A site-wide audit groups the same real technical and on-page checks used for a single page across every crawled page — one entry per problem, with every affected URL, instead of the same issue repeated per page." />;
+  if (!crawl) return <SiteCrawlGate body="A site-wide audit runs the same real technical and on-page checks across every crawled page — one entry per problem, with every affected URL, instead of the same issue repeated per page." />;
 
   function isAdded(id) { return b.actions.some((a) => a.detail?.sourceId === id); }
   function addIssueToActions(issue) {
@@ -1648,105 +1434,6 @@ function SiteAuditPanel() {
   );
 }
 
-function PageAuditPanel() {
-  const { bundle, setBundles, currentWebsiteId, toast, addAction } = useApp();
-  const b = bundle();
-  const [search, setSearch] = useState("");
-  const [cat, setCat] = useState("All");
-  const [sev, setSev] = useState("All");
-  const [fixIssue, setFixIssue] = useState(null);
-  const [expanded, setExpanded] = useState(null);
-
-  if (!currentWebsiteId) return <EmptyState icon={Globe2} title="Select a website" body="Choose a website from the top bar to see its audit." />;
-
-  const filtered = b.issues.filter((i) =>
-    i.title.toLowerCase().includes(search.toLowerCase()) &&
-    (cat === "All" || i.category === cat) &&
-    (sev === "All" || i.severity === sev)
-  );
-
-  function updateIssue(id, patch) {
-    setBundles((prev) => {
-      const site = prev[currentWebsiteId] || emptyBundle();
-      return { ...prev, [currentWebsiteId]: { ...site, issues: site.issues.map((i) => (i.id === id ? { ...i, ...patch } : i)) } };
-    });
-  }
-
-  function applyFix(issue, fix) {
-    updateIssue(issue.id, { status: "Applied", aiFix: fix });
-    addAction({ title: issue.title, type: "Technical Fix", status: "Applied", issueId: issue.id });
-    toast(`Fix applied: ${issue.title}`);
-  }
-
-  return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap gap-2 items-center justify-between">
-        <SearchInput value={search} onChange={setSearch} placeholder="Search issues..." />
-        <div className="flex gap-2">
-          <Select value={cat} onChange={(e) => setCat(e.target.value)}>
-            <option>All</option>{ISSUE_CATEGORIES.map((c) => <option key={c}>{c}</option>)}
-          </Select>
-          <Select value={sev} onChange={(e) => setSev(e.target.value)}>
-            <option>All</option>{SEVERITIES.map((s) => <option key={s}>{s}</option>)}
-          </Select>
-        </div>
-      </div>
-
-      {filtered.length === 0 ? (
-        <Card>
-          {b.issues.length === 0 ? (
-            <EmptyState icon={ListChecks} title="No audit yet" body="Go to Websites and run a scan to pull a real technical and on-page audit for this site." />
-          ) : (
-            <EmptyState icon={ListChecks} title="No matching issues" body="Try clearing filters, or rescan the site to refresh the audit." />
-          )}
-        </Card>
-      ) : (
-        <div className="space-y-3">
-          {filtered.map((i) => (
-            <Card key={i.id} className="overflow-hidden">
-              <button className="vr-focus w-full flex items-center justify-between gap-3 px-4 py-3.5 text-left" onClick={() => setExpanded(expanded === i.id ? null : i.id)}>
-                <div className="flex items-center gap-3 min-w-0">
-                  <ChevronRight size={15} style={{ transform: expanded === i.id ? "rotate(90deg)" : "none", transition: "transform .15s", color: BRAND.inkSoft, flexShrink: 0 }} />
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium truncate">{i.title}</p>
-                    <p className="text-xs mt-0.5" style={{ color: BRAND.inkSoft }}>{i.category} · {i.affectedUrls} URL{i.affectedUrls > 1 ? "s" : ""} affected</p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-2 shrink-0">
-                  <Badge color={i.source === "live" ? { fg: BRAND.visibility, bg: BRAND.visibilitySoft } : { fg: BRAND.inkSoft, bg: BRAND.canvas }}>{i.source === "live" ? "Live" : "Simulated"}</Badge>
-                  <SeverityBadge severity={i.severity} />
-                  <StatusBadge status={i.status} />
-                </div>
-              </button>
-              {expanded === i.id && (
-                <div className="px-4 pb-4 pt-1 space-y-3" style={{ borderTop: `1px solid ${BRAND.line}` }}>
-                  <div className="grid sm:grid-cols-3 gap-3 pt-3">
-                    <div><p className="text-xs font-semibold mb-1" style={{ color: BRAND.inkSoft }}>Problem</p><p className="text-sm">{i.title}</p></div>
-                    <div><p className="text-xs font-semibold mb-1" style={{ color: BRAND.inkSoft }}>Why it matters</p><p className="text-sm">{i.why}</p></div>
-                    <div><p className="text-xs font-semibold mb-1" style={{ color: BRAND.inkSoft }}>Recommended fix</p><p className="text-sm">{i.fix}</p></div>
-                  </div>
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <Button size="sm" icon={Wand2} onClick={() => setFixIssue(i)}>Generate AI Fix</Button>
-                    {i.status !== "Applied" && i.status !== "Verified" && (
-                      <Button size="sm" variant="soft" icon={Check} onClick={() => { updateIssue(i.id, { status: "Approved" }); toast("Marked approved"); }}>Approve</Button>
-                    )}
-                    {i.status === "Applied" && (
-                      <Button size="sm" variant="soft" icon={CheckCircle2} onClick={() => { updateIssue(i.id, { status: "Verified" }); toast("Marked verified"); }}>Mark verified</Button>
-                    )}
-                    {i.aiFix && <span className="text-xs" style={{ color: BRAND.visibility }}>AI fix applied</span>}
-                    <CopyButton label="Copy" variant="outline" title="Copy this issue" getText={() => formatIssue(i, "##")} />
-                  </div>
-                </div>
-              )}
-            </Card>
-          ))}
-        </div>
-      )}
-
-      {fixIssue && <AiFixModal issue={fixIssue} meta={b.scanMeta} onClose={() => setFixIssue(null)} onApply={(fix) => applyFix(fixIssue, fix)} />}
-    </div>
-  );
-}
 
 /* ============================== Action Center ============================== */
 
@@ -1885,14 +1572,14 @@ function KeywordsView() {
   return (
     <div className="space-y-4">
       <div className="flex gap-1 rounded-lg p-1 w-fit" style={{ background: BRAND.canvas }}>
-        {[["clusters", "Site-wide Clustering"], ["ai", "AI Keyword Intelligence"], ["manual", "Manual Tracking"]].map(([id, label]) => (
+        {[["clusters", "AI Keyword Intelligence"], ["manual", "Manual Tracking"]].map(([id, label]) => (
           <button key={id} onClick={() => setTab(id)} className="vr-focus text-sm font-medium rounded-md px-3 py-1.5"
             style={{ background: tab === id ? BRAND.surface : "transparent", color: tab === id ? BRAND.primary : BRAND.inkSoft, boxShadow: tab === id ? `0 1px 2px rgba(0,0,0,0.06)` : "none" }}>
             {label}
           </button>
         ))}
       </div>
-      {tab === "ai" ? <KeywordIntelligencePanel /> : tab === "clusters" ? <SiteKeywordClusteringPanel /> : <ManualKeywordTracker />}
+      {tab === "clusters" ? <SiteKeywordClusteringPanel /> : <ManualKeywordTracker />}
     </div>
   );
 }
@@ -2016,205 +1703,6 @@ function SiteKeywordClusteringPanel() {
   );
 }
 
-function KeywordIntelligencePanel() {
-  const { bundle, setBundles, currentWebsiteId, toast, addAction, setScore } = useApp();
-  const b = bundle();
-  const [form, setForm] = useState({ targetKeyword: "", topic: "", country: COUNTRIES[0], language: "English" });
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [search, setSearch] = useState("");
-  const [typeFilter, setTypeFilter] = useState("All");
-  const [intentFilter, setIntentFilter] = useState("All");
-  const [expanded, setExpanded] = useState(null);
-
-  const intel = b.keywordIntel;
-
-  async function runAnalysis() {
-    if (!b.scanMeta?.live) { toast("Run a live scan first, from Websites — Keyword Intelligence reads the real crawl.", "error"); return; }
-    setLoading(true); setError("");
-    try {
-      const data = await postJson("/api/keyword-intelligence", {
-        scanMeta: b.scanMeta, targetKeyword: form.targetKeyword, topic: form.topic, country: form.country, language: form.language,
-      });
-      setBundles((prev) => {
-        const site = prev[currentWebsiteId] || emptyBundle();
-        return { ...prev, [currentWebsiteId]: { ...site, keywordIntel: data.result } };
-      });
-      setScore("keyword", computeOpportunityScore(data.result.opportunities));
-      toast("Keyword Intelligence generated by VertexRank AI");
-    } catch (err) {
-      setError(err.message || "Couldn't run keyword analysis.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function addOppToActions(o) {
-    addAction({
-      title: o.problem, type: "Content Update", status: "New",
-      detail: { sourceId: `kwi_${o.id}`, module: "Keyword Intelligence", evidence: o.evidence, recommendedAction: o.recommendedAction, priority: o.priority, confidence: o.confidence, source: o.source },
-    });
-    toast("Added to Action Center");
-  }
-  function isAdded(id) { return b.actions.some((a) => a.detail?.sourceId === id); }
-
-  const KEYWORD_TYPES = ["Primary", "Secondary", "Long-tail", "Related", "Semantic", "Entity", "Question", "Commercial", "Informational", "Transactional", "Navigational", "Local"];
-
-  let rows = (intel?.keywords || []).filter((k) =>
-    k.keyword.toLowerCase().includes(search.toLowerCase()) &&
-    (typeFilter === "All" || k.type === typeFilter) &&
-    (intentFilter === "All" || k.intent === intentFilter)
-  );
-  const { page, setPage, totalPages, paged } = usePagination(rows, 10);
-
-  return (
-    <div className="space-y-5">
-      <AnalysisBanner icon={Sparkles}>
-        VertexRank AI reads the real crawled page — title, headings, alt text, body content — to extract and classify keyword candidates. Estimates (relevance, difficulty) are labeled "VertexRank AI Estimate" with a confidence level; they are never real Google search volume, rankings, or CPC.
-      </AnalysisBanner>
-
-      <Card className="p-5">
-        <div className="flex items-center gap-2 mb-3">
-          <Target size={16} style={{ color: BRAND.primary }} />
-          <h3 className="font-semibold vr-display">Run Keyword Intelligence</h3>
-        </div>
-        <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-3">
-          <Field label="Target keyword (optional)"><TextInput placeholder="e.g. POS software Kenya" value={form.targetKeyword} onChange={(e) => setForm((f) => ({ ...f, targetKeyword: e.target.value }))} /></Field>
-          <Field label="Topic (optional)"><TextInput placeholder="e.g. point of sale" value={form.topic} onChange={(e) => setForm((f) => ({ ...f, topic: e.target.value }))} /></Field>
-          <Field label="Country"><Select value={form.country} onChange={(e) => setForm((f) => ({ ...f, country: e.target.value }))}>{COUNTRIES.map((c) => <option key={c}>{c}</option>)}</Select></Field>
-          <Field label="Language"><TextInput value={form.language} onChange={(e) => setForm((f) => ({ ...f, language: e.target.value }))} /></Field>
-        </div>
-        {loading ? (
-          <div className="flex items-center gap-2 py-1">
-            <Loader2 className="vr-spin" size={18} style={{ color: BRAND.primary }} />
-            <span className="text-sm" style={{ color: BRAND.inkSoft }}>VertexRank AI is reading the crawl and classifying keywords…</span>
-          </div>
-        ) : (
-          <Button icon={intel ? RefreshCw : Sparkles} onClick={runAnalysis}>{intel ? "Re-run analysis" : "Run Keyword Intelligence"}</Button>
-        )}
-        {error && <p className="text-xs mt-2" style={{ color: BRAND.red }}>{error}</p>}
-        {!b.scanMeta?.live && <p className="text-xs mt-2" style={{ color: BRAND.amber }}>This website hasn't been scanned yet — go to Websites and run a scan first.</p>}
-      </Card>
-
-      {intel && (
-        <>
-          <Card className="p-5">
-            <div className="flex items-center gap-4 flex-wrap">
-              <ScoreDial label="Keyword Opportunity" value={computeOpportunityScore(intel.opportunities)} size={92} accent={BRAND.primary} />
-              <div className="text-xs" style={{ color: BRAND.inkSoft }}>
-                <p className="font-medium mb-1" style={{ color: BRAND.ink }}>How this score works</p>
-                <p>Starts at 100 and subtracts a weighted penalty for each open opportunity below (Critical −20, High −12, Medium −6, Low −2) — fully explainable, not an AI-invented number.</p>
-                <p className="mt-1">Generated {fmtDate(intel.generatedAt)} · {intel.keywords.length} keywords · {intel.opportunities.length} opportunities</p>
-              </div>
-            </div>
-          </Card>
-
-          {intel.entities?.length > 0 && (
-            <Card className="p-5">
-              <div className="flex items-start justify-between gap-2 mb-1">
-                <h3 className="font-semibold vr-display">Entities detected on the page</h3>
-                <CopyButton label="Copy" getText={() => sectionEntities(intel.entities)} />
-              </div>
-              <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Crawled Data · proper-noun phrases found directly in the page text.</p>
-              <div className="flex flex-wrap gap-1.5">
-                {intel.entities.map((e) => (
-                  <span key={e.entity} className="text-xs rounded-full px-2.5 py-1" style={{ background: BRAND.canvas, color: BRAND.ink }}>{e.entity} <span style={{ color: BRAND.inkSoft }}>×{e.occurrences}</span></span>
-                ))}
-              </div>
-            </Card>
-          )}
-
-          <Card className="p-5">
-            <div className="flex items-center justify-between gap-2 mb-3">
-              <h3 className="font-semibold vr-display">Keyword Opportunity Analysis</h3>
-              {intel.opportunities.length > 0 && <CopyButton label="Copy" getText={() => sectionKeywordOpportunities(intel)} />}
-            </div>
-            {intel.opportunities.length === 0 ? (
-              <p className="text-sm" style={{ color: BRAND.inkSoft }}>No specific opportunities flagged this run.</p>
-            ) : (
-              <div className="space-y-3">
-                {sortByPriority(intel.opportunities).map((o) => (
-                  <RecommendationCard key={o.id} title={o.problem} evidence={o.evidence} recommendedAction={o.recommendedAction}
-                    priority={o.priority} confidence={o.confidence} source={o.source}
-                    added={isAdded(`kwi_${o.id}`)} onAdd={() => addOppToActions(o)} />
-                ))}
-              </div>
-            )}
-          </Card>
-
-          <Card className="overflow-hidden">
-            <div className="p-4 flex flex-wrap gap-2 items-center justify-between" style={{ borderBottom: `1px solid ${BRAND.line}` }}>
-              <div className="flex flex-wrap gap-2">
-                <SearchInput value={search} onChange={setSearch} placeholder="Search keywords..." />
-                <Select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}><option>All</option>{KEYWORD_TYPES.map((t) => <option key={t}>{t}</option>)}</Select>
-                <Select value={intentFilter} onChange={(e) => setIntentFilter(e.target.value)}><option>All</option>{INTENTS.map((i) => <option key={i}>{i}</option>)}</Select>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="text-xs" style={{ color: BRAND.inkSoft }}>{rows.length} keyword{rows.length === 1 ? "" : "s"}</span>
-                <CopyButton label="Copy keywords" title="Copies the keywords currently shown (respects search and filters)" getText={() => sectionKeywordTable(rows)} />
-              </div>
-            </div>
-            {rows.length === 0 ? (
-              <div className="p-6"><EmptyState icon={KeyRound} title="No keywords match" body="Try clearing the search or filters." /></div>
-            ) : (
-              <>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead><tr style={{ borderBottom: `1px solid ${BRAND.line}` }}>
-                      <th className="px-4 py-2.5"></th>
-                      <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Keyword</th>
-                      <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Type</th>
-                      <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Intent</th>
-                      <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Occurs</th>
-                      <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Where it appears</th>
-                      <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Relevance</th>
-                      <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Difficulty (AI Est.)</th>
-                    </tr></thead>
-                    <tbody>
-                      {paged.map((k) => (
-                        <React.Fragment key={k.id}>
-                          <tr className="vr-row cursor-pointer" style={{ borderBottom: expanded === k.id ? "none" : `1px solid ${BRAND.line}` }} onClick={() => setExpanded(expanded === k.id ? null : k.id)}>
-                            <td className="px-4 py-2.5"><ChevronRight size={13} style={{ transform: expanded === k.id ? "rotate(90deg)" : "none", transition: "transform .15s", color: BRAND.inkSoft }} /></td>
-                            <td className="px-4 py-2.5 font-medium">{k.keyword}</td>
-                            <td className="px-4 py-2.5"><Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{k.type}</Badge></td>
-                            <td className="px-4 py-2.5" style={{ color: BRAND.inkSoft }}>{k.intent}</td>
-                            <td className="px-4 py-2.5 vr-mono">{k.occurrences || 0}</td>
-                            <td className="px-4 py-2.5">
-                              <div className="flex flex-wrap gap-1 max-w-[240px]">
-                                {[["title", "Title"], ["metaDescription", "Meta"], ["h1", "H1"], ["h2h3", "H2/H3"], ["alt", "ALT"], ["schema", "Schema"]]
-                                  .filter(([key]) => k.usage?.[key])
-                                  .map(([key, label]) => <span key={key} className="text-[10px] rounded px-1.5 py-0.5" style={{ background: BRAND.visibilitySoft, color: BRAND.visibility }}>{label}</span>)}
-                                {(!k.usage || Object.values(k.usage).every((v) => !v)) && <span className="text-xs" style={{ color: BRAND.inkSoft }}>Not found on page</span>}
-                              </div>
-                            </td>
-                            <td className="px-4 py-2.5 vr-mono">{k.relevance}</td>
-                            <td className="px-4 py-2.5 vr-mono" style={{ color: BRAND.inkSoft }}>{k.difficultyEstimate ?? "—"} <span className="text-[10px]">({k.difficultyConfidence})</span></td>
-                          </tr>
-                          {expanded === k.id && (
-                            <tr style={{ borderBottom: `1px solid ${BRAND.line}` }}>
-                              <td colSpan={8} className="px-4 pb-4 pt-0">
-                                <div className="rounded-lg p-3.5 space-y-2" style={{ background: BRAND.canvas }}>
-                                  {k.recommendedUsage && <div><p className="text-xs font-semibold mb-0.5" style={{ color: BRAND.inkSoft }}>Recommended usage</p><p className="text-sm">{k.recommendedUsage}</p></div>}
-                                  {k.opportunity && <div><p className="text-xs font-semibold mb-0.5" style={{ color: BRAND.inkSoft }}>Optimization opportunity</p><p className="text-sm">{k.opportunity}</p></div>}
-                                  <p className="text-[11px] rounded px-1.5 py-0.5 inline-block" style={{ background: BRAND.primarySoft, color: BRAND.primary }}>{k.source}</p>
-                                </div>
-                              </td>
-                            </tr>
-                          )}
-                        </React.Fragment>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                <Pagination page={page} totalPages={totalPages} setPage={setPage} />
-              </>
-            )}
-          </Card>
-        </>
-      )}
-    </div>
-  );
-}
 
 function ManualKeywordTracker() {
   const { bundle, setBundles, currentWebsiteId, toast } = useApp();
@@ -2253,40 +1741,31 @@ function ManualKeywordTracker() {
   function del(id) { mutate((arr) => arr.filter((x) => x.id !== id)); toast("Keyword removed"); }
 
   // Lets the user populate this list with VertexRank AI's own suggestions —
-  // grounded in the real crawl via Keyword Intelligence — instead of typing
-  // every keyword in by hand.
+  // grounded in the real crawl via the site-wide Keyword Intelligence
+  // clusters — instead of typing every keyword in by hand.
   async function suggestWithAi() {
-    let scanMeta = b.scanMeta;
-    if (!scanMeta?.live) {
-      const homepage = b.siteCrawl?.pages?.find((p) => p.url === b.siteCrawl.startUrl) || b.siteCrawl?.pages?.[0];
-      if (homepage) scanMeta = { domain: b.siteCrawl.domain, title: homepage.title, metaDescription: homepage.metaDescription, h1Text: homepage.h1Text, fullText: homepage.fullText };
-    }
-    if (!scanMeta?.domain) { toast("Add a website first — a full-site crawl starts automatically and powers this.", "error"); return; }
+    if (!b.siteCrawl) { toast("Add a website first — a full-site crawl starts automatically and powers this.", "error"); return; }
     setSuggesting(true);
     try {
-      let intel = b.keywordIntel;
-      if (!intel) {
-        const data = await postJson("/api/keyword-intelligence", { scanMeta, targetKeyword: "", topic: "", country: COUNTRIES[0], language: "English" });
-        intel = data.result;
+      let clusters = b.siteKeywordClusters;
+      if (!clusters) {
+        const data = await postJson("/api/site-keyword-clusters", { crawl: b.siteCrawl });
+        clusters = data.result;
         setBundles((prev) => {
           const site = prev[currentWebsiteId] || emptyBundle();
-          return { ...prev, [currentWebsiteId]: { ...site, keywordIntel: intel } };
+          return { ...prev, [currentWebsiteId]: { ...site, siteKeywordClusters: clusters } };
         });
       }
       const existing = new Set(b.keywords.map((k) => k.keyword.toLowerCase()));
-      const picks = [...(intel.keywords || [])]
-        .sort((a, c) => c.relevance - a.relevance)
+      const picks = [...(clusters.clusters || [])]
+        .flatMap((c) => (c.keywords || []).slice(0, 3).map((kw) => ({ keyword: kw })))
         .filter((k) => !existing.has(k.keyword.toLowerCase()))
         .slice(0, 8);
       if (picks.length === 0) { toast("No new AI-suggested keywords — everything relevant is already tracked."); return; }
       mutate((arr) => [
         ...arr,
         ...picks.map((k) => ({
-          id: uid("kw"), websiteId: currentWebsiteId, keyword: k.keyword, intent: k.intent, ranking: null, volume: null, difficulty: null, opportunity: null,
-          usage: [
-            ...(k.usage?.title ? ["Title"] : []), ...(k.usage?.metaDescription ? ["Meta"] : []), ...(k.usage?.h1 ? ["H1"] : []),
-            ...(k.usage?.h2h3 ? ["Headings"] : []), ...(k.usage?.body ? ["Body"] : []), ...(k.usage?.alt ? ["ALT"] : []), ...(k.usage?.schema ? ["Schema"] : []),
-          ],
+          id: uid("kw"), websiteId: currentWebsiteId, keyword: k.keyword, intent: "Informational", ranking: null, volume: null, difficulty: null, opportunity: null, usage: [],
         })),
       ]);
       toast(`Added ${picks.length} AI-suggested keyword${picks.length === 1 ? "" : "s"}`);
@@ -2398,14 +1877,14 @@ function AeoView() {
   return (
     <div className="space-y-4">
       <div className="flex gap-1 rounded-lg p-1 w-fit" style={{ background: BRAND.canvas }}>
-        {[["site", "Site-wide AEO"], ["ai", "AI Answer Coverage"], ["manual", "Manual Tracking"]].map(([id, label]) => (
+        {[["site", "Site-wide AEO"], ["manual", "Manual Tracking"]].map(([id, label]) => (
           <button key={id} onClick={() => setTab(id)} className="vr-focus text-sm font-medium rounded-md px-3 py-1.5"
             style={{ background: tab === id ? BRAND.surface : "transparent", color: tab === id ? BRAND.primary : BRAND.inkSoft, boxShadow: tab === id ? `0 1px 2px rgba(0,0,0,0.06)` : "none" }}>
             {label}
           </button>
         ))}
       </div>
-      {tab === "ai" ? <AeoIntelligencePanel /> : tab === "site" ? <SiteAeoPanel /> : <ManualAeoTracker />}
+      {tab === "site" ? <SiteAeoPanel /> : <ManualAeoTracker />}
     </div>
   );
 }
@@ -2416,163 +1895,11 @@ const COVERAGE_COLOR = {
   Missing: { fg: BRAND.red, bg: BRAND.redSoft },
 };
 
-function AeoIntelligencePanel() {
-  const { bundle, setBundles, currentWebsiteId, toast, addAction, setScore } = useApp();
-  const b = bundle();
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [coverageFilter, setCoverageFilter] = useState("All");
-  const [expanded, setExpanded] = useState(null);
-  const aeo = b.aeoAnalysis;
 
-  async function runAnalysis() {
-    if (!b.scanMeta?.live) { toast("Run a live scan first, from Websites — AEO analysis reads the real crawl.", "error"); return; }
-    setLoading(true); setError("");
-    try {
-      const data = await postJson("/api/aeo-analysis", { scanMeta: b.scanMeta, keywords: b.keywordIntel?.keywords || [] });
-      setBundles((prev) => {
-        const site = prev[currentWebsiteId] || emptyBundle();
-        return { ...prev, [currentWebsiteId]: { ...site, aeoAnalysis: data.result } };
-      });
-      const avgCoverage = data.result.questions.length
-        ? data.result.questions.reduce((s, q) => s + q.coverageScore, 0) / data.result.questions.length
-        : data.result.readinessScore;
-      setScore("aeo", clamp(Math.round(0.5 * data.result.readinessScore + 0.5 * avgCoverage), 0, 100));
-      toast("AEO analysis generated by VertexRank AI");
-    } catch (err) {
-      setError(err.message || "Couldn't run AEO analysis.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function addQuestionToActions(q) {
-    addAction({
-      title: `Answer: "${q.question}"`, type: "FAQ Addition", status: "New",
-      detail: { sourceId: `aeoq_${q.id}`, module: "AEO", evidence: q.missingInfo, recommendedAction: q.recommendedAnswer, priority: q.priority, confidence: "Medium", source: q.source },
-    });
-    toast("Added to Action Center");
-  }
-  function addRecToActions(r) {
-    addAction({
-      title: r.recommendation, type: "Content Update", status: "New",
-      detail: { sourceId: `aeor_${r.id}`, module: "AEO", evidence: r.why, recommendedAction: r.recommendation, priority: r.priority, confidence: "Medium", source: r.source },
-    });
-    toast("Added to Action Center");
-  }
-  function isAdded(id) { return b.actions.some((a) => a.detail?.sourceId === id); }
-
-  const signalLabels = AEO_SIGNAL_LABELS;
-
-  const questions = (aeo?.questions || []).filter((q) => coverageFilter === "All" || q.coverage === coverageFilter);
-
-  return (
-    <div className="space-y-5">
-      <AnalysisBanner icon={Sparkles}>
-        VertexRank AI generates realistic buyer questions grounded in the real crawled content, then judges — using only that content — whether the page already answers each one. Nothing here claims to be real AI-search or Google data.
-      </AnalysisBanner>
-
-      <Card className="p-5 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2"><MessageCircleQuestion size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">Run AEO Analysis</h3></div>
-        {loading ? (
-          <div className="flex items-center gap-2"><Loader2 className="vr-spin" size={18} style={{ color: BRAND.primary }} /><span className="text-sm" style={{ color: BRAND.inkSoft }}>VertexRank AI is generating questions and checking coverage…</span></div>
-        ) : (
-          <Button icon={aeo ? RefreshCw : Sparkles} onClick={runAnalysis}>{aeo ? "Re-run analysis" : "Run AEO Analysis"}</Button>
-        )}
-      </Card>
-      {error && <p className="text-xs" style={{ color: BRAND.red }}>{error}</p>}
-      {!b.scanMeta?.live && <p className="text-xs" style={{ color: BRAND.amber }}>This website hasn't been scanned yet — go to Websites and run a scan first.</p>}
-
-      {aeo && (
-        <>
-          <Card className="p-5">
-            <div className="flex items-center gap-4 flex-wrap mb-4">
-              <ScoreDial label="AEO Readiness" value={b.scores?.aeo ?? aeo.readinessScore} size={92} accent={BRAND.visibility} />
-              <div className="text-xs" style={{ color: BRAND.inkSoft }}>
-                <p className="font-medium mb-1" style={{ color: BRAND.ink }}>How this score works</p>
-                <p>Half comes from a real signal checklist below (schema, structure, existing Q&A); half from the average answer-coverage of the generated questions.</p>
-                <p className="mt-1">Generated {fmtDate(aeo.generatedAt)}</p>
-              </div>
-            </div>
-            <div className="flex flex-wrap gap-1.5">
-              {Object.entries(signalLabels).map(([key, label]) => (
-                <span key={key} className="text-xs rounded-full px-2.5 py-1 flex items-center gap-1"
-                  style={{ background: aeo.flags[key] ? BRAND.visibilitySoft : BRAND.canvas, color: aeo.flags[key] ? BRAND.visibility : BRAND.inkSoft }}>
-                  {aeo.flags[key] ? <Check size={11} /> : <X size={11} />} {label}
-                </span>
-              ))}
-            </div>
-          </Card>
-
-          <Card className="p-5">
-            <div className="flex items-center justify-between gap-2 mb-3">
-              <h3 className="font-semibold vr-display">Content Recommendations</h3>
-              {(aeo.contentRecommendations || []).length > 0 && <CopyButton label="Copy" getText={() => sectionAeoRecommendations(aeo)} />}
-            </div>
-            {(aeo.contentRecommendations || []).length === 0 ? (
-              <p className="text-sm" style={{ color: BRAND.inkSoft }}>No content additions flagged this run.</p>
-            ) : (
-              <div className="space-y-3">
-                {sortByPriority(aeo.contentRecommendations).map((r) => (
-                  <RecommendationCard key={r.id} title={r.recommendation} evidence={r.why} priority={r.priority} source={r.source}
-                    added={isAdded(`aeor_${r.id}`)} onAdd={() => addRecToActions(r)} />
-                ))}
-              </div>
-            )}
-          </Card>
-
-          <Card className="overflow-hidden">
-            <div className="p-4 flex flex-wrap gap-2 items-center justify-between" style={{ borderBottom: `1px solid ${BRAND.line}` }}>
-              <h3 className="font-semibold vr-display">Question &amp; Answer Coverage</h3>
-              <div className="flex items-center gap-2">
-                <CopyButton label="Copy" title="Copies the questions currently shown (respects the filter)" getText={() => sectionAeoQuestions(questions)} />
-                <Select value={coverageFilter} onChange={(e) => setCoverageFilter(e.target.value)}>
-                  <option>All</option><option>Answered</option><option>Partial</option><option>Missing</option>
-                </Select>
-              </div>
-            </div>
-            <div className="divide-y" style={{ borderColor: BRAND.line }}>
-              {questions.map((q) => (
-                <div key={q.id}>
-                  <button className="w-full text-left px-4 py-3 flex items-center gap-3 vr-row" onClick={() => setExpanded(expanded === q.id ? null : q.id)}>
-                    <ChevronRight size={13} style={{ transform: expanded === q.id ? "rotate(90deg)" : "none", transition: "transform .15s", color: BRAND.inkSoft, flexShrink: 0 }} />
-                    <span className="text-sm font-medium flex-1">{q.question}</span>
-                    <Badge color={COVERAGE_COLOR[q.coverage] || COVERAGE_COLOR.Missing}>{q.coverage}</Badge>
-                    <PriorityBadge priority={q.priority} />
-                  </button>
-                  {expanded === q.id && (
-                    <div className="px-4 pb-4">
-                      <div className="rounded-lg p-3.5 space-y-2" style={{ background: BRAND.canvas }}>
-                        <div className="flex gap-4 text-xs flex-wrap" style={{ color: BRAND.inkSoft }}>
-                          <span>Intent: {q.intent}</span>
-                          {q.relatedKeyword && <span>Related keyword: {q.relatedKeyword}</span>}
-                          <span>Coverage score: {q.coverageScore}/100</span>
-                        </div>
-                        {q.missingInfo && <div><p className="text-xs font-semibold mb-0.5" style={{ color: BRAND.inkSoft }}>Missing information</p><p className="text-sm">{q.missingInfo}</p></div>}
-                        {q.recommendedAnswer && <div><p className="text-xs font-semibold mb-0.5" style={{ color: BRAND.inkSoft }}>Recommended answer</p><p className="text-sm">{q.recommendedAnswer}</p></div>}
-                        <div className="flex justify-end pt-1">
-                          <Button size="sm" variant={isAdded(`aeoq_${q.id}`) ? "outline" : "soft"} icon={isAdded(`aeoq_${q.id}`) ? Check : ListPlus} disabled={isAdded(`aeoq_${q.id}`)} onClick={() => addQuestionToActions(q)}>
-                            {isAdded(`aeoq_${q.id}`) ? "Added" : "Add to Action Center"}
-                          </Button>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ))}
-              {questions.length === 0 && <p className="text-sm px-4 py-6" style={{ color: BRAND.inkSoft }}>No questions match this filter.</p>}
-            </div>
-          </Card>
-        </>
-      )}
-    </div>
-  );
-}
-
-/** Site-wide counterpart to AeoIntelligencePanel: judges whether the SITE AS
- *  A WHOLE answers buyer questions — the same question might be answered by
- *  a different page than whichever one a single-page analysis happened to
- *  look at. Reads b.siteCrawl (from a full-site crawl), not b.scanMeta. */
+/** Site-wide AEO analysis: judges whether the SITE AS A WHOLE answers buyer
+ *  questions — the same question might be answered by a different page than
+ *  whichever one a naive single-page look would have happened to check.
+ *  Reads b.siteCrawl, from the full-site crawl. */
 function SiteAeoPanel() {
   const { bundle, setBundles, currentWebsiteId, toast, addAction } = useApp();
   const b = bundle();
@@ -2585,7 +1912,7 @@ function SiteAeoPanel() {
   async function runAnalysis() {
     setLoading(true); setError("");
     try {
-      const data = await postJson("/api/site-aeo-analysis", { crawl: b.siteCrawl, keywords: b.keywordIntel?.keywords || [] });
+      const data = await postJson("/api/site-aeo-analysis", { crawl: b.siteCrawl, keywords: siteKeywordList(b) });
       setBundles((prev) => {
         const site = prev[currentWebsiteId] || emptyBundle();
         return { ...prev, [currentWebsiteId]: { ...site, siteAeoAnalysis: data.result } };
@@ -2609,7 +1936,7 @@ function SiteAeoPanel() {
   }
   function isAdded(id) { return b.actions.some((a) => a.detail?.sourceId === id); }
 
-  if (!b.siteCrawl) return <SiteCrawlGate body="Site-wide AEO checks whether ANY page on your site answers a given buyer question — not just the one page a single-page scan happens to look at. That needs a full-site crawl." />;
+  if (!b.siteCrawl) return <SiteCrawlGate body="Site-wide AEO checks whether ANY page on your site answers a given buyer question — not just whichever one page you might otherwise think to check. That needs a full-site crawl." />;
 
   const questions = (aeo?.questions || []).filter((q) => coverageFilter === "All" || q.coverage === coverageFilter);
 
@@ -2746,39 +2073,26 @@ function ManualAeoTracker() {
   function del(id) { mutate((arr) => arr.filter((q) => q.id !== id)); toast("Question removed"); }
 
   // Populate the list with VertexRank AI's own generated questions (from the
-  // AI Answer Coverage / Site-wide AEO tabs) — the only way new questions
-  // enter this tracker now; nothing here is typed in by hand.
+  // Site-wide AEO analysis) — the only way new questions enter this tracker
+  // now; nothing here is typed in by hand.
   async function suggestWithAi() {
+    if (!b.siteCrawl) { toast("Add a website first — a full-site crawl starts automatically and powers this.", "error"); return; }
     setSuggesting(true);
     try {
       let aeo = b.siteAeoAnalysis;
-      let source = "site";
       if (!aeo) {
-        if (b.siteCrawl) {
-          const data = await postJson("/api/site-aeo-analysis", { crawl: b.siteCrawl, keywords: b.keywordIntel?.keywords || [] });
-          aeo = data.result;
-          setBundles((prev) => {
-            const site = prev[currentWebsiteId] || emptyBundle();
-            return { ...prev, [currentWebsiteId]: { ...site, siteAeoAnalysis: aeo } };
-          });
-        } else if (b.scanMeta?.live) {
-          const data = await postJson("/api/aeo-analysis", { scanMeta: b.scanMeta, keywords: b.keywordIntel?.keywords || [] });
-          aeo = data.result;
-          source = "page";
-          setBundles((prev) => {
-            const site = prev[currentWebsiteId] || emptyBundle();
-            return { ...prev, [currentWebsiteId]: { ...site, aeoAnalysis: aeo } };
-          });
-        } else {
-          toast("Add a website first — a full-site crawl starts automatically and powers this.", "error");
-          return;
-        }
+        const data = await postJson("/api/site-aeo-analysis", { crawl: b.siteCrawl, keywords: siteKeywordList(b) });
+        aeo = data.result;
+        setBundles((prev) => {
+          const site = prev[currentWebsiteId] || emptyBundle();
+          return { ...prev, [currentWebsiteId]: { ...site, siteAeoAnalysis: aeo } };
+        });
       }
       const existing = new Set(b.aeoQuestions.map((q) => q.question.toLowerCase()));
       const picks = (aeo.questions || []).filter((q) => !existing.has(q.question.toLowerCase()));
       if (picks.length === 0) { toast("No new AI-suggested questions — everything relevant is already tracked."); return; }
       mutate((arr) => [...arr, ...picks.map((q) => ({ id: uid("aeo"), websiteId: currentWebsiteId, question: q.question, hasAnswer: q.coverage === "Answered" }))]);
-      toast(`Added ${picks.length} AI-suggested question${picks.length === 1 ? "" : "s"}${source === "page" ? " (from single-page AEO)" : ""}`);
+      toast(`Added ${picks.length} AI-suggested question${picks.length === 1 ? "" : "s"}`);
     } catch (err) {
       toast(err.message || "Couldn't suggest questions.", "error");
     } finally {
@@ -2862,147 +2176,18 @@ function GeoView() {
   return (
     <div className="space-y-4">
       <div className="flex gap-1 rounded-lg p-1 w-fit" style={{ background: BRAND.canvas }}>
-        {[["site", "Site-wide GEO"], ["geo", "GEO / AI Visibility"], ["sim", "AI Visibility Simulator"]].map(([id, label]) => (
+        {[["site", "Site-wide GEO"], ["sim", "AI Visibility Simulator"]].map(([id, label]) => (
           <button key={id} onClick={() => setTab(id)} className="vr-focus text-sm font-medium rounded-md px-3 py-1.5 flex items-center gap-1.5"
             style={{ background: tab === id ? BRAND.surface : "transparent", color: tab === id ? BRAND.primary : BRAND.inkSoft, boxShadow: tab === id ? `0 1px 2px rgba(0,0,0,0.06)` : "none" }}>
             {id === "sim" && <Bot size={14} />} {label}
           </button>
         ))}
       </div>
-      {tab === "geo" ? <GeoIntelligencePanel /> : tab === "site" ? <SiteGeoPanel /> : <AiVisibilitySimulatorPanel />}
+      {tab === "site" ? <SiteGeoPanel /> : <AiVisibilitySimulatorPanel />}
     </div>
   );
 }
 
-function GeoIntelligencePanel() {
-  const { bundle, setBundles, currentWebsiteId, toast, addAction, setScore } = useApp();
-  const b = bundle();
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const geo = b.geoAnalysis;
-
-  async function runAnalysis() {
-    if (!b.scanMeta?.live) { toast("Run a live scan first, from Websites — GEO analysis reads the real crawl.", "error"); return; }
-    setLoading(true); setError("");
-    try {
-      const data = await postJson("/api/geo-analysis", { scanMeta: b.scanMeta });
-      setBundles((prev) => {
-        const site = prev[currentWebsiteId] || emptyBundle();
-        return { ...prev, [currentWebsiteId]: { ...site, geoAnalysis: data.result } };
-      });
-      const factorValues = Object.values(data.result.factors).map((f) => f.score);
-      const avgFactor = factorValues.length ? factorValues.reduce((a, v) => a + v, 0) / factorValues.length : data.result.visibilityScore;
-      setScore("geo", clamp(Math.round(0.6 * data.result.visibilityScore + 0.4 * avgFactor), 0, 100));
-      toast("GEO analysis generated by VertexRank AI");
-    } catch (err) {
-      setError(err.message || "Couldn't run GEO analysis.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function addOppToActions(o) {
-    addAction({
-      title: o.title, type: "Schema Markup", status: "New",
-      detail: { sourceId: `geoo_${o.id}`, module: "GEO / AI Visibility", evidence: o.why, recommendedAction: o.title, priority: o.priority, confidence: "Medium", source: o.source },
-    });
-    toast("Added to Action Center");
-  }
-  function isAdded(id) { return b.actions.some((a) => a.detail?.sourceId === id); }
-
-  const authorityLabels = GEO_AUTHORITY_LABELS;
-
-  return (
-    <div className="space-y-5">
-      <AnalysisBanner icon={RadarIcon}>
-        VertexRank AI reasons only over the real crawled page to judge how clearly an AI system could understand this business. This is an "AI Visibility Opportunity" assessment, not a guarantee of inclusion in any AI system's answers.
-      </AnalysisBanner>
-
-      <Card className="p-5 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2"><RadarIcon size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">Run GEO Analysis</h3></div>
-        {loading ? (
-          <div className="flex items-center gap-2"><Loader2 className="vr-spin" size={18} style={{ color: BRAND.primary }} /><span className="text-sm" style={{ color: BRAND.inkSoft }}>VertexRank AI is assessing entity clarity and authority signals…</span></div>
-        ) : (
-          <Button icon={geo ? RefreshCw : Sparkles} onClick={runAnalysis}>{geo ? "Re-run analysis" : "Run GEO Analysis"}</Button>
-        )}
-      </Card>
-      {error && <p className="text-xs" style={{ color: BRAND.red }}>{error}</p>}
-      {!b.scanMeta?.live && <p className="text-xs" style={{ color: BRAND.amber }}>This website hasn't been scanned yet — go to Websites and run a scan first.</p>}
-
-      {geo ? (
-        <>
-          <Card className="p-5">
-            <div className="flex items-center gap-4 flex-wrap mb-4">
-              <ScoreDial label="GEO / AI Visibility" value={b.scores?.geo ?? geo.visibilityScore} size={92} accent={BRAND.visibility} />
-              <div className="text-xs" style={{ color: BRAND.inkSoft }}>
-                <p className="font-medium mb-1" style={{ color: BRAND.ink }}>How this score works</p>
-                <p>60% comes from a real, rule-based signal checklist (schema, contact/about info, credentials); 40% from VertexRank AI's qualitative judgment of the eight factors below.</p>
-                <p className="mt-1">Generated {fmtDate(geo.generatedAt)}</p>
-              </div>
-            </div>
-            <div className="grid sm:grid-cols-2 gap-3">
-              {GEO_FACTORS.map((f) => {
-                const factor = geo.factors[f.key];
-                return (
-                  <div key={f.key} className="rounded-lg px-4 py-3" style={{ background: BRAND.canvas }}>
-                    <div className="flex items-center justify-between gap-3 mb-1">
-                      <p className="text-sm font-medium">{f.label}</p>
-                      <span className="text-sm vr-mono font-semibold" style={{ color: factor.score >= 60 ? BRAND.visibility : factor.score >= 35 ? BRAND.amber : BRAND.red }}>{factor.score}</span>
-                    </div>
-                    <p className="text-xs mb-1.5" style={{ color: BRAND.inkSoft }}>{f.blurb}</p>
-                    {factor.note && <p className="text-xs">{factor.note}</p>}
-                  </div>
-                );
-              })}
-            </div>
-          </Card>
-
-          <Card className="p-5">
-            <h3 className="font-semibold vr-display mb-3">Authority &amp; Trust Signals</h3>
-            <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Crawled Data · detected directly from the page.</p>
-            <div className="flex flex-wrap gap-1.5">
-              {Object.entries(authorityLabels).map(([key, label]) => (
-                <span key={key} className="text-xs rounded-full px-2.5 py-1 flex items-center gap-1"
-                  style={{ background: geo.flags[key] ? BRAND.visibilitySoft : BRAND.canvas, color: geo.flags[key] ? BRAND.visibility : BRAND.inkSoft }}>
-                  {geo.flags[key] ? <Check size={11} /> : <X size={11} />} {label}
-                </span>
-              ))}
-            </div>
-          </Card>
-
-          <Card className="p-5">
-            <div className="flex items-center justify-between gap-2 mb-3">
-              <div className="flex items-center gap-2"><ShieldCheck size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">AI Visibility Opportunities</h3></div>
-              {(geo.opportunities || []).length > 0 && <CopyButton label="Copy" getText={() => sectionGeoOpportunities(geo)} />}
-            </div>
-            {(geo.opportunities || []).length === 0 ? (
-              <p className="text-sm" style={{ color: BRAND.inkSoft }}>No opportunities flagged this run.</p>
-            ) : (
-              <div className="space-y-3">
-                {sortByPriority(geo.opportunities).map((o) => (
-                  <RecommendationCard key={o.id} title={o.title} evidence={o.why} priority={o.priority} source={o.source}
-                    added={isAdded(`geoo_${o.id}`)} onAdd={() => addOppToActions(o)} />
-                ))}
-              </div>
-            )}
-          </Card>
-        </>
-      ) : (
-        <Card className="p-5">
-          <h3 className="font-semibold vr-display mb-3">What GEO scoring measures</h3>
-          <div className="grid sm:grid-cols-2 gap-3">
-            {GEO_FACTORS.map((f) => (
-              <div key={f.key} className="flex items-start justify-between gap-3 rounded-lg px-4 py-3" style={{ background: BRAND.canvas }}>
-                <div><p className="text-sm font-medium">{f.label}</p><p className="text-xs mt-0.5" style={{ color: BRAND.inkSoft }}>{f.blurb}</p></div>
-                <span className="text-xs font-medium shrink-0" style={{ color: BRAND.inkSoft }}>Not analyzed yet</span>
-              </div>
-            ))}
-          </div>
-        </Card>
-      )}
-    </div>
-  );
-}
 
 const READINESS_COLOR = {
   Strong: { fg: BRAND.visibility, bg: BRAND.visibilitySoft },
@@ -3010,9 +2195,9 @@ const READINESS_COLOR = {
   Weak: { fg: BRAND.red, bg: BRAND.redSoft },
 };
 
-/** Site-wide counterpart to GeoIntelligencePanel: judges the SITE AS A
- *  WHOLE's clarity/authority/trust signals from a full-site crawl, plus
- *  entities detected across every crawled page — not just one URL. */
+/** Site-wide GEO analysis: judges the SITE AS A WHOLE's clarity/authority/
+ *  trust signals from a full-site crawl, plus entities detected across every
+ *  crawled page — not just one URL. */
 function SiteGeoPanel() {
   const { bundle, setBundles, currentWebsiteId, toast, addAction } = useApp();
   const b = bundle();
@@ -3141,11 +2326,12 @@ function AiVisibilitySimulatorPanel() {
   const sim = b.aiVisibility;
 
   async function runSimulation() {
-    if (!b.scanMeta?.live) { toast("Run a live scan first, from Websites — the simulator reads the real crawl.", "error"); return; }
+    const siteMeta = siteMetaFrom(b);
+    if (!siteMeta) { toast("Add a website first — a full-site crawl starts automatically and powers this.", "error"); return; }
     setLoading(true); setError("");
     try {
       const data = await postJson("/api/ai-visibility-simulator", {
-        scanMeta: b.scanMeta, keywords: b.keywordIntel?.keywords || [], country: "Kenya",
+        scanMeta: siteMeta, keywords: siteKeywordList(b), country: "Kenya",
       });
       setBundles((prev) => {
         const site = prev[currentWebsiteId] || emptyBundle();
@@ -3186,7 +2372,7 @@ function AiVisibilitySimulatorPanel() {
         )}
       </Card>
       {error && <p className="text-xs" style={{ color: BRAND.red }}>{error}</p>}
-      {!b.scanMeta?.live && <p className="text-xs" style={{ color: BRAND.amber }}>This website hasn't been scanned yet — go to Websites and run a scan first.</p>}
+      {!b.siteCrawl && <p className="text-xs" style={{ color: BRAND.amber }}>This website hasn't been crawled yet — go to Websites (a crawl starts automatically when you add a site).</p>}
 
       {sim && (
         <div className="space-y-3">
@@ -3250,22 +2436,9 @@ function CompetitorsView() {
   }
   function del(id) { mutate((arr) => arr.filter((x) => x.id !== id)); toast("Competitor removed"); }
 
-  async function analyze(c) {
-    if (b.siteCrawl?.pages?.length) return analyzeSiteWide(c);
-    if (!b.scanMeta?.live) { toast("Run a live scan of your own site first — from Websites.", "error"); return; }
-    setAnalyzing(c.id);
-    try {
-      const data = await postJson("/api/competitor-scan", {
-        competitorUrl: c.url, scanMeta: b.scanMeta, ourKeywords: (b.keywordIntel?.keywords || []).map((k) => k.keyword),
-      });
-      mutate((arr) => arr.map((x) => (x.id === c.id ? { ...x, analysis: data.result } : x)));
-      setExpanded(c.id);
-      toast(data.warning ? "Observed comparison ready (AI interpretation unavailable)" : "Competitor analysis ready");
-    } catch (err) {
-      toast(err.message || "Couldn't analyze that competitor.", "error");
-    } finally {
-      setAnalyzing(null);
-    }
+  function analyze(c) {
+    if (!b.siteCrawl?.pages?.length) { toast("Add a website first — a full-site crawl starts automatically and powers this.", "error"); return; }
+    return analyzeSiteWide(c);
   }
 
   // Site-wide competitor analysis: crawls the competitor's WHOLE site (not
@@ -3283,9 +2456,10 @@ function CompetitorsView() {
 
       if (data.competitorCrawl?.pages?.length) {
         try {
+          const ourMeta = siteMetaFrom(b);
           const bl = await postJson("/api/backlink-opportunities", {
             crawl: data.competitorCrawl,
-            ourContext: b.scanMeta?.title ? `${b.scanMeta.domain} — ${b.scanMeta.title}` : (b.siteCrawl?.domain || ""),
+            ourContext: ourMeta?.title ? `${ourMeta.domain} — ${ourMeta.title}` : (b.siteCrawl?.domain || ""),
           });
           mutate((arr) => arr.map((x) => (x.id === c.id ? { ...x, backlinkOpportunities: bl.result } : x)));
           if ((bl.result.opportunities?.length || 0) > 0) toast(`Found ${bl.result.opportunities.length} potential backlink prospect${bl.result.opportunities.length === 1 ? "" : "s"} from ${c.name}'s site`);
@@ -3336,15 +2510,11 @@ function CompetitorsView() {
   // already know who to add — each suggestion still needs a click to accept
   // since company names/URLs here are the model's best guess, not verified fact.
   async function suggestCompetitors() {
-    let scanMeta = b.scanMeta;
-    if (!scanMeta?.live) {
-      const homepage = b.siteCrawl?.pages?.find((p) => p.url === b.siteCrawl.startUrl) || b.siteCrawl?.pages?.[0];
-      if (homepage) scanMeta = { domain: b.siteCrawl.domain, title: homepage.title, metaDescription: homepage.metaDescription, h1Text: homepage.h1Text, fullText: homepage.fullText };
-    }
-    if (!scanMeta?.domain) { toast("Add a website first — a full-site crawl starts automatically and powers this.", "error"); return; }
+    const siteMeta = siteMetaFrom(b);
+    if (!siteMeta) { toast("Add a website first — a full-site crawl starts automatically and powers this.", "error"); return; }
     setSuggesting(true);
     try {
-      const data = await postJson("/api/competitor-suggestions", { scanMeta });
+      const data = await postJson("/api/competitor-suggestions", { scanMeta: siteMeta });
       const existing = new Set(b.competitors.map((c) => c.name.toLowerCase()));
       const fresh = (data.result.suggestions || []).filter((s) => s.name && !existing.has(s.name.toLowerCase()));
       setSuggestions(() => fresh);
@@ -3356,7 +2526,7 @@ function CompetitorsView() {
     }
   }
   function acceptSuggestion(s) {
-    mutate((arr) => [...arr, { id: uid("comp"), websiteId: currentWebsiteId, analysis: null, name: s.name, url: s.url || s.name.toLowerCase().replace(/\s+/g, "") + ".com" }]);
+    mutate((arr) => [...arr, { id: uid("comp"), websiteId: currentWebsiteId, siteAnalysis: null, name: s.name, url: s.url || s.name.toLowerCase().replace(/\s+/g, "") + ".com" }]);
     setSuggestions((arr) => arr.filter((x) => x.id !== s.id));
     toast(`${s.name} added — verify the URL before analyzing`);
   }
@@ -3368,7 +2538,7 @@ function CompetitorsView() {
         <Info size={14} />
         {b.siteCrawl
           ? `Site-wide comparison is on: analyzing a competitor crawls their whole site and compares it against your ${b.siteCrawl.pagesCrawled}-page crawl, then automatically mines their outbound links for backlink prospects — no manual entry needed.`
-          : "Competitor SEO scores and shared-keyword counts require a paid data provider — not connected yet. You can analyze one real, publicly crawlable competitor page below, or run a full-site crawl of your own site (from Websites) to unlock a full site-wide comparison and automatic backlink discovery."}
+          : "Run a full-site crawl of your own site first (from Websites — one starts automatically when you add a site) to unlock site-wide competitor comparison and automatic backlink discovery."}
       </div>
       <div className="flex justify-end gap-2">
         <Button variant="soft" icon={suggesting ? Loader2 : Sparkles} disabled={suggesting} onClick={suggestCompetitors}>{suggesting ? "Suggesting…" : "Suggest with AI"}</Button>
@@ -3413,13 +2583,13 @@ function CompetitorsView() {
               </div>
               <div className="mt-3 pt-3" style={{ borderTop: `1px solid ${BRAND.line}` }}>
                 {analyzing === c.id ? (
-                  <div className="flex items-center gap-2 text-sm" style={{ color: BRAND.inkSoft }}><Loader2 className="vr-spin" size={16} /> {b.siteCrawl ? "Crawling their whole site and comparing…" : "Crawling and comparing…"}</div>
+                  <div className="flex items-center gap-2 text-sm" style={{ color: BRAND.inkSoft }}><Loader2 className="vr-spin" size={16} /> Crawling their whole site and comparing…</div>
                 ) : (
-                  <Button size="sm" variant="soft" icon={(c.siteAnalysis || c.analysis) ? RefreshCw : Search} onClick={() => analyze(c)}>
-                    {b.siteCrawl ? ((c.siteAnalysis || c.analysis) ? "Re-analyze site-wide" : "Analyze site-wide") : ((c.siteAnalysis || c.analysis) ? "Re-analyze" : "Analyze real page")}
+                  <Button size="sm" variant="soft" icon={c.siteAnalysis ? RefreshCw : Search} onClick={() => analyze(c)}>
+                    {c.siteAnalysis ? "Re-analyze site-wide" : "Analyze site-wide"}
                   </Button>
                 )}
-                {(c.siteAnalysis || c.analysis) && (
+                {c.siteAnalysis && (
                   <button className="text-xs ml-2 underline" style={{ color: BRAND.primary }} onClick={() => setExpanded(expanded === c.id ? null : c.id)}>
                     {expanded === c.id ? "Hide" : "Show"} comparison
                   </button>
@@ -3503,43 +2673,6 @@ function CompetitorsView() {
                           ))}
                         </div>
                       )}
-                    </div>
-                  )}
-                </div>
-              )}
-              {!c.siteAnalysis && c.analysis && expanded === c.id && (
-                <div className="mt-3 space-y-3">
-                  <div className="rounded-lg p-3" style={{ background: BRAND.canvas }}>
-                    <p className="text-[10px] font-semibold mb-1" style={{ color: BRAND.inkSoft }}>OBSERVED COMPETITOR DATA (single page)</p>
-                    <div className="grid grid-cols-2 gap-2 text-xs mb-2">
-                      <span>Word count: {c.analysis.observed.wordCount}</span>
-                      <span>Headings: {c.analysis.observed.headingCount}</span>
-                      <span>Schema: {c.analysis.observed.schemaTypes.join(", ") || "none"}</span>
-                    </div>
-                    {c.analysis.observed.competitorOnlyTopics.length > 0 && (
-                      <>
-                        <p className="text-xs font-medium mb-1">Topics they cover that we don't</p>
-                        <div className="flex flex-wrap gap-1">{c.analysis.observed.competitorOnlyTopics.slice(0, 10).map((t) => <span key={t} className="text-[10px] rounded px-1.5 py-0.5" style={{ background: BRAND.redSoft, color: BRAND.red }}>{t}</span>)}</div>
-                      </>
-                    )}
-                  </div>
-                  {c.analysis.interpretation && (
-                    <div className="rounded-lg p-3" style={{ background: BRAND.primarySoft }}>
-                      <p className="text-[10px] font-semibold mb-1" style={{ color: BRAND.primary }}>VERTEXRANK AI INTERPRETATION</p>
-                      <p className="text-xs mb-2">{c.analysis.interpretation.summary}</p>
-                      <div className="space-y-2">
-                        {c.analysis.interpretation.gaps.map((g) => (
-                          <div key={g.id} className="rounded p-2" style={{ background: BRAND.surface }}>
-                            <div className="flex items-center justify-between gap-2 mb-1"><p className="text-xs font-medium">{g.gap}</p><PriorityBadge priority={g.priority} /></div>
-                            <p className="text-[11px] mb-1.5" style={{ color: BRAND.inkSoft }}>{g.evidence}</p>
-                            <div className="flex justify-end">
-                              <Button size="sm" variant={isAdded(`${c.id}_${g.id}`) ? "outline" : "soft"} icon={isAdded(`${c.id}_${g.id}`) ? Check : ListPlus} disabled={isAdded(`${c.id}_${g.id}`)} onClick={() => addGapToActions(c, g)}>
-                                {isAdded(`${c.id}_${g.id}`) ? "Added" : "Add to Action Center"}
-                              </Button>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
                     </div>
                   )}
                 </div>
@@ -3632,19 +2765,14 @@ function ContentPlannerView() {
   // Keyword Intelligence, AEO, and GEO (site-wide versions preferred once
   // they've been run). This is the only way new ideas enter the planner now.
   async function generateIdeasWithAi() {
-    let scanMeta = b.scanMeta;
-    if (!scanMeta?.live) {
-      const homepage = b.siteCrawl?.pages?.find((p) => p.url === b.siteCrawl.startUrl) || b.siteCrawl?.pages?.[0];
-      if (homepage) scanMeta = { domain: b.siteCrawl.domain, title: homepage.title, metaDescription: homepage.metaDescription, h1Text: homepage.h1Text, fullText: homepage.fullText };
-    }
-    if (!scanMeta?.domain) { toast("Add a website first — a full-site crawl starts automatically and powers this.", "error"); return; }
+    const siteMeta = siteMetaFrom(b);
+    if (!siteMeta) { toast("Add a website first — a full-site crawl starts automatically and powers this.", "error"); return; }
     setGeneratingIdeas(true);
     try {
-      const siteKw = b.siteKeywordClusters?.opportunities;
-      const keywordOpportunities = siteKw?.length ? siteKw.map((o) => ({ problem: o.opportunity, evidence: o.evidence })) : (b.keywordIntel?.opportunities || []);
-      const aeoQuestions = b.siteAeoAnalysis?.questions?.length ? b.siteAeoAnalysis.questions : (b.aeoAnalysis?.questions || []);
-      const geoOpportunities = b.siteGeoAnalysis?.opportunities?.length ? b.siteGeoAnalysis.opportunities : (b.geoAnalysis?.opportunities || []);
-      const data = await postJson("/api/content-ideas", { scanMeta, keywordOpportunities, aeoQuestions, geoOpportunities, count: 4 });
+      const keywordOpportunities = (b.siteKeywordClusters?.opportunities || []).map((o) => ({ problem: o.opportunity, evidence: o.evidence }));
+      const aeoQuestions = b.siteAeoAnalysis?.questions || [];
+      const geoOpportunities = b.siteGeoAnalysis?.opportunities || [];
+      const data = await postJson("/api/content-ideas", { scanMeta: siteMeta, keywordOpportunities, aeoQuestions, geoOpportunities, count: 4 });
       const existing = new Set(b.contentIdeas.map((c) => c.title.toLowerCase()));
       const fresh = (data.result.ideas || []).filter((idea) => idea.title && !existing.has(idea.title.toLowerCase()));
       if (fresh.length === 0) { toast("No new AI-generated ideas this time — try again for different suggestions."); return; }
@@ -3937,7 +3065,8 @@ function BacklinksView() {
     setDiscovering(true); setDiscoverError(""); setManualDiscovery(null);
     try {
       const crawl = await postJson("/api/site-scan", { url: discoverUrl.trim(), maxPages: 25 });
-      const bl = await postJson("/api/backlink-opportunities", { crawl, ourContext: b.scanMeta?.title ? `${b.scanMeta.domain} — ${b.scanMeta.title}` : (b.siteCrawl?.domain || "") });
+      const ourMeta = siteMetaFrom(b);
+      const bl = await postJson("/api/backlink-opportunities", { crawl, ourContext: ourMeta?.title ? `${ourMeta.domain} — ${ourMeta.title}` : (b.siteCrawl?.domain || "") });
       setManualDiscovery(bl.result);
       toast(`Found ${bl.result.candidateDomainsFound} candidate domain${bl.result.candidateDomainsFound === 1 ? "" : "s"} linked from ${crawl.domain}`);
     } catch (err) {
