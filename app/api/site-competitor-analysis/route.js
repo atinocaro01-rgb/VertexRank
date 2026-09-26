@@ -6,9 +6,7 @@ import { aggregateSiteFlags } from "../../../lib/siteSignals";
 // Site-wide competitor analysis: crawls the COMPETITOR's whole site (the
 // client's own site should already have been crawled via /api/site-scan and
 // is passed in as `ourCrawl`) and compares them — content gaps, topic
-// overlap, AEO/GEO differences, and opportunities. The single-page
-// /api/competitor-scan route already does a lighter version of this for one
-// page each; this is the full-site version.
+// overlap, AEO/GEO differences, and opportunities.
 //
 // Time budget: this route does its OWN crawl (of the competitor) inside an
 // already-60s-limited function, so the competitor crawl gets a tighter
