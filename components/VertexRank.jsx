@@ -935,7 +935,7 @@ function Dashboard() {
       {crawled ? (
         <div className="flex items-center gap-2 rounded-lg px-4 py-2.5 text-xs" style={{ background: BRAND.visibilitySoft, color: BRAND.visibility }}>
           <CheckCircle2 size={14} />
-          Technical and Content scores are the site-wide average across {b.siteCrawl.pagesCrawled} crawled pages of {b.siteCrawl.domain} (crawled {fmtDate(b.siteCrawl.crawledAt)}). AEO, GEO, and Keyword scores are VertexRank AI estimates — run each site-wide analysis from its module to compute them.
+          Technical and Content scores are the site-wide average across {b.siteCrawl.pagesCrawled} crawled pages of {b.siteCrawl.domain} (crawled {fmtDate(b.siteCrawl.crawledAt)}). AEO, GEO, and Keyword scores are VertexRank AI estimates, computed automatically right after the crawl — re-run any of them from its own tab if you want a fresh pass.
         </div>
       ) : (
         <div className="flex items-center gap-2 rounded-lg px-4 py-2.5 text-xs" style={{ background: BRAND.amberSoft, color: BRAND.amber }}>
@@ -1180,7 +1180,9 @@ function ScannerView() {
             ...site,
             siteCrawl: data,
             // A fresh crawl invalidates anything computed from the previous
-            // one — clear it and let the user re-run each module.
+            // one — cleared here, then immediately recomputed below so the
+            // Dashboard shows a complete picture without a separate trip to
+            // each module (the "single scan" experience, done site-wide).
             siteKeywordClusters: null,
             siteAeoAnalysis: null,
             siteGeoAnalysis: null,
@@ -1199,7 +1201,43 @@ function ScannerView() {
         const overall = Math.round((technical + content) / 2);
         setWebsites((ws) => ws.map((x) => (x.id === w.id ? { ...x, scores: { ...(x.scores || {}), technical, content, overall } } : x)));
       }
-      toast(`Full-site crawl complete — ${data.pagesCrawled} page${data.pagesCrawled === 1 ? "" : "s"} crawled${data.truncated ? " (time/page limit reached)" : ""}`);
+      toast(`Full-site crawl complete — ${data.pagesCrawled} page${data.pagesCrawled === 1 ? "" : "s"} crawled${data.truncated ? " (time/page limit reached)" : ""}. Running AEO, GEO, and Keyword Intelligence…`);
+
+      // Auto-run the three AI modules right after the crawl — the same way
+      // Technical/Content appear immediately — so AEO, GEO, and Keyword
+      // Intelligence scores are already on the Dashboard without the user
+      // having to open each module and click "Analyze" by hand. Run in
+      // parallel (independent AI calls) and tolerate any one of them
+      // failing without losing the other two or the crawl itself.
+      const [aeoRes, geoRes, kwRes] = await Promise.allSettled([
+        postJson("/api/site-aeo-analysis", { crawl: data, keywords: [] }),
+        postJson("/api/site-geo-analysis", { crawl: data }),
+        postJson("/api/site-keyword-clusters", { crawl: data }),
+      ]);
+      setBundles((prev) => {
+        const site = prev[w.id] || emptyBundle();
+        return {
+          ...prev,
+          [w.id]: {
+            ...site,
+            siteAeoAnalysis: aeoRes.status === "fulfilled" ? aeoRes.value.result : site.siteAeoAnalysis,
+            siteGeoAnalysis: geoRes.status === "fulfilled" ? geoRes.value.result : site.siteGeoAnalysis,
+            siteKeywordClusters: kwRes.status === "fulfilled" ? kwRes.value.result : site.siteKeywordClusters,
+          },
+        };
+      });
+      setWebsites((ws) => ws.map((x) => {
+        if (x.id !== w.id) return x;
+        const scores = { ...(x.scores || {}) };
+        if (aeoRes.status === "fulfilled" && aeoRes.value.result.readinessScore != null) scores.aeo = aeoRes.value.result.readinessScore;
+        if (geoRes.status === "fulfilled" && geoRes.value.result.visibilityScore != null) scores.geo = geoRes.value.result.visibilityScore;
+        if (kwRes.status === "fulfilled" && kwRes.value.result.keywordScore != null) scores.keyword = kwRes.value.result.keywordScore;
+        return { ...x, scores };
+      }));
+      const failedCount = [aeoRes, geoRes, kwRes].filter((r) => r.status === "rejected").length;
+      toast(failedCount > 0
+        ? `${3 - failedCount} of 3 AI analyses finished — ${failedCount} had an issue and can be retried from its own tab.`
+        : "AEO, GEO, and Keyword Intelligence are ready on the Dashboard.");
     } catch (err) {
       clearInterval(ticker);
       setCrawlProgress(0);
@@ -1590,7 +1628,7 @@ function KeywordsView() {
  *  same cluster. Deterministic clustering always shows even if the AI
  *  labeling step fails; see app/api/site-keyword-clusters/route.js. */
 function SiteKeywordClusteringPanel() {
-  const { bundle, setBundles, currentWebsiteId, toast, addAction } = useApp();
+  const { bundle, setBundles, currentWebsiteId, toast, addAction, setScore } = useApp();
   const b = bundle();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -1604,11 +1642,12 @@ function SiteKeywordClusteringPanel() {
         const site = prev[currentWebsiteId] || emptyBundle();
         return { ...prev, [currentWebsiteId]: { ...site, siteKeywordClusters: res.result } };
       });
+      if (res.result.keywordScore != null) setScore("keyword", res.result.keywordScore);
       if (res.warning) toast(res.warning);
-      else toast("Site-wide keyword clusters ready");
+      else toast("Site-wide Keyword Intelligence ready");
     } catch (err) {
-      setError(err.message || "Couldn't cluster this site's keywords.");
-      toast(err.message || "Couldn't cluster this site's keywords.", "error");
+      setError(err.message || "Couldn't analyze this site's keywords.");
+      toast(err.message || "Couldn't analyze this site's keywords.", "error");
     } finally {
       setLoading(false);
     }
@@ -1616,28 +1655,29 @@ function SiteKeywordClusteringPanel() {
 
   function isAdded(id) { return b.actions.some((a) => a.detail?.sourceId === id); }
   function addOpportunity(o) {
-    addAction({ title: o.opportunity, type: "Content Update", status: "New", detail: { sourceId: o.id, module: "Site-wide Keyword Clustering", evidence: o.evidence, priority: o.priority, confidence: "Medium", source: o.source } });
+    addAction({ title: o.problem, type: "Content Update", status: "New", detail: { sourceId: o.id, module: "Site-wide Keyword Intelligence", evidence: o.evidence, recommendedAction: o.recommendedAction, priority: o.priority, confidence: o.confidence, source: o.source } });
     toast("Added to Action Center");
   }
   function addCannibalGuidance(g) {
-    addAction({ title: `${g.recommendedAction} competing pages`, type: "Content Update", status: "New", detail: { sourceId: g.id, module: "Site-wide Keyword Clustering", evidence: g.explanation, recommendedAction: g.reasoning, priority: "High", confidence: "Medium", source: g.source } });
+    addAction({ title: `${g.recommendedAction} competing pages`, type: "Content Update", status: "New", detail: { sourceId: g.id, module: "Site-wide Keyword Intelligence", evidence: g.explanation, recommendedAction: g.reasoning, priority: "High", confidence: "Medium", source: g.source } });
     toast("Added to Action Center");
   }
 
-  if (!b.siteCrawl) return <SiteCrawlGate body="Keyword clustering groups the keywords found across EVERY page of your site and flags cannibalization — two different pages competing for the same topic. That needs a full-site crawl, not just one page." />;
+  if (!b.siteCrawl) return <SiteCrawlGate body="Keyword Intelligence ranks the keywords found across EVERY page of your site, flags cannibalization — two different pages competing for the same topic — and estimates a Keyword Opportunity score. That needs a full-site crawl, not just one page." />;
 
   if (!data) {
-    return <RunAnalysisPanel icon={KeyRound} title="Site-wide keyword clustering" body={`Group the keywords found across all ${b.siteCrawl.pagesCrawled} crawled pages into topic clusters and detect cannibalization — pages competing for the same search intent.`}
-      buttonLabel="Cluster keywords" loadingLabel="Clustering keywords across the site…" onRun={runAnalysis} loading={loading} error={error} />;
+    return <RunAnalysisPanel icon={KeyRound} title="Site-wide Keyword Intelligence" body={`Rank the keywords found across all ${b.siteCrawl.pagesCrawled} crawled pages, group them into topic clusters, detect cannibalization, and surface strategic opportunities.`}
+      buttonLabel="Analyze keywords" loadingLabel="Analyzing keywords across the site…" onRun={runAnalysis} loading={loading} error={error} />;
   }
 
   return (
     <div className="space-y-4">
       <AnalysisBanner icon={KeyRound}>
         {data.domain} · {data.pagesCrawled} pages · {data.clusterCount} clusters · {data.cannibalizationCount} cannibalization risk{data.cannibalizationCount === 1 ? "" : "s"}
+        {data.keywordScore != null && <> · Keyword Opportunity score: <strong>{data.keywordScore}/100</strong></>}
       </AnalysisBanner>
       <div className="flex justify-end">
-        <Button size="sm" variant="soft" icon={loading ? Loader2 : RefreshCw} disabled={loading} onClick={runAnalysis}>{loading ? "Re-clustering…" : "Re-cluster"}</Button>
+        <Button size="sm" variant="soft" icon={loading ? Loader2 : RefreshCw} disabled={loading} onClick={runAnalysis}>{loading ? "Re-analyzing…" : "Re-analyze"}</Button>
       </div>
 
       {data.cannibalizationGuidance && data.cannibalizationGuidance.length > 0 && (
@@ -1678,7 +1718,7 @@ function SiteKeywordClusteringPanel() {
           <h3 className="font-semibold vr-display mb-3">Keyword strategy opportunities</h3>
           <div className="space-y-3">
             {data.opportunities.map((o) => (
-              <RecommendationCard key={o.id} title={o.opportunity} evidence={o.evidence} priority={o.priority} source={o.source} onAdd={() => addOpportunity(o)} added={isAdded(o.id)} />
+              <RecommendationCard key={o.id} title={o.problem} evidence={o.evidence} recommendedAction={o.recommendedAction} priority={o.priority} confidence={o.confidence} source={o.source} onAdd={() => addOpportunity(o)} added={isAdded(o.id)} />
             ))}
           </div>
         </Card>
@@ -1699,6 +1739,47 @@ function SiteKeywordClusteringPanel() {
           </div>
         )}
       </Card>
+
+      {data.entities && data.entities.length > 0 && (
+        <Card className="p-4">
+          <h3 className="font-semibold vr-display mb-1">Entities detected across the site</h3>
+          <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Crawled data · proper-noun phrases found directly in the crawled page text, counted across every page.</p>
+          <div className="flex flex-wrap gap-1.5">
+            {data.entities.map((e) => (
+              <span key={e.entity} className="text-[11px] rounded px-2 py-1" style={{ background: BRAND.canvas, border: `1px solid ${BRAND.line}` }}>{e.entity} <span style={{ color: BRAND.inkSoft }}>×{e.occurrences}</span></span>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {data.keywords && data.keywords.length > 0 && (
+        <Card className="p-4">
+          <h3 className="font-semibold vr-display mb-1">Keywords ({data.keywords.length})</h3>
+          <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Ranked by relative relevance across the whole site — usage counts are real crawl data; difficulty is a VertexRank AI estimate.</p>
+          <div className="space-y-3">
+            {data.keywords.map((k, i) => {
+              const where = [k.usage.title ? "Title" : null, k.usage.h1 ? "H1" : null, k.usage.h2h3 ? "Headings" : null, k.usage.metaDescription ? "Meta" : null, k.usage.alt ? "ALT" : null, k.usage.schema ? "Schema" : null, k.usage.body ? `Body ×${k.usage.body}` : null].filter(Boolean).join(", ") || "Not clearly used";
+              return (
+                <div key={k.keyword + i} className="rounded-lg p-3" style={{ background: BRAND.canvas }}>
+                  <div className="flex items-start justify-between gap-2 mb-1.5">
+                    <p className="text-sm font-medium">{k.keyword}</p>
+                    <CopyButton iconOnly label="Copy this keyword" getText={() => `${k.keyword} — Type: ${k.type}, Intent: ${k.intent}, Relevance: ${k.relevance}, Difficulty: ${k.difficultyEstimate ?? "n/a"}${k.difficultyConfidence ? ` (${k.difficultyConfidence} confidence)` : ""}\nUsed on ${k.pagesUsedOn} page(s) — ${where}\nRecommended usage: ${k.recommendedUsage}\nOptimization opportunity: ${k.opportunity}`} />
+                  </div>
+                  <div className="flex flex-wrap gap-1.5 mb-2">
+                    <Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{k.type}</Badge>
+                    <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>{k.intent}</Badge>
+                    <Badge color={{ fg: BRAND.visibility, bg: BRAND.visibilitySoft }}>Relevance {k.relevance}</Badge>
+                    {k.difficultyEstimate != null && <Badge color={{ fg: BRAND.amber, bg: BRAND.amberSoft }}>Difficulty {k.difficultyEstimate}{k.difficultyConfidence ? ` (${k.difficultyConfidence})` : ""}</Badge>}
+                  </div>
+                  <p className="text-[11px] mb-1.5" style={{ color: BRAND.inkSoft }}>Used on {k.pagesUsedOn} of {data.pagesCrawled} page{data.pagesCrawled === 1 ? "" : "s"} — {where}</p>
+                  {k.recommendedUsage && <p className="text-xs mb-1"><span className="font-medium">Recommended usage: </span>{k.recommendedUsage}</p>}
+                  {k.opportunity && <p className="text-xs" style={{ color: BRAND.inkSoft }}><span className="font-medium" style={{ color: BRAND.ink }}>Optimization opportunity: </span>{k.opportunity}</p>}
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
     </div>
   );
 }
@@ -1901,7 +1982,7 @@ const COVERAGE_COLOR = {
  *  whichever one a naive single-page look would have happened to check.
  *  Reads b.siteCrawl, from the full-site crawl. */
 function SiteAeoPanel() {
-  const { bundle, setBundles, currentWebsiteId, toast, addAction } = useApp();
+  const { bundle, setBundles, currentWebsiteId, toast, addAction, setScore } = useApp();
   const b = bundle();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -1917,6 +1998,7 @@ function SiteAeoPanel() {
         const site = prev[currentWebsiteId] || emptyBundle();
         return { ...prev, [currentWebsiteId]: { ...site, siteAeoAnalysis: data.result } };
       });
+      if (data.result.readinessScore != null) setScore("aeo", data.result.readinessScore);
       if (data.warning) toast(data.warning);
       else toast("Site-wide AEO analysis generated by VertexRank AI");
     } catch (err) {
@@ -2199,7 +2281,7 @@ const READINESS_COLOR = {
  *  trust signals from a full-site crawl, plus entities detected across every
  *  crawled page — not just one URL. */
 function SiteGeoPanel() {
-  const { bundle, setBundles, currentWebsiteId, toast, addAction } = useApp();
+  const { bundle, setBundles, currentWebsiteId, toast, addAction, setScore } = useApp();
   const b = bundle();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -2213,6 +2295,7 @@ function SiteGeoPanel() {
         const site = prev[currentWebsiteId] || emptyBundle();
         return { ...prev, [currentWebsiteId]: { ...site, siteGeoAnalysis: data.result } };
       });
+      if (data.result.visibilityScore != null) setScore("geo", data.result.visibilityScore);
       if (data.warning) toast(data.warning);
       else toast("Site-wide GEO analysis generated by VertexRank AI");
     } catch (err) {
@@ -2769,7 +2852,7 @@ function ContentPlannerView() {
     if (!siteMeta) { toast("Add a website first — a full-site crawl starts automatically and powers this.", "error"); return; }
     setGeneratingIdeas(true);
     try {
-      const keywordOpportunities = (b.siteKeywordClusters?.opportunities || []).map((o) => ({ problem: o.opportunity, evidence: o.evidence }));
+      const keywordOpportunities = (b.siteKeywordClusters?.opportunities || []).map((o) => ({ problem: o.problem, evidence: o.evidence }));
       const aeoQuestions = b.siteAeoAnalysis?.questions || [];
       const geoOpportunities = b.siteGeoAnalysis?.opportunities || [];
       const data = await postJson("/api/content-ideas", { scanMeta: siteMeta, keywordOpportunities, aeoQuestions, geoOpportunities, count: 4 });
