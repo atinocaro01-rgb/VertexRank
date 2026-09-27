@@ -1,29 +1,52 @@
 import { callOpenRouterJson } from "../../../lib/openrouter";
-import { clusterSiteKeywords, aggregateSiteKeywords, aggregateSiteEntities } from "../../../lib/keywordClustering";
+import { clusterSiteKeywords, aggregateSiteKeywords, aggregateSiteEntities, auditKeywordUsage, scoreKeywordUsage } from "../../../lib/keywordClustering";
 
 // Site-wide Keyword Intelligence. Everything factual is computed
 // deterministically, always returned even if the AI step below fails:
-// - clusterSiteKeywords: topic clusters + cannibalization (which pages
-//   compete for the same cluster)
-// - aggregateSiteKeywords: one ranked keyword table across every crawled
-//   page (type/intent/usage counts/relative relevance)
-// - aggregateSiteEntities: proper-noun phrases found across the site
-// The AI layer only adds judgment on top of those facts: a human-readable
-// label per cluster, cannibalization guidance, a difficulty estimate and
-// recommendation per keyword, and a handful of strategic opportunities.
-// The overall Keyword Opportunity score is then computed deterministically
-// from the AI's own opportunity list (see scoreFromOpportunities below), not
-// asked of the model directly, so it can't drift from the opportunities shown.
+// - aggregateSiteKeywords + auditKeywordUsage: one ranked keyword table
+//   across every crawled page, with a real Strong/Weak/Poor usage verdict
+//   and concrete flags per keyword (e.g. "not in any title") — zero AI
+//   involved in the verdict itself.
+// - scoreKeywordUsage: the site's Keyword Usage Score, a relevance-weighted
+//   average of real placement data. Computed BEFORE the AI call and never
+//   overwritten by it, so the score on the Dashboard is stable and always
+//   present, even on a total AI outage.
+// - clusterSiteKeywords: still used internally to detect cannibalization
+//   (2+ different pages strongly targeting the same topic) — clusters
+//   themselves are no longer a user-facing concept here.
+// - aggregateSiteEntities: proper-noun phrases found across the site, used
+//   as grounding context for the AI's new-keyword suggestions.
+// The AI layer's job is now narrow and concrete: (1) a one-sentence fix for
+// each keyword the audit above already flagged, (2) a short list of new
+// keywords this site isn't targeting yet but plausibly should, grounded in
+// its real entities/topics, and (3) plain-language cannibalization guidance.
+// It never re-derives the score and never invents the usage verdict.
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const OPPORTUNITY_PENALTY = { Critical: 20, High: 12, Medium: 6, Low: 2 };
+const STATUS_RANK = { Poor: 0, Weak: 1, Strong: 2 };
 
-function scoreFromOpportunities(opportunities) {
-  if (!opportunities) return null;
-  const penalty = opportunities.reduce((sum, o) => sum + (OPPORTUNITY_PENALTY[o.priority] ?? 6), 0);
-  return Math.max(0, Math.min(100, 100 - penalty));
+function describeUsage(k) {
+  return [
+    k.usage.title ? "title" : null,
+    k.usage.h1 ? "H1" : null,
+    k.usage.h2h3 ? "H2/H3" : null,
+    k.usage.metaDescription ? "meta description" : null,
+    k.usage.alt ? "ALT text" : null,
+    k.usage.schema ? "schema" : null,
+    k.usage.body ? `body (${k.usage.body}x across the site)` : null,
+  ].filter(Boolean).join(", ") || "not clearly used anywhere";
+}
+
+/** Grounded priority for a flagged keyword — deterministic, not asked of
+ * the AI, so it can't drift between runs: how urgent this is depends on
+ * real relevance + how badly it's placed, both already known facts. */
+function priorityForKeyword(k) {
+  if (k.status === "Poor" && k.relevance >= 70) return "Critical";
+  if (k.status === "Poor" || (k.status === "Weak" && k.relevance >= 70)) return "High";
+  if (k.status === "Weak") return "Medium";
+  return "Low";
 }
 
 export async function POST(req) {
@@ -39,128 +62,128 @@ export async function POST(req) {
     return Response.json({ error: "Site crawl data is required. Run a full-site crawl first." }, { status: 400 });
   }
 
-  const { clusters, cannibalization } = clusterSiteKeywords(crawl.pages);
-  // Kept deliberately smaller than this function's own defaults (24): this
-  // is already the single largest AI request in the app (cluster insights +
-  // cannibalization guidance + per-keyword insights + opportunities all in
-  // one JSON reply), and a big keyword table was the direct cause of
-  // responses being cut off before the model finished writing valid JSON
-  // (see the maxTokens/timeout comment below). Trimming the ask keeps the
-  // reply achievable within that budget on every provider in the chain,
-  // not just the fastest one.
+  const { cannibalization } = clusterSiteKeywords(crawl.pages);
+  // Kept smaller than this function's own default (24): this is still the
+  // largest AI request in the app, and a big table was the direct cause of
+  // replies being cut off before the model finished writing valid JSON.
   const keywordCandidates = aggregateSiteKeywords(crawl.pages, 18);
   const entities = aggregateSiteEntities(crawl.pages, 20);
+  const audited = auditKeywordUsage(keywordCandidates, crawl.pages.length).map((k, i) => ({ ...k, id: `kw_${i}` }));
+  const keywordScore = scoreKeywordUsage(audited, cannibalization.length);
 
   const observed = {
     domain: crawl.domain,
     pagesCrawled: crawl.pages.length,
-    clusterCount: clusters.length,
     cannibalizationCount: cannibalization.length,
-    clusters,
     cannibalization,
     entities,
+    keywordScore,
   };
 
-  if (clusters.length === 0 && keywordCandidates.length === 0) {
+  if (audited.length === 0) {
     return Response.json({
-      result: { ...observed, keywords: [], cannibalizationGuidance: [], opportunities: [], keywordScore: null, generatedAt: new Date().toISOString() },
+      result: { ...observed, keywords: [], suggestedKeywords: [], cannibalizationGuidance: [], opportunities: [], generatedAt: new Date().toISOString() },
     });
   }
 
-  const topClusters = clusters.slice(0, 14);
-  const clusterBlock = topClusters.length
-    ? topClusters
-        .map((c, i) => `${i + 1}. [id=${c.id}] Keywords: ${c.keywords.slice(0, 6).join(", ")}. Used on ${c.pages.length} page(s): ${c.pages.map((p) => `"${p.title}" (${p.url})${p.strong ? " [strongly targeted]" : ""}`).join("; ")}`)
-        .join("\n")
-    : "(no multi-keyword clusters found)";
+  // Only keywords the deterministic audit already flagged need an AI fix
+  // suggestion — usually well under the full keyword table, which keeps
+  // the AI's reply small and fast regardless of site size.
+  const flagged = audited.filter((k) => k.flags.length > 0);
+
+  const keywordBlock = audited.length
+    ? audited.map((k) => `[id=${k.id}] "${k.keyword}" — relevance ${k.relevance}/100, status: ${k.status}, used on ${k.pagesUsedOn} of ${crawl.pages.length} page(s), appears in: ${describeUsage(k)}${k.flags.length ? `. Flags: ${k.flags.join("; ")}` : ""}`).join("\n")
+    : "(no keyword candidates found in the crawled text)";
+  const flaggedBlock = flagged.length
+    ? flagged.map((k) => `[id=${k.id}] "${k.keyword}" (${k.status}, relevance ${k.relevance}/100). Currently: ${describeUsage(k)}. Problem(s): ${k.flags.join("; ")}`).join("\n")
+    : "(no flagged keywords — every tracked keyword already has strong placement)";
+  const entityBlock = entities.length ? entities.slice(0, 15).map((e) => `${e.entity} (×${e.occurrences})`).join(", ") : "(none detected)";
+  const existingKeywordSet = new Set(audited.map((k) => k.keyword.toLowerCase()));
   const cannibalBlock = cannibalization.length
     ? cannibalization.map((c, i) => `${i + 1}. [id=${c.clusterId}] Keywords: ${c.keywords.join(", ")}. Pages competing for this: ${c.competingPages.map((p) => `"${p.title}" (${p.url})`).join(" vs ")}`).join("\n")
     : "(none detected)";
-  const keywordBlock = keywordCandidates.length
-    ? keywordCandidates
-        .map((k, i) => {
-          const where = [k.usage.title ? "title" : null, k.usage.h1 ? "H1" : null, k.usage.h2h3 ? "H2/H3" : null, k.usage.metaDescription ? "meta description" : null, k.usage.alt ? "ALT text" : null, k.usage.schema ? "schema" : null, k.usage.body ? `body (${k.usage.body}x across the site)` : null].filter(Boolean).join(", ") || "not clearly used anywhere";
-          return `${i + 1}. [id=kw_${i}] "${k.keyword}" — type: ${k.type}, intent: ${k.intent}, relevance: ${k.relevance}/100, used on ${k.pagesUsedOn} of ${crawl.pages.length} page(s), appears in: ${where}`;
-        })
-        .join("\n")
-    : "(no strong keyword candidates found in the crawled text)";
 
-  const system = `You are VertexRank AI, a site-wide keyword strategist. You are given real keyword clusters, a real ranked keyword table, and real entity mentions computed deterministically from a full crawl of every page on a site — all of that is FACT, not your invention. Your job is to add judgment on top: name each cluster, explain cannibalization risk, estimate ranking difficulty for the given keywords (there is no real search-volume/difficulty data source connected — say so implicitly by giving a confidence level, never invent a precise number you present as certain), and recommend concrete next steps grounded only in the real usage data given. You never invent search volume, ranking positions, or traffic figures.`;
+  const system = `You are VertexRank AI, a practical on-page keyword strategist. You are given a real, deterministically-computed keyword usage audit from a full crawl of every page on a site — the relevance scores, placement facts, and flagged problems are FACT, not your invention; you never re-score or contradict them. Your job is narrow: (1) write one concrete, one-sentence fix for each flagged keyword, grounded only in where it's currently used/not used, (2) propose a short list of genuinely new, specific keyword phrases this site should target but currently doesn't (never repeat a keyword already in the audited table), grounded in the real entities/topics found on the site, and (3) explain cannibalization risk in plain language. You never invent search volume, ranking positions, or traffic figures.`;
 
   const prompt = `Website: ${crawl.domain}
 Pages crawled: ${crawl.pages.length}
 
-Top keyword clusters (real, computed from the crawl):
-${clusterBlock}
-
-Keyword cannibalization detected (2+ different pages strongly targeting the same cluster):
-${cannibalBlock}
-
-Ranked keyword table (real usage counts, aggregated across every crawled page):
+Full ranked keyword table (real usage data from the crawl):
 ${keywordBlock}
 
-For each numbered cluster above, provide:
-- id (must match the [id=...] shown)
-- label: a clear, human-readable topic name (2-5 words)
-- insight: one sentence on what this cluster represents and how well it's currently covered
+Keywords flagged as needing a fix (subset of the table above):
+${flaggedBlock}
 
-For each numbered cannibalization case above, provide:
+Proper-noun entities/topics found across the site (real, from the crawl):
+${entityBlock}
+
+Keyword cannibalization detected (2+ different pages strongly targeting the same topic):
+${cannibalBlock}
+
+For each flagged keyword above, provide:
+- id (must match the [id=kw_...] shown)
+- fixSuggestion: one concrete sentence on exactly how to fix its placement (e.g. "Add this to the H1 of the Services page — it's currently buried in body text only")
+- recommendedPlacement: one short phrase naming where it should go (e.g. "Page title + H1 of /services")
+
+Then propose 6-10 NEW keyword phrases this site should consider targeting that are NOT already in the keyword table above. Ground each in the real entities/topics/business shown, not generic SEO filler. For each, provide:
+- keyword: the specific phrase
+- intent: "Informational", "Commercial", "Transactional", or "Navigational"
+- whyRelevant: one sentence on why this fits the business shown above
+- recommendedPlacement: one short phrase naming where/how to introduce it (e.g. "New H2 section on the homepage" or "New blog post targeting this")
+- priority: "Critical", "High", "Medium", or "Low"
+
+Then for each numbered cannibalization case above, provide:
 - clusterId (must match the [id=...] shown)
 - explanation: plain-language explanation of the risk, grounded in the real competing pages listed
 - recommendedAction: one of "Consolidate" (merge into one page), "Differentiate" (keep both but make each target a clearly different angle/intent), or "Redirect" (one page should redirect to the other)
 - primaryPageUrl: which of the competing page URLs should be the primary/surviving page (must be one of the URLs listed for that case)
-- reasoning: one sentence grounded in the real data (e.g. word count, which page is more complete) for why that page should be primary
-
-For each numbered keyword in the ranked keyword table above, provide:
-- id (must match the [id=kw_...] shown)
-- difficultyEstimate: your best-guess ranking difficulty 0-100 (0=trivial, 100=extremely competitive) — this is an estimate, not real SERP data
-- difficultyConfidence: "Low", "Medium", or "High" — how confident you are in that estimate given only on-page data
-- recommendedUsage: one sentence on how this keyword should be used across the site, grounded in where it currently appears (or doesn't)
-- opportunity: one sentence naming the specific optimization opportunity for this keyword (a gap, an underused placement, a missing page, etc.)
-
-Then list up to 8 site-wide keyword strategy opportunities, each a real problem visible in the data above (e.g. a high-relevance keyword barely used anywhere, a whole cluster with no page strongly targeting it, a valuable term buried only in body text). For each, provide:
-- problem: the specific problem (1 sentence)
-- evidence: what in the crawl/keyword data shows this (1 sentence)
-- recommendedAction: a concrete next step (1 sentence)
-- priority: "Critical", "High", "Medium", or "Low"
-- confidence: "Low", "Medium", or "High"
+- reasoning: one sentence grounded in the real data for why that page should be primary
 
 Respond with ONLY a JSON object, no markdown fences, no commentary, in exactly this shape:
 {
-  "clusterInsights": [ { "id": "string", "label": "string", "insight": "string" } ],
-  "cannibalizationGuidance": [ { "clusterId": "string", "explanation": "string", "recommendedAction": "string", "primaryPageUrl": "string", "reasoning": "string" } ],
-  "keywordInsights": [ { "id": "string", "difficultyEstimate": 0, "difficultyConfidence": "Low|Medium|High", "recommendedUsage": "string", "opportunity": "string" } ],
-  "opportunities": [ { "problem": "string", "evidence": "string", "recommendedAction": "string", "priority": "Critical|High|Medium|Low", "confidence": "Low|Medium|High" } ]
+  "keywordFixes": [ { "id": "string", "fixSuggestion": "string", "recommendedPlacement": "string" } ],
+  "suggestedKeywords": [ { "keyword": "string", "intent": "string", "whyRelevant": "string", "recommendedPlacement": "string", "priority": "Critical|High|Medium|Low" } ],
+  "cannibalizationGuidance": [ { "clusterId": "string", "explanation": "string", "recommendedAction": "string", "primaryPageUrl": "string", "reasoning": "string" } ]
 }`;
 
   try {
-    // This route asks for by far the largest JSON reply in the app (cluster
-    // insights + cannibalization guidance + up to 18 keyword insights + up
-    // to 8 opportunities, each multi-sentence) — every other route here
-    // tops out at maxTokens 2600. At the old maxTokens: 3600 with the
-    // shared default timeouts (12s/model, 42s total), a model that spends
-    // part of its budget "thinking" before answering would either get cut
-    // off mid-reasoning (surfaced as a JSON-parse failure showing raw
-    // reasoning text) or hit the per-model timeout ("took too long"),
-    // depending on which one ran out first. Both symptoms were the same
-    // root cause: not enough token/time headroom for how much output this
-    // specific request requires. maxDuration on this route is 60s, so
-    // overallBudgetMs leaves ~10s of slack below that ceiling for request
-    // overhead and the deterministic post-processing below.
+    // This is still the largest AI request in the app, so it keeps a
+    // larger token/time budget than the shared defaults (which are tuned
+    // for much lighter routes). maxDuration on this route is 60s;
+    // overallBudgetMs leaves ~10s of slack below that ceiling.
     const parsed = await callOpenRouterJson({
       system,
       prompt,
-      maxTokens: 6500,
+      maxTokens: 5000,
       temperature: 0.5,
-      perModelTimeoutMs: 20000,
-      overallBudgetMs: 50000,
+      perModelTimeoutMs: 18000,
+      overallBudgetMs: 48000,
     });
 
-    const insightById = new Map((parsed.clusterInsights || []).map((c) => [c.id, c]));
-    const clustersWithLabels = clusters.map((c) => {
-      const ai = insightById.get(c.id);
-      return { ...c, label: ai?.label || c.label, insight: ai?.insight || "", source: ai ? "Crawled Data + VertexRank AI Analysis" : "Crawled Data" };
-    });
+    const fixById = new Map((parsed.keywordFixes || []).map((f) => [f.id, f]));
+    const keywords = audited.map((k) => {
+      const fix = fixById.get(k.id);
+      return {
+        ...k,
+        fixSuggestion: k.flags.length ? (fix?.fixSuggestion || "") : "",
+        recommendedPlacement: k.flags.length ? (fix?.recommendedPlacement || "") : "",
+        priority: k.flags.length ? priorityForKeyword(k) : "Low",
+        source: fix ? "Crawled Data + VertexRank AI Analysis" : "Crawled Data",
+      };
+    }).sort((a, b) => STATUS_RANK[a.status] - STATUS_RANK[b.status] || b.relevance - a.relevance);
+
+    const suggestedKeywords = (parsed.suggestedKeywords || [])
+      .filter((s) => s.keyword && !existingKeywordSet.has(s.keyword.toLowerCase()))
+      .slice(0, 10)
+      .map((s, idx) => ({
+        id: `sugg_${idx}`,
+        keyword: s.keyword,
+        intent: s.intent || "Informational",
+        whyRelevant: s.whyRelevant || "",
+        recommendedPlacement: s.recommendedPlacement || "",
+        priority: ["Critical", "High", "Medium", "Low"].includes(s.priority) ? s.priority : "Medium",
+        source: "VertexRank AI Analysis",
+      }));
 
     const validCannibalIds = new Set(cannibalization.map((c) => c.clusterId));
     const cannibalizationGuidance = (parsed.cannibalizationGuidance || [])
@@ -179,44 +202,57 @@ Respond with ONLY a JSON object, no markdown fences, no commentary, in exactly t
         };
       });
 
-    const insightByKwId = new Map((parsed.keywordInsights || []).map((k) => [k.id, k]));
-    const keywords = keywordCandidates.map((k, i) => {
-      const ai = insightByKwId.get(`kw_${i}`);
-      return {
-        ...k,
-        difficultyEstimate: typeof ai?.difficultyEstimate === "number" ? Math.max(0, Math.min(100, Math.round(ai.difficultyEstimate))) : null,
-        difficultyConfidence: ai?.difficultyConfidence || null,
-        recommendedUsage: ai?.recommendedUsage || "",
-        opportunity: ai?.opportunity || "",
-        source: ai ? "Crawled Data + VertexRank AI Analysis" : "Crawled Data",
-      };
-    });
-
-    const opportunities = (parsed.opportunities || []).map((o, idx) => ({
-      id: `kwop_${idx}`,
-      problem: o.problem || "",
-      evidence: o.evidence || "",
-      recommendedAction: o.recommendedAction || "",
-      priority: ["Critical", "High", "Medium", "Low"].includes(o.priority) ? o.priority : "Medium",
-      confidence: ["Low", "Medium", "High"].includes(o.confidence) ? o.confidence : "Medium",
-      source: "VertexRank AI Analysis",
-    }));
+    // "opportunities" keeps the exact shape the Dashboard's Unified AI
+    // Recommendations / Action Center already expect from this module
+    // (id/problem/evidence/recommendedAction/priority/confidence/source) —
+    // just populated from the new, more concrete fix + new-keyword data
+    // instead of a separate AI-invented list. "High" confidence on fixes
+    // because they're grounded in directly observed placement facts;
+    // "Medium" on new keywords since there's no real search-volume data.
+    const opportunities = [
+      ...keywords.filter((k) => k.flags.length > 0).map((k) => ({
+        id: `kwop_${k.id}`,
+        problem: `"${k.keyword}" — ${k.flags[0]}`,
+        evidence: `Currently used in: ${describeUsage(k)}. Relevance ${k.relevance}/100, used on ${k.pagesUsedOn} of ${crawl.pages.length} page(s).`,
+        recommendedAction: k.fixSuggestion || "Improve this keyword's placement in titles/headings.",
+        priority: k.priority,
+        confidence: "High",
+        source: k.source,
+      })),
+      ...suggestedKeywords.map((s) => ({
+        id: `kwop_${s.id}`,
+        problem: `Not yet targeted: "${s.keyword}"`,
+        evidence: s.whyRelevant,
+        recommendedAction: s.recommendedPlacement || `Add "${s.keyword}" to relevant page content.`,
+        priority: s.priority,
+        confidence: "Medium",
+        source: s.source,
+      })),
+    ];
 
     return Response.json({
       result: {
         ...observed,
-        clusters: clustersWithLabels,
-        cannibalizationGuidance,
         keywords,
+        suggestedKeywords,
+        cannibalizationGuidance,
         opportunities,
-        keywordScore: scoreFromOpportunities(opportunities),
         generatedAt: new Date().toISOString(),
       },
     });
   } catch (err) {
     return Response.json({
-      result: { ...observed, keywords: keywordCandidates, cannibalizationGuidance: [], opportunities: [], keywordScore: null, generatedAt: new Date().toISOString() },
-      warning: err.message || "VertexRank AI couldn't generate keyword narratives, but the clusters, keyword table, and entities above are real, computed from the crawl.",
+      result: {
+        ...observed,
+        keywords: audited
+          .map((k) => ({ ...k, fixSuggestion: "", recommendedPlacement: "", priority: k.flags.length ? priorityForKeyword(k) : "Low", source: "Crawled Data" }))
+          .sort((a, b) => STATUS_RANK[a.status] - STATUS_RANK[b.status] || b.relevance - a.relevance),
+        suggestedKeywords: [],
+        cannibalizationGuidance: [],
+        opportunities: [],
+        generatedAt: new Date().toISOString(),
+      },
+      warning: err.message || "VertexRank AI couldn't generate fix suggestions or new keyword ideas, but the usage audit and score above are real, computed from the crawl.",
     });
   }
 }
