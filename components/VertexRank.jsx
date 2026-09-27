@@ -1632,6 +1632,7 @@ function SiteKeywordClusteringPanel() {
   const b = bundle();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [typeFilter, setTypeFilter] = useState("All");
   const data = b.siteKeywordClusters;
 
   async function runAnalysis() {
@@ -1697,26 +1698,12 @@ function SiteKeywordClusteringPanel() {
         </div>
       </Card>
 
-      {data.suggestedKeywords && data.suggestedKeywords.length > 0 && (
+      {data.opportunities && data.opportunities.length > 0 && (
         <Card className="p-4">
-          <h3 className="font-semibold vr-display mb-1">Keywords you should add ({data.suggestedKeywords.length})</h3>
-          <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Not currently targeted anywhere on the site — grounded in the real topics/entities found in the crawl.</p>
+          <h3 className="font-semibold vr-display mb-3">Keyword Opportunity Analysis</h3>
           <div className="space-y-3">
-            {data.suggestedKeywords.map((sug) => (
-              <div key={sug.id} className="rounded-lg p-3.5" style={{ background: BRAND.canvas }}>
-                <div className="flex items-start justify-between gap-2 mb-1.5">
-                  <p className="text-sm font-medium">{sug.keyword}</p>
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    <PriorityBadge priority={sug.priority} />
-                    <CopyButton iconOnly label="Copy this keyword" getText={() => `${sug.keyword} — Intent: ${sug.intent}, Priority: ${sug.priority}\nWhy: ${sug.whyRelevant}\nRecommended placement: ${sug.recommendedPlacement}`} />
-                  </div>
-                </div>
-                <div className="flex flex-wrap gap-1.5 mb-2">
-                  <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.surface }}>{sug.intent}</Badge>
-                </div>
-                {sug.whyRelevant && <p className="text-xs mb-1">{sug.whyRelevant}</p>}
-                {sug.recommendedPlacement && <p className="text-[11px]" style={{ color: BRAND.inkSoft }}><span className="font-medium" style={{ color: BRAND.ink }}>Where to add it: </span>{sug.recommendedPlacement}</p>}
-              </div>
+            {data.opportunities.map((o) => (
+              <RecommendationCard key={o.id} title={o.problem} evidence={o.evidence} recommendedAction={o.recommendedAction} priority={o.priority} confidence={o.confidence} source={o.source} onAdd={() => addOpportunity(o)} added={isAdded(o.id)} />
             ))}
           </div>
         </Card>
@@ -1755,17 +1742,6 @@ function SiteKeywordClusteringPanel() {
         </Card>
       )}
 
-      {data.opportunities && data.opportunities.length > 0 && (
-        <Card className="p-4">
-          <h3 className="font-semibold vr-display mb-3">Keyword strategy opportunities</h3>
-          <div className="space-y-3">
-            {data.opportunities.map((o) => (
-              <RecommendationCard key={o.id} title={o.problem} evidence={o.evidence} recommendedAction={o.recommendedAction} priority={o.priority} confidence={o.confidence} source={o.source} onAdd={() => addOpportunity(o)} added={isAdded(o.id)} />
-            ))}
-          </div>
-        </Card>
-      )}
-
       {data.entities && data.entities.length > 0 && (
         <Card className="p-4">
           <h3 className="font-semibold vr-display mb-1">Entities detected across the site</h3>
@@ -1778,48 +1754,59 @@ function SiteKeywordClusteringPanel() {
         </Card>
       )}
 
-      {data.keywords && data.keywords.length > 0 && (
-        <Card className="p-4">
-          <h3 className="font-semibold vr-display mb-1">Keyword usage audit ({data.keywords.length})</h3>
-          <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Every real keyword found across the site, worst-placed first — usage and status are real crawl data; fixes are VertexRank AI suggestions.</p>
-          <div className="space-y-3">
-            {data.keywords.map((k, i) => {
-              const where = [k.usage.title ? "Title" : null, k.usage.h1 ? "H1" : null, k.usage.h2h3 ? "Headings" : null, k.usage.metaDescription ? "Meta" : null, k.usage.alt ? "ALT" : null, k.usage.schema ? "Schema" : null, k.usage.body ? `Body ×${k.usage.body}` : null].filter(Boolean).join(", ") || "Not clearly used";
-              const statusColor = k.status === "Strong" ? { fg: BRAND.visibility, bg: BRAND.visibilitySoft } : k.status === "Weak" ? { fg: BRAND.amber, bg: BRAND.amberSoft } : { fg: BRAND.red, bg: BRAND.redSoft };
-              return (
-                <div key={k.id || k.keyword + i} className="rounded-lg p-3" style={{ background: BRAND.canvas }}>
-                  <div className="flex items-start justify-between gap-2 mb-1.5">
-                    <p className="text-sm font-medium">{k.keyword}</p>
-                    <div className="flex items-center gap-1.5 shrink-0">
-                      {k.flags.length > 0 && <PriorityBadge priority={k.priority} />}
-                      <CopyButton iconOnly label="Copy this keyword" getText={() => `${k.keyword} — Status: ${k.status}, Relevance: ${k.relevance}, Placement score: ${k.placementScore}\nUsed on ${k.pagesUsedOn} page(s) — ${where}${k.flags.length ? `\nIssues: ${k.flags.join("; ")}` : ""}${k.fixSuggestion ? `\nSuggested fix: ${k.fixSuggestion}` : ""}${k.recommendedPlacement ? `\nRecommended placement: ${k.recommendedPlacement}` : ""}`} />
-                    </div>
-                  </div>
-                  <div className="flex flex-wrap gap-1.5 mb-2">
-                    <Badge color={statusColor}>{k.status}</Badge>
-                    <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>{k.intent}</Badge>
-                    <Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>Relevance {k.relevance}</Badge>
-                  </div>
-                  <p className="text-[11px] mb-1.5" style={{ color: BRAND.inkSoft }}>Used on {k.pagesUsedOn} of {data.pagesCrawled} page{data.pagesCrawled === 1 ? "" : "s"} — {where}</p>
-                  {k.flags.length > 0 && (
-                    <div className="rounded p-2 mb-1.5" style={{ background: BRAND.redSoft }}>
-                      <p className="text-[10px] font-semibold mb-0.5" style={{ color: BRAND.red }}>WHAT'S WRONG</p>
-                      <ul className="text-xs list-disc list-inside space-y-0.5">{k.flags.map((f, fi) => <li key={fi}>{f}</li>)}</ul>
-                    </div>
-                  )}
-                  {k.fixSuggestion && (
-                    <div className="rounded p-2 mb-1" style={{ background: BRAND.visibilitySoft }}>
-                      <p className="text-[10px] font-semibold mb-0.5" style={{ color: BRAND.visibility }}>HOW TO FIX IT</p>
-                      <p className="text-xs">{k.fixSuggestion}</p>
-                    </div>
-                  )}
-                  {k.recommendedPlacement && <p className="text-[11px]" style={{ color: BRAND.inkSoft }}><span className="font-medium" style={{ color: BRAND.ink }}>Recommended placement: </span>{k.recommendedPlacement}</p>}
-                </div>
-              );
-            })}
-          </div>
-        </Card>
-      )}
+      {(data.keywords.length > 0 || (data.suggestedKeywords && data.suggestedKeywords.length > 0)) && (() => {
+        const merged = [...data.keywords, ...(data.suggestedKeywords || [])].sort((a, b2) => (b2.relevance ?? 0) - (a.relevance ?? 0));
+        const types = ["All", ...Array.from(new Set(merged.map((k) => k.type).filter(Boolean)))];
+        const rows = typeFilter === "All" ? merged : merged.filter((k) => k.type === typeFilter);
+        return (
+          <Card className="overflow-hidden">
+            <div className="p-4 pb-2 flex items-center justify-between gap-3 flex-wrap">
+              <div>
+                <h3 className="font-semibold vr-display">Keywords ({rows.length})</h3>
+                <p className="text-xs" style={{ color: BRAND.inkSoft }}>Real keywords found on the site, ranked alongside VertexRank AI's new suggestions — sorted by relevance.</p>
+              </div>
+              <div className="w-40">
+                <Select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
+                  {types.map((t) => <option key={t} value={t}>{t}</option>)}
+                </Select>
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead><tr style={{ borderBottom: `1px solid ${BRAND.line}` }}>
+                  <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Keyword</th>
+                  <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Type</th>
+                  <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Intent</th>
+                  <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Occurs</th>
+                  <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Where it appears</th>
+                  <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Relevance</th>
+                  <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Difficulty (AI est.)</th>
+                </tr></thead>
+                <tbody>
+                  {rows.map((k, i) => {
+                    const where = [k.usage?.title ? "Title" : null, k.usage?.h1 ? "H1" : null, k.usage?.h2h3 ? "H2/H3" : null, k.usage?.metaDescription ? "Meta" : null, k.usage?.alt ? "ALT" : null, k.usage?.schema ? "Schema" : null, k.usage?.body ? `Body ×${k.usage.body}` : null].filter(Boolean);
+                    return (
+                      <tr key={k.id || k.keyword + i} className="vr-row align-top" style={{ borderBottom: `1px solid ${BRAND.line}` }}>
+                        <td className="px-4 py-2.5 font-medium">{k.keyword}</td>
+                        <td className="px-4 py-2.5"><Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{k.type}</Badge></td>
+                        <td className="px-4 py-2.5" style={{ color: BRAND.inkSoft }}>{k.intent}</td>
+                        <td className="px-4 py-2.5 vr-mono" style={{ color: BRAND.inkSoft }}>{k.occurs ?? 0}</td>
+                        <td className="px-4 py-2.5">
+                          <div className="flex flex-wrap gap-1 max-w-[220px]">
+                            {where.length > 0 ? where.map((w) => <span key={w} className="text-[10px] rounded px-1.5 py-0.5" style={{ background: BRAND.visibilitySoft, color: BRAND.visibility }}>{w}</span>) : <span className="text-xs" style={{ color: BRAND.inkSoft }}>Not found on page</span>}
+                          </div>
+                        </td>
+                        <td className="px-4 py-2.5 vr-mono">{k.relevance ?? "—"}</td>
+                        <td className="px-4 py-2.5 vr-mono" style={{ color: BRAND.inkSoft }}>{k.difficulty != null ? `${k.difficulty}${k.difficultyConfidence ? ` (${k.difficultyConfidence})` : ""}` : "—"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        );
+      })()}
     </div>
   );
 }
