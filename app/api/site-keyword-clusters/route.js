@@ -1,15 +1,30 @@
 import { callOpenRouterJson } from "../../../lib/openrouter";
-import { clusterSiteKeywords } from "../../../lib/keywordClustering";
+import { clusterSiteKeywords, aggregateSiteKeywords, aggregateSiteEntities } from "../../../lib/keywordClustering";
 
-// Feature ②. Deterministic clustering (lib/keywordClustering.js) runs
-// first and is always returned, even if the AI step below fails — the
-// clusters and cannibalization list are real, computed facts about the
-// crawled site, not AI output. The AI layer only adds: a human-readable
-// label per cluster, plain-language explanations of cannibalization risk,
-// and which page should be the "primary" one per contested cluster.
+// Site-wide Keyword Intelligence. Everything factual is computed
+// deterministically, always returned even if the AI step below fails:
+// - clusterSiteKeywords: topic clusters + cannibalization (which pages
+//   compete for the same cluster)
+// - aggregateSiteKeywords: one ranked keyword table across every crawled
+//   page (type/intent/usage counts/relative relevance)
+// - aggregateSiteEntities: proper-noun phrases found across the site
+// The AI layer only adds judgment on top of those facts: a human-readable
+// label per cluster, cannibalization guidance, a difficulty estimate and
+// recommendation per keyword, and a handful of strategic opportunities.
+// The overall Keyword Opportunity score is then computed deterministically
+// from the AI's own opportunity list (see scoreFromOpportunities below), not
+// asked of the model directly, so it can't drift from the opportunities shown.
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
+
+const OPPORTUNITY_PENALTY = { Critical: 20, High: 12, Medium: 6, Low: 2 };
+
+function scoreFromOpportunities(opportunities) {
+  if (!opportunities) return null;
+  const penalty = opportunities.reduce((sum, o) => sum + (OPPORTUNITY_PENALTY[o.priority] ?? 6), 0);
+  return Math.max(0, Math.min(100, 100 - penalty));
+}
 
 export async function POST(req) {
   let body;
@@ -25,6 +40,8 @@ export async function POST(req) {
   }
 
   const { clusters, cannibalization } = clusterSiteKeywords(crawl.pages);
+  const keywordCandidates = aggregateSiteKeywords(crawl.pages, 24);
+  const entities = aggregateSiteEntities(crawl.pages, 20);
 
   const observed = {
     domain: crawl.domain,
@@ -33,26 +50,34 @@ export async function POST(req) {
     cannibalizationCount: cannibalization.length,
     clusters,
     cannibalization,
+    entities,
   };
 
-  if (clusters.length === 0) {
+  if (clusters.length === 0 && keywordCandidates.length === 0) {
     return Response.json({
-      result: { ...observed, clusterInsights: [], cannibalizationGuidance: [], opportunities: [], generatedAt: new Date().toISOString() },
+      result: { ...observed, keywords: [], cannibalizationGuidance: [], opportunities: [], keywordScore: null, generatedAt: new Date().toISOString() },
     });
   }
 
-  // Only the top clusters (by score) and all cannibalization cases go to
-  // the AI — not the full list, to keep the prompt bounded regardless of
-  // site size.
   const topClusters = clusters.slice(0, 20);
-  const clusterBlock = topClusters
-    .map((c, i) => `${i + 1}. [id=${c.id}] Keywords: ${c.keywords.slice(0, 6).join(", ")}. Used on ${c.pages.length} page(s): ${c.pages.map((p) => `"${p.title}" (${p.url})${p.strong ? " [strongly targeted]" : ""}`).join("; ")}`)
-    .join("\n");
+  const clusterBlock = topClusters.length
+    ? topClusters
+        .map((c, i) => `${i + 1}. [id=${c.id}] Keywords: ${c.keywords.slice(0, 6).join(", ")}. Used on ${c.pages.length} page(s): ${c.pages.map((p) => `"${p.title}" (${p.url})${p.strong ? " [strongly targeted]" : ""}`).join("; ")}`)
+        .join("\n")
+    : "(no multi-keyword clusters found)";
   const cannibalBlock = cannibalization.length
     ? cannibalization.map((c, i) => `${i + 1}. [id=${c.clusterId}] Keywords: ${c.keywords.join(", ")}. Pages competing for this: ${c.competingPages.map((p) => `"${p.title}" (${p.url})`).join(" vs ")}`).join("\n")
     : "(none detected)";
+  const keywordBlock = keywordCandidates.length
+    ? keywordCandidates
+        .map((k, i) => {
+          const where = [k.usage.title ? "title" : null, k.usage.h1 ? "H1" : null, k.usage.h2h3 ? "H2/H3" : null, k.usage.metaDescription ? "meta description" : null, k.usage.alt ? "ALT text" : null, k.usage.schema ? "schema" : null, k.usage.body ? `body (${k.usage.body}x across the site)` : null].filter(Boolean).join(", ") || "not clearly used anywhere";
+          return `${i + 1}. [id=kw_${i}] "${k.keyword}" — type: ${k.type}, intent: ${k.intent}, relevance: ${k.relevance}/100, used on ${k.pagesUsedOn} of ${crawl.pages.length} page(s), appears in: ${where}`;
+        })
+        .join("\n")
+    : "(no strong keyword candidates found in the crawled text)";
 
-  const system = `You are VertexRank AI, a site-wide keyword strategist. You are given real keyword clusters computed deterministically from a real crawl of every page on a site — the clusters and which pages use them are FACTS, not your invention. Your job is to name each cluster with a clear topic label, explain cannibalization risk in plain language grounded in the real competing pages given, and recommend concrete next steps. You never invent search volume, ranking data, or traffic figures.`;
+  const system = `You are VertexRank AI, a site-wide keyword strategist. You are given real keyword clusters, a real ranked keyword table, and real entity mentions computed deterministically from a full crawl of every page on a site — all of that is FACT, not your invention. Your job is to add judgment on top: name each cluster, explain cannibalization risk, estimate ranking difficulty for the given keywords (there is no real search-volume/difficulty data source connected — say so implicitly by giving a confidence level, never invent a precise number you present as certain), and recommend concrete next steps grounded only in the real usage data given. You never invent search volume, ranking positions, or traffic figures.`;
 
   const prompt = `Website: ${crawl.domain}
 Pages crawled: ${crawl.pages.length}
@@ -62,6 +87,9 @@ ${clusterBlock}
 
 Keyword cannibalization detected (2+ different pages strongly targeting the same cluster):
 ${cannibalBlock}
+
+Ranked keyword table (real usage counts, aggregated across every crawled page):
+${keywordBlock}
 
 For each numbered cluster above, provide:
 - id (must match the [id=...] shown)
@@ -75,17 +103,30 @@ For each numbered cannibalization case above, provide:
 - primaryPageUrl: which of the competing page URLs should be the primary/surviving page (must be one of the URLs listed for that case)
 - reasoning: one sentence grounded in the real data (e.g. word count, which page is more complete) for why that page should be primary
 
-Then list up to 6 general keyword-strategy opportunities visible across the clusters as a whole (e.g. a high-scoring cluster with no page strongly targeting it yet = a content gap).
+For each numbered keyword in the ranked keyword table above, provide:
+- id (must match the [id=kw_...] shown)
+- difficultyEstimate: your best-guess ranking difficulty 0-100 (0=trivial, 100=extremely competitive) — this is an estimate, not real SERP data
+- difficultyConfidence: "Low", "Medium", or "High" — how confident you are in that estimate given only on-page data
+- recommendedUsage: one sentence on how this keyword should be used across the site, grounded in where it currently appears (or doesn't)
+- opportunity: one sentence naming the specific optimization opportunity for this keyword (a gap, an underused placement, a missing page, etc.)
+
+Then list up to 8 site-wide keyword strategy opportunities, each a real problem visible in the data above (e.g. a high-relevance keyword barely used anywhere, a whole cluster with no page strongly targeting it, a valuable term buried only in body text). For each, provide:
+- problem: the specific problem (1 sentence)
+- evidence: what in the crawl/keyword data shows this (1 sentence)
+- recommendedAction: a concrete next step (1 sentence)
+- priority: "Critical", "High", "Medium", or "Low"
+- confidence: "Low", "Medium", or "High"
 
 Respond with ONLY a JSON object, no markdown fences, no commentary, in exactly this shape:
 {
   "clusterInsights": [ { "id": "string", "label": "string", "insight": "string" } ],
   "cannibalizationGuidance": [ { "clusterId": "string", "explanation": "string", "recommendedAction": "string", "primaryPageUrl": "string", "reasoning": "string" } ],
-  "opportunities": [ { "opportunity": "string", "evidence": "string", "priority": "Critical|High|Medium|Low" } ]
+  "keywordInsights": [ { "id": "string", "difficultyEstimate": 0, "difficultyConfidence": "Low|Medium|High", "recommendedUsage": "string", "opportunity": "string" } ],
+  "opportunities": [ { "problem": "string", "evidence": "string", "recommendedAction": "string", "priority": "Critical|High|Medium|Low", "confidence": "Low|Medium|High" } ]
 }`;
 
   try {
-    const parsed = await callOpenRouterJson({ system, prompt, maxTokens: 2400, temperature: 0.5 });
+    const parsed = await callOpenRouterJson({ system, prompt, maxTokens: 3600, temperature: 0.5 });
 
     const insightById = new Map((parsed.clusterInsights || []).map((c) => [c.id, c]));
     const clustersWithLabels = clusters.map((c) => {
@@ -110,11 +151,26 @@ Respond with ONLY a JSON object, no markdown fences, no commentary, in exactly t
         };
       });
 
+    const insightByKwId = new Map((parsed.keywordInsights || []).map((k) => [k.id, k]));
+    const keywords = keywordCandidates.map((k, i) => {
+      const ai = insightByKwId.get(`kw_${i}`);
+      return {
+        ...k,
+        difficultyEstimate: typeof ai?.difficultyEstimate === "number" ? Math.max(0, Math.min(100, Math.round(ai.difficultyEstimate))) : null,
+        difficultyConfidence: ai?.difficultyConfidence || null,
+        recommendedUsage: ai?.recommendedUsage || "",
+        opportunity: ai?.opportunity || "",
+        source: ai ? "Crawled Data + VertexRank AI Analysis" : "Crawled Data",
+      };
+    });
+
     const opportunities = (parsed.opportunities || []).map((o, idx) => ({
       id: `kwop_${idx}`,
-      opportunity: o.opportunity || "",
+      problem: o.problem || "",
       evidence: o.evidence || "",
-      priority: o.priority || "Medium",
+      recommendedAction: o.recommendedAction || "",
+      priority: ["Critical", "High", "Medium", "Low"].includes(o.priority) ? o.priority : "Medium",
+      confidence: ["Low", "Medium", "High"].includes(o.confidence) ? o.confidence : "Medium",
       source: "VertexRank AI Analysis",
     }));
 
@@ -123,14 +179,16 @@ Respond with ONLY a JSON object, no markdown fences, no commentary, in exactly t
         ...observed,
         clusters: clustersWithLabels,
         cannibalizationGuidance,
+        keywords,
         opportunities,
+        keywordScore: scoreFromOpportunities(opportunities),
         generatedAt: new Date().toISOString(),
       },
     });
   } catch (err) {
     return Response.json({
-      result: { ...observed, cannibalizationGuidance: [], opportunities: [], generatedAt: new Date().toISOString() },
-      warning: err.message || "VertexRank AI couldn't generate cluster narratives, but the clusters and cannibalization list above are real, computed from the crawl.",
+      result: { ...observed, keywords: keywordCandidates, cannibalizationGuidance: [], opportunities: [], keywordScore: null, generatedAt: new Date().toISOString() },
+      warning: err.message || "VertexRank AI couldn't generate keyword narratives, but the clusters, keyword table, and entities above are real, computed from the crawl.",
     });
   }
 }
