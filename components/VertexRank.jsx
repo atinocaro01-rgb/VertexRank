@@ -118,11 +118,11 @@ function siteMetaFrom(b) {
   };
 }
 
-/** Flat keyword list from the site-wide keyword clusters, for AI modules
+/** Flat keyword list from the site-wide keyword usage audit, for AI modules
  *  (AEO, competitor comparison) that just want known target keywords as
  *  context. Empty until Keyword Intelligence has been run at least once. */
 function siteKeywordList(b) {
-  return (b?.siteKeywordClusters?.clusters || []).flatMap((c) => c.keywords || []);
+  return (b?.siteKeywordClusters?.keywords || []).map((k) => k.keyword);
 }
 
 /* ============================== constants ============================== */
@@ -1663,22 +1663,64 @@ function SiteKeywordClusteringPanel() {
     toast("Added to Action Center");
   }
 
-  if (!b.siteCrawl) return <SiteCrawlGate body="Keyword Intelligence ranks the keywords found across EVERY page of your site, flags cannibalization — two different pages competing for the same topic — and estimates a Keyword Opportunity score. That needs a full-site crawl, not just one page." />;
+  if (!b.siteCrawl) return <SiteCrawlGate body="Keyword Intelligence audits how keywords are actually used across EVERY page of your site — what's placed well, what's placed wrong, and which keywords you should add — plus a real Keyword Usage Score. That needs a full-site crawl, not just one page." />;
 
   if (!data) {
-    return <RunAnalysisPanel icon={KeyRound} title="Site-wide Keyword Intelligence" body={`Rank the keywords found across all ${b.siteCrawl.pagesCrawled} crawled pages, group them into topic clusters, detect cannibalization, and surface strategic opportunities.`}
+    return <RunAnalysisPanel icon={KeyRound} title="Site-wide Keyword Intelligence" body={`Audit how every real keyword found across all ${b.siteCrawl.pagesCrawled} crawled pages is placed, flag what's wrong, suggest concrete fixes, and surface new keywords worth targeting.`}
       buttonLabel="Analyze keywords" loadingLabel="Analyzing keywords across the site…" onRun={runAnalysis} loading={loading} error={error} />;
   }
 
+  const strongCount = data.keywords.filter((k) => k.status === "Strong").length;
+  const weakCount = data.keywords.filter((k) => k.status === "Weak").length;
+  const poorCount = data.keywords.filter((k) => k.status === "Poor").length;
+
   return (
     <div className="space-y-4">
-      <AnalysisBanner icon={KeyRound}>
-        {data.domain} · {data.pagesCrawled} pages · {data.clusterCount} clusters · {data.cannibalizationCount} cannibalization risk{data.cannibalizationCount === 1 ? "" : "s"}
-        {data.keywordScore != null && <> · Keyword Opportunity score: <strong>{data.keywordScore}/100</strong></>}
-      </AnalysisBanner>
       <div className="flex justify-end">
         <Button size="sm" variant="soft" icon={loading ? Loader2 : RefreshCw} disabled={loading} onClick={runAnalysis}>{loading ? "Re-analyzing…" : "Re-analyze"}</Button>
       </div>
+
+      <Card className="p-5">
+        <div className="flex items-center gap-4 flex-wrap mb-2">
+          <ScoreDial label="Keyword Usage Score" value={data.keywordScore} size={92} accent={BRAND.amber} />
+          <div className="text-xs" style={{ color: BRAND.inkSoft }}>
+            <p className="font-medium mb-1" style={{ color: BRAND.ink }}>{data.domain} · {data.pagesCrawled} page{data.pagesCrawled === 1 ? "" : "s"} crawled</p>
+            <p>A relevance-weighted average of real placement (title, H1, meta description, headings, schema, ALT) across every tracked keyword — computed directly from the crawl, not an AI opinion.</p>
+            <p className="mt-1">Generated {fmtDate(data.generatedAt)}</p>
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-1.5 mt-3">
+          <span className="text-xs rounded-full px-2.5 py-1" style={{ background: BRAND.visibilitySoft, color: BRAND.visibility }}>{strongCount} Strong</span>
+          <span className="text-xs rounded-full px-2.5 py-1" style={{ background: BRAND.amberSoft, color: BRAND.amber }}>{weakCount} Weak</span>
+          <span className="text-xs rounded-full px-2.5 py-1" style={{ background: BRAND.redSoft, color: BRAND.red }}>{poorCount} Poor</span>
+          {data.cannibalizationCount > 0 && <span className="text-xs rounded-full px-2.5 py-1" style={{ background: BRAND.canvas, color: BRAND.inkSoft }}>{data.cannibalizationCount} cannibalization risk{data.cannibalizationCount === 1 ? "" : "s"}</span>}
+        </div>
+      </Card>
+
+      {data.suggestedKeywords && data.suggestedKeywords.length > 0 && (
+        <Card className="p-4">
+          <h3 className="font-semibold vr-display mb-1">Keywords you should add ({data.suggestedKeywords.length})</h3>
+          <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Not currently targeted anywhere on the site — grounded in the real topics/entities found in the crawl.</p>
+          <div className="space-y-3">
+            {data.suggestedKeywords.map((sug) => (
+              <div key={sug.id} className="rounded-lg p-3.5" style={{ background: BRAND.canvas }}>
+                <div className="flex items-start justify-between gap-2 mb-1.5">
+                  <p className="text-sm font-medium">{sug.keyword}</p>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <PriorityBadge priority={sug.priority} />
+                    <CopyButton iconOnly label="Copy this keyword" getText={() => `${sug.keyword} — Intent: ${sug.intent}, Priority: ${sug.priority}\nWhy: ${sug.whyRelevant}\nRecommended placement: ${sug.recommendedPlacement}`} />
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-1.5 mb-2">
+                  <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.surface }}>{sug.intent}</Badge>
+                </div>
+                {sug.whyRelevant && <p className="text-xs mb-1">{sug.whyRelevant}</p>}
+                {sug.recommendedPlacement && <p className="text-[11px]" style={{ color: BRAND.inkSoft }}><span className="font-medium" style={{ color: BRAND.ink }}>Where to add it: </span>{sug.recommendedPlacement}</p>}
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
 
       {data.cannibalizationGuidance && data.cannibalizationGuidance.length > 0 && (
         <Card className="p-4">
@@ -1724,22 +1766,6 @@ function SiteKeywordClusteringPanel() {
         </Card>
       )}
 
-      <Card className="p-4">
-        <h3 className="font-semibold vr-display mb-3">Clusters ({data.clusters.length})</h3>
-        {data.clusters.length === 0 ? <p className="text-sm" style={{ color: BRAND.inkSoft }}>No clusters detected.</p> : (
-          <div className="grid sm:grid-cols-2 gap-3">
-            {data.clusters.slice(0, 20).map((c) => (
-              <div key={c.id} className="rounded-lg p-3" style={{ background: BRAND.canvas }}>
-                <p className="text-sm font-medium">{c.label}</p>
-                {c.insight && <p className="text-xs mt-1" style={{ color: BRAND.inkSoft }}>{c.insight}</p>}
-                <div className="flex flex-wrap gap-1 mt-2">{c.keywords.slice(0, 6).map((k) => <span key={k} className="text-[10px] rounded px-1.5 py-0.5" style={{ background: BRAND.primarySoft, color: BRAND.primary }}>{k}</span>)}</div>
-                <p className="text-[10px] mt-2" style={{ color: BRAND.inkSoft }}>{c.pages.length} page{c.pages.length === 1 ? "" : "s"} · {c.source}</p>
-              </div>
-            ))}
-          </div>
-        )}
-      </Card>
-
       {data.entities && data.entities.length > 0 && (
         <Card className="p-4">
           <h3 className="font-semibold vr-display mb-1">Entities detected across the site</h3>
@@ -1754,26 +1780,40 @@ function SiteKeywordClusteringPanel() {
 
       {data.keywords && data.keywords.length > 0 && (
         <Card className="p-4">
-          <h3 className="font-semibold vr-display mb-1">Keywords ({data.keywords.length})</h3>
-          <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Ranked by relative relevance across the whole site — usage counts are real crawl data; difficulty is a VertexRank AI estimate.</p>
+          <h3 className="font-semibold vr-display mb-1">Keyword usage audit ({data.keywords.length})</h3>
+          <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Every real keyword found across the site, worst-placed first — usage and status are real crawl data; fixes are VertexRank AI suggestions.</p>
           <div className="space-y-3">
             {data.keywords.map((k, i) => {
               const where = [k.usage.title ? "Title" : null, k.usage.h1 ? "H1" : null, k.usage.h2h3 ? "Headings" : null, k.usage.metaDescription ? "Meta" : null, k.usage.alt ? "ALT" : null, k.usage.schema ? "Schema" : null, k.usage.body ? `Body ×${k.usage.body}` : null].filter(Boolean).join(", ") || "Not clearly used";
+              const statusColor = k.status === "Strong" ? { fg: BRAND.visibility, bg: BRAND.visibilitySoft } : k.status === "Weak" ? { fg: BRAND.amber, bg: BRAND.amberSoft } : { fg: BRAND.red, bg: BRAND.redSoft };
               return (
-                <div key={k.keyword + i} className="rounded-lg p-3" style={{ background: BRAND.canvas }}>
+                <div key={k.id || k.keyword + i} className="rounded-lg p-3" style={{ background: BRAND.canvas }}>
                   <div className="flex items-start justify-between gap-2 mb-1.5">
                     <p className="text-sm font-medium">{k.keyword}</p>
-                    <CopyButton iconOnly label="Copy this keyword" getText={() => `${k.keyword} — Type: ${k.type}, Intent: ${k.intent}, Relevance: ${k.relevance}, Difficulty: ${k.difficultyEstimate ?? "n/a"}${k.difficultyConfidence ? ` (${k.difficultyConfidence} confidence)` : ""}\nUsed on ${k.pagesUsedOn} page(s) — ${where}\nRecommended usage: ${k.recommendedUsage}\nOptimization opportunity: ${k.opportunity}`} />
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {k.flags.length > 0 && <PriorityBadge priority={k.priority} />}
+                      <CopyButton iconOnly label="Copy this keyword" getText={() => `${k.keyword} — Status: ${k.status}, Relevance: ${k.relevance}, Placement score: ${k.placementScore}\nUsed on ${k.pagesUsedOn} page(s) — ${where}${k.flags.length ? `\nIssues: ${k.flags.join("; ")}` : ""}${k.fixSuggestion ? `\nSuggested fix: ${k.fixSuggestion}` : ""}${k.recommendedPlacement ? `\nRecommended placement: ${k.recommendedPlacement}` : ""}`} />
+                    </div>
                   </div>
                   <div className="flex flex-wrap gap-1.5 mb-2">
-                    <Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{k.type}</Badge>
+                    <Badge color={statusColor}>{k.status}</Badge>
                     <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>{k.intent}</Badge>
-                    <Badge color={{ fg: BRAND.visibility, bg: BRAND.visibilitySoft }}>Relevance {k.relevance}</Badge>
-                    {k.difficultyEstimate != null && <Badge color={{ fg: BRAND.amber, bg: BRAND.amberSoft }}>Difficulty {k.difficultyEstimate}{k.difficultyConfidence ? ` (${k.difficultyConfidence})` : ""}</Badge>}
+                    <Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>Relevance {k.relevance}</Badge>
                   </div>
                   <p className="text-[11px] mb-1.5" style={{ color: BRAND.inkSoft }}>Used on {k.pagesUsedOn} of {data.pagesCrawled} page{data.pagesCrawled === 1 ? "" : "s"} — {where}</p>
-                  {k.recommendedUsage && <p className="text-xs mb-1"><span className="font-medium">Recommended usage: </span>{k.recommendedUsage}</p>}
-                  {k.opportunity && <p className="text-xs" style={{ color: BRAND.inkSoft }}><span className="font-medium" style={{ color: BRAND.ink }}>Optimization opportunity: </span>{k.opportunity}</p>}
+                  {k.flags.length > 0 && (
+                    <div className="rounded p-2 mb-1.5" style={{ background: BRAND.redSoft }}>
+                      <p className="text-[10px] font-semibold mb-0.5" style={{ color: BRAND.red }}>WHAT'S WRONG</p>
+                      <ul className="text-xs list-disc list-inside space-y-0.5">{k.flags.map((f, fi) => <li key={fi}>{f}</li>)}</ul>
+                    </div>
+                  )}
+                  {k.fixSuggestion && (
+                    <div className="rounded p-2 mb-1" style={{ background: BRAND.visibilitySoft }}>
+                      <p className="text-[10px] font-semibold mb-0.5" style={{ color: BRAND.visibility }}>HOW TO FIX IT</p>
+                      <p className="text-xs">{k.fixSuggestion}</p>
+                    </div>
+                  )}
+                  {k.recommendedPlacement && <p className="text-[11px]" style={{ color: BRAND.inkSoft }}><span className="font-medium" style={{ color: BRAND.ink }}>Recommended placement: </span>{k.recommendedPlacement}</p>}
                 </div>
               );
             })}
@@ -1838,15 +1878,20 @@ function ManualKeywordTracker() {
         });
       }
       const existing = new Set(b.keywords.map((k) => k.keyword.toLowerCase()));
-      const picks = [...(clusters.clusters || [])]
-        .flatMap((c) => (c.keywords || []).slice(0, 3).map((kw) => ({ keyword: kw })))
+      // Prefer the AI's genuinely-new keyword suggestions (not already used
+      // anywhere on the site) over the on-site keyword table itself — those
+      // are keywords the site already targets, not new ones worth tracking.
+      const source = (clusters.suggestedKeywords && clusters.suggestedKeywords.length)
+        ? clusters.suggestedKeywords.map((s) => ({ keyword: s.keyword, intent: s.intent }))
+        : (clusters.keywords || []).map((k) => ({ keyword: k.keyword, intent: k.intent }));
+      const picks = source
         .filter((k) => !existing.has(k.keyword.toLowerCase()))
         .slice(0, 8);
       if (picks.length === 0) { toast("No new AI-suggested keywords — everything relevant is already tracked."); return; }
       mutate((arr) => [
         ...arr,
         ...picks.map((k) => ({
-          id: uid("kw"), websiteId: currentWebsiteId, keyword: k.keyword, intent: "Informational", ranking: null, volume: null, difficulty: null, opportunity: null, usage: [],
+          id: uid("kw"), websiteId: currentWebsiteId, keyword: k.keyword, intent: k.intent || "Informational", ranking: null, volume: null, difficulty: null, opportunity: null, usage: [],
         })),
       ]);
       toast(`Added ${picks.length} AI-suggested keyword${picks.length === 1 ? "" : "s"}`);
