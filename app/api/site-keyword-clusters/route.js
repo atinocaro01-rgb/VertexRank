@@ -40,7 +40,15 @@ export async function POST(req) {
   }
 
   const { clusters, cannibalization } = clusterSiteKeywords(crawl.pages);
-  const keywordCandidates = aggregateSiteKeywords(crawl.pages, 24);
+  // Kept deliberately smaller than this function's own defaults (24): this
+  // is already the single largest AI request in the app (cluster insights +
+  // cannibalization guidance + per-keyword insights + opportunities all in
+  // one JSON reply), and a big keyword table was the direct cause of
+  // responses being cut off before the model finished writing valid JSON
+  // (see the maxTokens/timeout comment below). Trimming the ask keeps the
+  // reply achievable within that budget on every provider in the chain,
+  // not just the fastest one.
+  const keywordCandidates = aggregateSiteKeywords(crawl.pages, 18);
   const entities = aggregateSiteEntities(crawl.pages, 20);
 
   const observed = {
@@ -59,7 +67,7 @@ export async function POST(req) {
     });
   }
 
-  const topClusters = clusters.slice(0, 20);
+  const topClusters = clusters.slice(0, 14);
   const clusterBlock = topClusters.length
     ? topClusters
         .map((c, i) => `${i + 1}. [id=${c.id}] Keywords: ${c.keywords.slice(0, 6).join(", ")}. Used on ${c.pages.length} page(s): ${c.pages.map((p) => `"${p.title}" (${p.url})${p.strong ? " [strongly targeted]" : ""}`).join("; ")}`)
@@ -126,7 +134,27 @@ Respond with ONLY a JSON object, no markdown fences, no commentary, in exactly t
 }`;
 
   try {
-    const parsed = await callOpenRouterJson({ system, prompt, maxTokens: 3600, temperature: 0.5 });
+    // This route asks for by far the largest JSON reply in the app (cluster
+    // insights + cannibalization guidance + up to 18 keyword insights + up
+    // to 8 opportunities, each multi-sentence) — every other route here
+    // tops out at maxTokens 2600. At the old maxTokens: 3600 with the
+    // shared default timeouts (12s/model, 42s total), a model that spends
+    // part of its budget "thinking" before answering would either get cut
+    // off mid-reasoning (surfaced as a JSON-parse failure showing raw
+    // reasoning text) or hit the per-model timeout ("took too long"),
+    // depending on which one ran out first. Both symptoms were the same
+    // root cause: not enough token/time headroom for how much output this
+    // specific request requires. maxDuration on this route is 60s, so
+    // overallBudgetMs leaves ~10s of slack below that ceiling for request
+    // overhead and the deterministic post-processing below.
+    const parsed = await callOpenRouterJson({
+      system,
+      prompt,
+      maxTokens: 6500,
+      temperature: 0.5,
+      perModelTimeoutMs: 20000,
+      overallBudgetMs: 50000,
+    });
 
     const insightById = new Map((parsed.clusterInsights || []).map((c) => [c.id, c]));
     const clustersWithLabels = clusters.map((c) => {
