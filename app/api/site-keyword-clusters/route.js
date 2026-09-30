@@ -98,6 +98,18 @@ export async function POST(req) {
   // + a confidence word), not prose, so it stays cheap even at full scale.
   const flagged = audited.filter((k) => k.flags.length > 0);
 
+  // Instant path: the deterministic audit + score, no AI. The client asks for
+  // this first so the keyword score is on the Dashboard right after the crawl
+  // while the slower AI enrichment below runs at the same time.
+  const deterministicKeywords = audited
+    .map((k) => ({ ...k, fixSuggestion: "", recommendedPlacement: "", priority: k.flags.length ? priorityForKeyword(k) : "Low", difficulty: null, difficultyConfidence: null, source: "Crawled Data" }))
+    .sort((a, b) => STATUS_RANK[a.status] - STATUS_RANK[b.status] || b.relevance - a.relevance);
+  if (body?.signalsOnly) {
+    return Response.json({
+      result: { ...observed, keywords: deterministicKeywords, suggestedKeywords: [], cannibalizationGuidance: [], opportunities: [], generatedAt: new Date().toISOString(), signalsOnly: true },
+    });
+  }
+
   const keywordBlock = audited.length
     ? audited.map((k) => `[id=${k.id}] "${k.keyword}" — relevance ${k.relevance}/100, status: ${k.status}, used on ${k.pagesUsedOn} of ${crawl.pages.length} page(s), appears in: ${describeUsage(k)}${k.flags.length ? `. Flags: ${k.flags.join("; ")}` : ""}`).join("\n")
     : "(no keyword candidates found in the crawled text)";
@@ -112,20 +124,19 @@ export async function POST(req) {
 
   const system = `You are VertexRank AI, a practical on-page keyword strategist. You are given a real, deterministically-computed keyword usage audit from a full crawl of every page on a site — the relevance scores, placement facts, and flagged problems are FACT, not your invention; you never re-score or contradict them. Your job is narrow: (1) write one concrete, one-sentence fix for each flagged keyword, grounded only in where it's currently used/not used, (2) propose a short list of genuinely new, specific keyword phrases this site should target but currently doesn't (never repeat a keyword already in the audited table), grounded in the real entities/topics found on the site, (3) estimate ranking difficulty (0-100, 0=trivial 100=extremely competitive) with a confidence level for every keyword listed, real or newly suggested, and (4) explain cannibalization risk in plain language. Difficulty is a professional estimate based on keyword specificity/competitiveness, not a claim of real search data. You never invent search volume, ranking positions, or traffic figures.`;
 
-  const prompt = `Website: ${crawl.domain}
-Pages crawled: ${crawl.pages.length}
+  const header = `Website: ${crawl.domain}\nPages crawled: ${crawl.pages.length}\n`;
 
+  // The reply used to be ONE ~5,500-token JSON object, so the wait was the
+  // sum of everything the model had to write. It's now two independent
+  // requests that run at the same time (per-keyword facts vs. new ideas +
+  // cannibalization), so the wait is roughly the slower half, and if one
+  // fails the other's results are still kept.
+  const promptA = `${header}
 Full ranked keyword table (real usage data from the crawl):
 ${keywordBlock}
 
 Keywords flagged as needing a fix (subset of the table above):
 ${flaggedBlock}
-
-Proper-noun entities/topics found across the site (real, from the crawl):
-${entityBlock}
-
-Keyword cannibalization detected (2+ different pages strongly targeting the same topic):
-${cannibalBlock}
 
 For EVERY keyword in the full table above (not just flagged ones), provide a difficulty estimate:
 - id (must match the [id=kw_...] shown)
@@ -137,45 +148,55 @@ For each flagged keyword above, additionally provide:
 - fixSuggestion: one concrete sentence on exactly how to fix its placement (e.g. "Add this to the H1 of the Services page — it's currently buried in body text only")
 - recommendedPlacement: one short phrase naming where it should go (e.g. "Page title + H1 of /services")
 
-Then propose 6-10 NEW keyword phrases this site should consider targeting that are NOT already in the keyword table above. Ground each in the real entities/topics/business shown, not generic SEO filler. For each, provide:
+Respond with ONLY a JSON object, no markdown fences, no commentary, in exactly this shape:
+{
+  "keywordDifficulty": [ { "id": "string", "difficulty": 0, "confidence": "Low|Medium|High" } ],
+  "keywordFixes": [ { "id": "string", "fixSuggestion": "string", "recommendedPlacement": "string" } ]
+}`;
+
+  const promptB = `${header}
+Keywords this site already targets (do NOT repeat any of these): ${audited.map((k) => k.keyword).join(", ")}
+
+Proper-noun entities/topics found across the site (real, from the crawl):
+${entityBlock}
+
+Keyword cannibalization detected (2+ different pages strongly targeting the same topic):
+${cannibalBlock}
+
+Propose 6-10 NEW keyword phrases this site should consider targeting that are NOT in the list above. Ground each in the real entities/topics/business shown, not generic SEO filler. For each, provide:
 - keyword: the specific phrase
 - type: one of ${KEYWORD_TYPES.map((t) => `"${t}"`).join(", ")} — classify it the same way an SEO tool would classify a real keyword of that shape (e.g. a phrase with a place name is "Local", a single generic word is "Primary", a 2-word phrase is "Secondary", 4+ specific words is "Long-tail")
 - intent: "Informational", "Commercial", "Transactional", or "Navigational"
-- relevance: integer 0-100, how strategically relevant this phrase is to the business shown above (this sits in the SAME ranked table as the real keywords above, so judge it on the same 0-100 scale they use)
-- whyRelevant: one sentence on why this fits the business shown above
+- relevance: integer 0-100, how strategically relevant this phrase is to the business shown above
+- whyRelevant: one short sentence on why this fits the business shown above
 - recommendedPlacement: one short phrase naming where/how to introduce it (e.g. "New H2 section on the homepage" or "New blog post targeting this")
 - priority: "Critical", "High", "Medium", or "Low"
 - difficulty: integer 0-100
 - confidence: "Low", "Medium", or "High"
 
-Then for each numbered cannibalization case above, provide:
+Then for each numbered cannibalization case above (skip this if there are none), provide:
 - clusterId (must match the [id=...] shown)
 - explanation: plain-language explanation of the risk, grounded in the real competing pages listed
 - recommendedAction: one of "Consolidate" (merge into one page), "Differentiate" (keep both but make each target a clearly different angle/intent), or "Redirect" (one page should redirect to the other)
 - primaryPageUrl: which of the competing page URLs should be the primary/surviving page (must be one of the URLs listed for that case)
-- reasoning: one sentence grounded in the real data for why that page should be primary
+- reasoning: one short sentence grounded in the real data for why that page should be primary
 
 Respond with ONLY a JSON object, no markdown fences, no commentary, in exactly this shape:
 {
-  "keywordDifficulty": [ { "id": "string", "difficulty": 0, "confidence": "Low|Medium|High" } ],
-  "keywordFixes": [ { "id": "string", "fixSuggestion": "string", "recommendedPlacement": "string" } ],
   "suggestedKeywords": [ { "keyword": "string", "type": "string", "intent": "string", "relevance": 0, "whyRelevant": "string", "recommendedPlacement": "string", "priority": "Critical|High|Medium|Low", "difficulty": 0, "confidence": "Low|Medium|High" } ],
   "cannibalizationGuidance": [ { "clusterId": "string", "explanation": "string", "recommendedAction": "string", "primaryPageUrl": "string", "reasoning": "string" } ]
 }`;
 
   try {
-    // This is still the largest AI request in the app, so it keeps a
-    // larger token/time budget than the shared defaults (which are tuned
-    // for much lighter routes). maxDuration on this route is 60s;
-    // overallBudgetMs leaves ~10s of slack below that ceiling.
-    const parsed = await callOpenRouterJson({
-      system,
-      prompt,
-      maxTokens: 5500,
-      temperature: 0.5,
-      perModelTimeoutMs: 18000,
-      overallBudgetMs: 48000,
-    });
+    const [aRes, bRes] = await Promise.allSettled([
+      callOpenRouterJson({ system, prompt: promptA, maxTokens: 2200, temperature: 0.4, perModelTimeoutMs: 15000, overallBudgetMs: 45000 }),
+      callOpenRouterJson({ system, prompt: promptB, maxTokens: 3000, temperature: 0.5, perModelTimeoutMs: 15000, overallBudgetMs: 45000 }),
+    ]);
+    if (aRes.status === "rejected" && bRes.status === "rejected") throw aRes.reason;
+    const parsed = { ...(aRes.status === "fulfilled" ? aRes.value : {}), ...(bRes.status === "fulfilled" ? bRes.value : {}) };
+    const partialWarning = aRes.status === "rejected" || bRes.status === "rejected"
+      ? `Part of the AI enrichment (${aRes.status === "rejected" ? "per-keyword fixes and difficulty" : "new keyword ideas and cannibalization guidance"}) couldn't be generated. The rest is complete — re-run to fill in the gap.`
+      : undefined;
 
     const fixById = new Map((parsed.keywordFixes || []).map((f) => [f.id, f]));
     const difficultyById = new Map((parsed.keywordDifficulty || []).map((d) => [d.id, d]));
@@ -267,6 +288,7 @@ Respond with ONLY a JSON object, no markdown fences, no commentary, in exactly t
         opportunities,
         generatedAt: new Date().toISOString(),
       },
+      ...(partialWarning ? { warning: partialWarning } : {}),
     });
   } catch (err) {
     return Response.json({
