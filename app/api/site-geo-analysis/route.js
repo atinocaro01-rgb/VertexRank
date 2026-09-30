@@ -56,8 +56,15 @@ export async function POST(req) {
     entities,
   };
 
+  // Instant path (see site-aeo-analysis): scores first, AI enrichment after.
+  if (body?.signalsOnly) {
+    return Response.json({
+      result: { ...observed, factors: null, opportunities: [], generatedAt: new Date().toISOString(), signalsOnly: true },
+    });
+  }
+
   // ---- AI layer ----
-  const sample = samplePagesForPrompt(pages, crawl.startUrl, 15);
+  const sample = samplePagesForPrompt(pages, crawl.startUrl, 15, { scoreFn: computeGeoSignals, weights: GEO_WEIGHTS });
   const pageSummaries = sample
     .map((p) => `- "${p.title || "(untitled)"}" (${p.url}) — ${truncate(p.fullText, 220)}`)
     .join("\n");
