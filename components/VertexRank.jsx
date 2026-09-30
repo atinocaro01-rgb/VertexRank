@@ -12,7 +12,7 @@ import {
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
 import {
   GEO_FACTORS, AEO_SIGNAL_LABELS, GEO_AUTHORITY_LABELS, PAGE_EXPORTERS, exportFullReport, buildUnifiedRecs,
-  formatRecommendation, formatCompetitor, formatContentIdea, formatAction,
+  formatRecommendation, formatWeakPage, formatCompetitor, formatContentIdea, formatAction,
   sectionUnifiedRecs, sectionAiInsights, sectionSimulator, computeSiteAuditIssues, copyTextToClipboard,
 } from "../lib/copyExport";
 
@@ -81,6 +81,23 @@ async function postJson(url, body) {
   }
   if (!res.ok) throw new Error(data.error || "VertexRank AI couldn't complete this request.");
   return data;
+}
+
+/** The AEO, GEO and Keyword analyses only read a handful of fields per page.
+ *  The crawl also carries every internal/external link and every audit issue,
+ *  which can be more than half of its size — sending all of that three times
+ *  over just slows the request down, so those routes get a trimmed copy. */
+const ANALYSIS_PAGE_FIELDS = ["url", "title", "metaDescription", "h1Text", "h2Texts", "h3Texts", "altTexts", "fullText", "bodySnippet", "schemaRaw", "schemaTypes", "wordCount", "listItemCount", "tableCount"];
+function slimCrawl(crawl) {
+  if (!crawl?.pages) return crawl;
+  return {
+    domain: crawl.domain, startUrl: crawl.startUrl, truncated: crawl.truncated, pagesCrawled: crawl.pagesCrawled,
+    pages: crawl.pages.map((p) => {
+      const o = {};
+      for (const k of ANALYSIS_PAGE_FIELDS) if (p[k] !== undefined) o[k] = p[k];
+      return o;
+    }),
+  };
 }
 
 const PRIORITY_WEIGHT = { Critical: 20, High: 12, Medium: 6, Low: 2 };
@@ -1203,41 +1220,50 @@ function ScannerView() {
       }
       toast(`Full-site crawl complete — ${data.pagesCrawled} page${data.pagesCrawled === 1 ? "" : "s"} crawled${data.truncated ? " (time/page limit reached)" : ""}. Running AEO, GEO, and Keyword Intelligence…`);
 
-      // Auto-run the three AI modules right after the crawl — the same way
-      // Technical/Content appear immediately — so AEO, GEO, and Keyword
-      // Intelligence scores are already on the Dashboard without the user
-      // having to open each module and click "Analyze" by hand. Run in
-      // parallel (independent AI calls) and tolerate any one of them
-      // failing without losing the other two or the crawl itself.
-      const [aeoRes, geoRes, kwRes] = await Promise.allSettled([
-        postJson("/api/site-aeo-analysis", { crawl: data, keywords: [] }),
-        postJson("/api/site-geo-analysis", { crawl: data }),
-        postJson("/api/site-keyword-clusters", { crawl: data }),
-      ]);
-      setBundles((prev) => {
-        const site = prev[w.id] || emptyBundle();
-        return {
-          ...prev,
-          [w.id]: {
-            ...site,
-            siteAeoAnalysis: aeoRes.status === "fulfilled" ? aeoRes.value.result : site.siteAeoAnalysis,
-            siteGeoAnalysis: geoRes.status === "fulfilled" ? geoRes.value.result : site.siteGeoAnalysis,
-            siteKeywordClusters: kwRes.status === "fulfilled" ? kwRes.value.result : site.siteKeywordClusters,
-          },
-        };
+      // Auto-run the three AI modules right after the crawl so their scores
+      // are already on the Dashboard without opening each tab.
+      //
+      // Speed: each module is requested TWICE at the same moment —
+      //   1. { signalsOnly: true }: the scores and evidence computed straight
+      //      from the crawl, no AI, back in a fraction of a second, so the
+      //      Dashboard fills in immediately;
+      //   2. the full request: the AI enrichment, which takes longer and
+      //      replaces the quick result when it lands.
+      // Each result is applied the moment it arrives instead of waiting for
+      // the slowest of the three. Any one failing never loses the others.
+      const slim = slimCrawl(data);
+      const applyResult = (field, scoreKey, scoreProp, result) => {
+        setBundles((prev) => {
+          const site = prev[w.id] || emptyBundle();
+          // A quick result must never overwrite a finished AI one that
+          // happened to arrive first.
+          if (result?.signalsOnly && site[field] && !site[field].signalsOnly) return prev;
+          return { ...prev, [w.id]: { ...site, [field]: result } };
+        });
+        if (result?.[scoreProp] != null) {
+          setWebsites((ws) => ws.map((x) => (x.id === w.id ? { ...x, scores: { ...(x.scores || {}), [scoreKey]: result[scoreProp] } } : x)));
+        }
+      };
+      const modules = [
+        { url: "/api/site-aeo-analysis", extra: { keywords: [] }, field: "siteAeoAnalysis", scoreKey: "aeo", scoreProp: "readinessScore" },
+        { url: "/api/site-geo-analysis", extra: {}, field: "siteGeoAnalysis", scoreKey: "geo", scoreProp: "visibilityScore" },
+        { url: "/api/site-keyword-clusters", extra: {}, field: "siteKeywordClusters", scoreKey: "keyword", scoreProp: "keywordScore" },
+      ];
+      const fullRuns = modules.map((m) => {
+        postJson(m.url, { crawl: slim, ...m.extra, signalsOnly: true })
+          .then((r) => applyResult(m.field, m.scoreKey, m.scoreProp, r.result))
+          .catch(() => { /* the full request below still reports any real failure */ });
+        return postJson(m.url, { crawl: slim, ...m.extra })
+          .then((r) => { applyResult(m.field, m.scoreKey, m.scoreProp, r.result); return r; });
       });
-      setWebsites((ws) => ws.map((x) => {
-        if (x.id !== w.id) return x;
-        const scores = { ...(x.scores || {}) };
-        if (aeoRes.status === "fulfilled" && aeoRes.value.result.readinessScore != null) scores.aeo = aeoRes.value.result.readinessScore;
-        if (geoRes.status === "fulfilled" && geoRes.value.result.visibilityScore != null) scores.geo = geoRes.value.result.visibilityScore;
-        if (kwRes.status === "fulfilled" && kwRes.value.result.keywordScore != null) scores.keyword = kwRes.value.result.keywordScore;
-        return { ...x, scores };
-      }));
-      const failedCount = [aeoRes, geoRes, kwRes].filter((r) => r.status === "rejected").length;
+      const settled = await Promise.allSettled(fullRuns);
+      const failedCount = settled.filter((r) => r.status === "rejected").length;
+      const warned = settled.some((r) => r.status === "fulfilled" && r.value?.warning);
       toast(failedCount > 0
         ? `${3 - failedCount} of 3 AI analyses finished — ${failedCount} had an issue and can be retried from its own tab.`
-        : "AEO, GEO, and Keyword Intelligence are ready on the Dashboard.");
+        : warned
+          ? "Your scores are ready. Some AI suggestions couldn't be generated — re-run them from each tab."
+          : "AEO, GEO, and Keyword Intelligence are ready on the Dashboard.");
     } catch (err) {
       clearInterval(ticker);
       setCrawlProgress(0);
@@ -1638,7 +1664,7 @@ function SiteKeywordClusteringPanel() {
   async function runAnalysis() {
     setLoading(true); setError("");
     try {
-      const res = await postJson("/api/site-keyword-clusters", { crawl: b.siteCrawl });
+      const res = await postJson("/api/site-keyword-clusters", { crawl: slimCrawl(b.siteCrawl) });
       setBundles((prev) => {
         const site = prev[currentWebsiteId] || emptyBundle();
         return { ...prev, [currentWebsiteId]: { ...site, siteKeywordClusters: res.result } };
@@ -1857,7 +1883,7 @@ function ManualKeywordTracker() {
     try {
       let clusters = b.siteKeywordClusters;
       if (!clusters) {
-        const data = await postJson("/api/site-keyword-clusters", { crawl: b.siteCrawl });
+        const data = await postJson("/api/site-keyword-clusters", { crawl: slimCrawl(b.siteCrawl) });
         clusters = data.result;
         setBundles((prev) => {
           const site = prev[currentWebsiteId] || emptyBundle();
@@ -2020,12 +2046,13 @@ function SiteAeoPanel() {
   const [error, setError] = useState("");
   const [coverageFilter, setCoverageFilter] = useState("All");
   const [expanded, setExpanded] = useState(null);
+  const [expandedPage, setExpandedPage] = useState(null);
   const aeo = b.siteAeoAnalysis;
 
   async function runAnalysis() {
     setLoading(true); setError("");
     try {
-      const data = await postJson("/api/site-aeo-analysis", { crawl: b.siteCrawl, keywords: siteKeywordList(b) });
+      const data = await postJson("/api/site-aeo-analysis", { crawl: slimCrawl(b.siteCrawl), keywords: siteKeywordList(b) });
       setBundles((prev) => {
         const site = prev[currentWebsiteId] || emptyBundle();
         return { ...prev, [currentWebsiteId]: { ...site, siteAeoAnalysis: data.result } };
@@ -2046,6 +2073,11 @@ function SiteAeoPanel() {
   }
   function addRecToActions(r) {
     addAction({ title: r.recommendation, type: "Content Update", status: "New", detail: { sourceId: `saeor_${r.id}`, module: "Site-wide AEO", evidence: r.why, recommendedAction: r.recommendation, priority: r.priority, confidence: "Medium", source: r.source } });
+    toast("Added to Action Center");
+  }
+  function addPageToActions(p) {
+    const fixes = (p.fixes || []).map((f) => `${f.label} (+${f.points}): ${f.action}`).join("\n");
+    addAction({ title: `Improve AEO on: ${p.title}`, type: "Content Update", status: "New", detail: { sourceId: `saeop_${p.url}`, module: "Site-wide AEO", evidence: `Scores ${p.score}/100 on the AEO signal checklist (${p.url}).`, recommendedAction: [fixes, p.aiSuggestions?.rewriteTip].filter(Boolean).join("\n"), priority: p.priority, confidence: "High", source: "VertexRank crawl signals" } });
     toast("Added to Action Center");
   }
   function isAdded(id) { return b.actions.some((a) => a.detail?.sourceId === id); }
@@ -2092,15 +2124,94 @@ function SiteAeoPanel() {
           </Card>
 
           {aeo.weakestPages && aeo.weakestPages.length > 0 && (
-            <Card className="p-4">
-              <h3 className="font-semibold vr-display mb-3">Weakest pages</h3>
-              <div className="space-y-1.5">
-                {aeo.weakestPages.slice(0, 8).map((p) => (
-                  <div key={p.url} className="flex items-center justify-between gap-2 text-xs rounded px-3 py-2" style={{ background: BRAND.canvas }}>
-                    <span className="truncate">{p.title}</span>
-                    <span className="vr-mono font-semibold shrink-0" style={{ color: p.score < 40 ? BRAND.red : p.score < 70 ? BRAND.amber : BRAND.visibility }}>{p.score}</span>
-                  </div>
-                ))}
+            <Card className="overflow-hidden">
+              <div className="p-4" style={{ borderBottom: `1px solid ${BRAND.line}` }}>
+                <h3 className="font-semibold vr-display">Weakest pages</h3>
+                <p className="text-xs mt-0.5" style={{ color: BRAND.inkSoft }}>Select a page to see exactly what's missing and how to fix it.</p>
+              </div>
+              <div className="divide-y" style={{ borderColor: BRAND.line }}>
+                {aeo.weakestPages.slice(0, 8).map((p) => {
+                  const open = expandedPage === p.url;
+                  const scoreColor = p.score < 40 ? BRAND.red : p.score < 70 ? BRAND.amber : BRAND.visibility;
+                  const hasRecs = Array.isArray(p.fixes);
+                  return (
+                    <div key={p.url}>
+                      <button className="w-full text-left px-4 py-3 flex items-center gap-3 vr-row text-xs" onClick={() => setExpandedPage(open ? null : p.url)}>
+                        <ChevronRight size={13} style={{ transform: open ? "rotate(90deg)" : "none", transition: "transform .15s", color: BRAND.inkSoft, flexShrink: 0 }} />
+                        <span className="truncate flex-1">{p.title}</span>
+                        {hasRecs && p.fixes.length > 0 && <span className="shrink-0 hidden sm:inline" style={{ color: BRAND.inkSoft }}>{p.fixes.length} fix{p.fixes.length === 1 ? "" : "es"}</span>}
+                        {hasRecs && p.priority && <PriorityBadge priority={p.priority} />}
+                        <span className="vr-mono font-semibold shrink-0" style={{ color: scoreColor }}>{p.score}</span>
+                      </button>
+                      {open && (
+                        <div className="px-4 pb-4">
+                          <div className="rounded-lg p-3.5 space-y-3" style={{ background: BRAND.canvas }}>
+                            <div className="flex items-center justify-between gap-2 flex-wrap text-xs" style={{ color: BRAND.inkSoft }}>
+                              <span className="vr-mono truncate">{p.url}</span>
+                              <span className="flex items-center gap-2">
+                                {p.pageTypeLabel && <span className="rounded px-1.5 py-0.5" style={{ background: BRAND.primarySoft, color: BRAND.primary }}>{p.pageTypeLabel}</span>}
+                                {p.potentialScore != null && <span>Score {p.score} → up to <b style={{ color: BRAND.visibility }}>{p.potentialScore}</b> if fixed</span>}
+                              </span>
+                            </div>
+
+                            {p.note && <p className="text-xs rounded p-2" style={{ background: BRAND.surface, border: `1px solid ${BRAND.line}` }}>{p.note}</p>}
+
+                            {!hasRecs ? (
+                              <p className="text-sm" style={{ color: BRAND.inkSoft }}>Re-run the analysis to get page-level recommendations for this page.</p>
+                            ) : p.fixes.length === 0 ? (
+                              <p className="text-sm" style={{ color: BRAND.inkSoft }}>Nothing actionable left here — the remaining missing signals don't apply to this kind of page.</p>
+                            ) : (
+                              <div>
+                                <p className="text-xs font-semibold mb-1.5" style={{ color: BRAND.inkSoft }}>WHAT TO FIX (biggest gain first)</p>
+                                <div className="space-y-1.5">
+                                  {p.fixes.map((f) => (
+                                    <div key={f.key} className="flex gap-2.5 rounded p-2.5" style={{ background: BRAND.surface, border: `1px solid ${BRAND.line}` }}>
+                                      <span className="vr-mono text-xs font-semibold shrink-0 rounded px-1.5 py-0.5 h-fit" style={{ background: BRAND.visibilitySoft, color: BRAND.visibility }}>+{f.points}</span>
+                                      <div className="min-w-0">
+                                        <p className="text-sm font-medium">{f.label}</p>
+                                        <p className="text-xs mt-0.5" style={{ color: BRAND.inkSoft }}>{f.action}</p>
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+
+                            {p.aiSuggestions?.rewriteTip && (
+                              <div className="rounded p-2.5" style={{ background: BRAND.visibilitySoft }}>
+                                <p className="text-[10px] font-semibold mb-0.5" style={{ color: BRAND.visibility }}>BIGGEST SINGLE CHANGE</p>
+                                <p className="text-xs">{p.aiSuggestions.rewriteTip}</p>
+                              </div>
+                            )}
+
+                            {(p.aiSuggestions?.suggestedQuestions || []).length > 0 && (
+                              <div>
+                                <p className="text-xs font-semibold mb-1.5" style={{ color: BRAND.inkSoft }}>QUESTIONS THIS PAGE SHOULD ANSWER</p>
+                                <div className="space-y-1.5">
+                                  {p.aiSuggestions.suggestedQuestions.map((q, i) => (
+                                    <div key={i} className="rounded p-2.5" style={{ background: BRAND.surface, border: `1px solid ${BRAND.line}` }}>
+                                      <p className="text-sm font-medium">{q.question}</p>
+                                      {q.answerOutline && <p className="text-xs mt-0.5" style={{ color: BRAND.inkSoft }}>{q.answerOutline}</p>}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+
+                            <div className="flex items-center justify-end gap-2 pt-1">
+                              <CopyButton label="Copy fixes" getText={() => formatWeakPage(p, { heading: "##" })} />
+                              {hasRecs && p.fixes.length > 0 && (
+                                <Button size="sm" variant={isAdded(`saeop_${p.url}`) ? "outline" : "soft"} icon={isAdded(`saeop_${p.url}`) ? Check : ListPlus} disabled={isAdded(`saeop_${p.url}`)} onClick={() => addPageToActions(p)}>
+                                  {isAdded(`saeop_${p.url}`) ? "Added" : "Add to Action Center"}
+                                </Button>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </Card>
           )}
@@ -2195,7 +2306,7 @@ function ManualAeoTracker() {
     try {
       let aeo = b.siteAeoAnalysis;
       if (!aeo) {
-        const data = await postJson("/api/site-aeo-analysis", { crawl: b.siteCrawl, keywords: siteKeywordList(b) });
+        const data = await postJson("/api/site-aeo-analysis", { crawl: slimCrawl(b.siteCrawl), keywords: siteKeywordList(b) });
         aeo = data.result;
         setBundles((prev) => {
           const site = prev[currentWebsiteId] || emptyBundle();
@@ -2322,7 +2433,7 @@ function SiteGeoPanel() {
   async function runAnalysis() {
     setLoading(true); setError("");
     try {
-      const data = await postJson("/api/site-geo-analysis", { crawl: b.siteCrawl });
+      const data = await postJson("/api/site-geo-analysis", { crawl: slimCrawl(b.siteCrawl) });
       setBundles((prev) => {
         const site = prev[currentWebsiteId] || emptyBundle();
         return { ...prev, [currentWebsiteId]: { ...site, siteGeoAnalysis: data.result } };
