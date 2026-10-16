@@ -144,7 +144,10 @@ function siteKeywordList(b) {
 
 /* ============================== constants ============================== */
 
-const COUNTRIES = ["United States", "United Kingdom", "Canada", "Australia", "Germany", "France", "India", "Kenya", "Brazil", "Japan"];
+// "Worldwide" first (for sites with no single target country), then A–Z.
+const COUNTRIES = ["Worldwide", "Algeria", "Argentina", "Australia", "Austria", "Bangladesh", "Belgium", "Botswana", "Brazil", "Cameroon", "Canada", "Chile", "China", "Colombia", "Czech Republic", "Côte d'Ivoire", "Denmark", "Egypt", "Ethiopia", "Finland", "France", "Germany", "Ghana", "Greece", "Hong Kong", "Hungary", "India", "Indonesia", "Ireland", "Israel", "Italy", "Japan", "Jordan", "Kenya", "Malawi", "Malaysia", "Mexico", "Morocco", "Mozambique", "Namibia", "Netherlands", "New Zealand", "Nigeria", "Norway", "Pakistan", "Peru", "Philippines", "Poland", "Portugal", "Qatar", "Romania", "Rwanda", "Saudi Arabia", "Senegal", "Singapore", "South Africa", "South Korea", "Spain", "Sri Lanka", "Sweden", "Switzerland", "Taiwan", "Tanzania", "Thailand", "Tunisia", "Turkey", "Uganda", "Ukraine", "United Arab Emirates", "United Kingdom", "United States", "Vietnam", "Zambia", "Zimbabwe"];
+// New websites still default to United States (not the first list entry).
+const DEFAULT_COUNTRY = "United States";
 const INTENTS = ["Informational", "Commercial", "Transactional", "Navigational"];
 const ISSUE_CATEGORIES = ["Technical", "Content", "On-Page", "Schema", "Internal Linking", "Indexing"];
 const SEVERITIES = ["Critical", "High", "Medium", "Low"];
@@ -1142,11 +1145,11 @@ function ScannerView() {
   const { websites, setWebsites, bundles, setBundles, currentWebsiteId, setCurrentWebsiteId, toast } = useApp();
   const [modal, setModal] = useState(null); // {mode:'add'|'edit', website}
   const [confirmDelete, setConfirmDelete] = useState(null);
-  const [form, setForm] = useState({ url: "", country: COUNTRIES[0] });
+  const [form, setForm] = useState({ url: "", country: DEFAULT_COUNTRY });
   const [crawlingId, setCrawlingId] = useState(null);
   const [crawlProgress, setCrawlProgress] = useState(0);
 
-  function openAdd() { setForm({ url: "", country: COUNTRIES[0] }); setModal({ mode: "add" }); }
+  function openAdd() { setForm({ url: "", country: DEFAULT_COUNTRY }); setModal({ mode: "add" }); }
   function openEdit(w) { setForm({ url: w.url, country: w.country }); setModal({ mode: "edit", website: w }); }
 
   function saveForm() {
@@ -2545,11 +2548,12 @@ function SiteGeoPanel() {
 }
 
 function AiVisibilitySimulatorPanel() {
-  const { bundle, setBundles, currentWebsiteId, toast, addAction } = useApp();
+  const { bundle, setBundles, currentWebsiteId, toast, addAction, websites } = useApp();
   const b = bundle();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const sim = b.aiVisibility;
+  const siteCountry = (websites || []).find((w) => w.id === currentWebsiteId)?.country;
 
   async function runSimulation() {
     const siteMeta = siteMetaFrom(b);
@@ -2557,7 +2561,7 @@ function AiVisibilitySimulatorPanel() {
     setLoading(true); setError("");
     try {
       const data = await postJson("/api/ai-visibility-simulator", {
-        scanMeta: siteMeta, keywords: siteKeywordList(b), country: "Kenya",
+        scanMeta: siteMeta, keywords: siteKeywordList(b), country: siteCountry || "Worldwide",
       });
       setBundles((prev) => {
         const site = prev[currentWebsiteId] || emptyBundle();
