@@ -1,3 +1,4 @@
+import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
 import { crawlSite } from "../../../lib/siteCrawler";
 import { extractKeywordCandidates, computeAeoSignals, computeGeoSignals, scoreFromFlags } from "../../../lib/textIntelligence";
@@ -30,15 +31,12 @@ function topicSet(pages, limit) {
 }
 
 export async function POST(req) {
-  let body;
-  try {
-    body = await req.json();
-  } catch {
-    return Response.json({ error: "Invalid request." }, { status: 400 });
-  }
+  const guard = await guardJson(req, "competitor");
+  if (!guard.ok) return guard.response;
+  const body = guard.body;
 
   const { competitorUrl, ourCrawl } = body || {};
-  if (!competitorUrl?.trim()) return Response.json({ error: "A competitor URL is required." }, { status: 400 });
+  if (typeof competitorUrl !== "string" || !competitorUrl.trim() || competitorUrl.length > 2048) return Response.json({ error: "A competitor URL is required." }, { status: 400 });
   if (!ourCrawl?.pages?.length) return Response.json({ error: "Crawl your own site first before comparing competitors." }, { status: 400 });
 
   const competitorCrawl = await crawlSite(competitorUrl, { maxPages: 25, timeBudgetMs: 35000 });

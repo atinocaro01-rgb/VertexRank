@@ -1,3 +1,4 @@
+import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
 import { computeGeoSignals, extractEntityCandidates, scoreFromFlags, truncate } from "../../../lib/textIntelligence";
 import { aggregateSiteFlags, samplePagesForPrompt } from "../../../lib/siteSignals";
@@ -18,12 +19,9 @@ const GEO_WEIGHTS = {
 };
 
 export async function POST(req) {
-  let body;
-  try {
-    body = await req.json();
-  } catch {
-    return Response.json({ error: "Invalid request." }, { status: 400 });
-  }
+  const guard = await guardJson(req, "aiHeavy", { signalsPolicy: true });
+  if (!guard.ok) return guard.response;
+  const body = guard.body;
 
   const { crawl } = body || {};
   if (!crawl?.pages?.length) {

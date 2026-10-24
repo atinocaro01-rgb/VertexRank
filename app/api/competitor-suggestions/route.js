@@ -1,3 +1,4 @@
+import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
 import { truncate } from "../../../lib/textIntelligence";
 
@@ -13,12 +14,9 @@ export const runtime = "nodejs";
 export const maxDuration = 60;
 
 export async function POST(req) {
-  let body;
-  try {
-    body = await req.json();
-  } catch {
-    return Response.json({ error: "Invalid request." }, { status: 400 });
-  }
+  const guard = await guardJson(req, "aiLight");
+  if (!guard.ok) return guard.response;
+  const body = guard.body;
 
   const { scanMeta } = body || {};
   if (!scanMeta?.domain) {

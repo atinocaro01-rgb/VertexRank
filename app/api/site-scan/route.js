@@ -1,3 +1,4 @@
+import { guardJson } from "../../../lib/apiGuard";
 import { crawlSite } from "../../../lib/siteCrawler";
 
 // Crawls up to maxPages pages of a site (not just one), bounded by an
@@ -9,15 +10,12 @@ export const runtime = "nodejs";
 export const maxDuration = 60;
 
 export async function POST(req) {
-  let body;
-  try {
-    body = await req.json();
-  } catch {
-    return Response.json({ error: "Invalid request." }, { status: 400 });
-  }
+  const guard = await guardJson(req, "crawl");
+  if (!guard.ok) return guard.response;
+  const body = guard.body;
 
   const url = body?.url;
-  if (!url || typeof url !== "string") {
+  if (!url || typeof url !== "string" || url.length > 2048) {
     return Response.json({ error: "That doesn't look like a valid URL." }, { status: 400 });
   }
 

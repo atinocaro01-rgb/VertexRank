@@ -1,3 +1,4 @@
+import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
 import { classifyBacklinkOpportunities } from "../../../lib/backlinkClassifier";
 
@@ -30,12 +31,9 @@ const DISCLAIMER = "These are potential prospects worth investigating, identifie
 const MAX_CANDIDATES_TO_AI = 25;
 
 export async function POST(req) {
-  let body;
-  try {
-    body = await req.json();
-  } catch {
-    return Response.json({ error: "Invalid request." }, { status: 400 });
-  }
+  const guard = await guardJson(req, "aiHeavy");
+  if (!guard.ok) return guard.response;
+  const body = guard.body;
 
   const { crawl, ourContext } = body || {};
   if (!crawl?.pages?.length) {

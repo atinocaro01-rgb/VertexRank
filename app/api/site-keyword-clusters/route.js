@@ -1,3 +1,4 @@
+import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
 import { clusterSiteKeywords, aggregateSiteKeywords, aggregateSiteEntities, auditKeywordUsage, scoreKeywordUsage } from "../../../lib/keywordClustering";
 
@@ -55,12 +56,9 @@ function priorityForKeyword(k) {
 }
 
 export async function POST(req) {
-  let body;
-  try {
-    body = await req.json();
-  } catch {
-    return Response.json({ error: "Invalid request." }, { status: 400 });
-  }
+  const guard = await guardJson(req, "aiHeavy", { signalsPolicy: true });
+  if (!guard.ok) return guard.response;
+  const body = guard.body;
 
   const { crawl } = body || {};
   if (!crawl?.pages?.length) {
