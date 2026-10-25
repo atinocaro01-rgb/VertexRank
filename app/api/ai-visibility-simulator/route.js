@@ -1,6 +1,6 @@
+import { normalizeCountry } from "../../../lib/market";
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
-import { countryPromptLine } from "../../../lib/country";
 import { truncate } from "../../../lib/textIntelligence";
 
 export const runtime = "nodejs";
@@ -11,7 +11,8 @@ export async function POST(req) {
   if (!guard.ok) return guard.response;
   const body = guard.body;
 
-  const { scanMeta, keywords, country } = body || {};
+  const { scanMeta, keywords } = body || {};
+  const country = normalizeCountry(body?.country);
   if (!scanMeta?.domain) {
     return Response.json({ error: "Scan data is required. Run a scan on this website first." }, { status: 400 });
   }
@@ -28,7 +29,7 @@ Headings: ${[...(scanMeta.h2Texts || []), ...(scanMeta.h3Texts || [])].join(" | 
 Visible body text (truncated): "${truncate(scanMeta.fullText || scanMeta.bodySnippet, 2500)}"
 Schema types present: ${(scanMeta.schemaTypes || []).join(", ") || "(none)"}
 Known target keywords: ${keywordList}
-${countryPromptLine(country)}
+Target country/market: ${!country || country === "Worldwide" ? "Worldwide (no single target country — do not assume any specific country or local market)" : country}
 
 Generate 6 realistic questions a person might ask an AI search assistant that this business could plausibly be a relevant answer for — grounded in what this content actually describes (its real products/services/location/audience), not generic industry questions. Vary specificity: include at least one broad "who are the best..." style comparison question and at least one narrow, specific question.
 

@@ -1,6 +1,6 @@
+import { normalizeCountry, marketPromptBlock } from "../../../lib/market";
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
-import { countryPromptLine } from "../../../lib/country";
 import { computeAeoSignals, extractExistingQuestions, scoreFromFlags, truncate } from "../../../lib/textIntelligence";
 import { aggregateSiteFlags, rankPagesByScore, samplePagesForPrompt } from "../../../lib/siteSignals";
 import { buildPageRecommendations, UTILITY_TYPES } from "../../../lib/aeoPageRecommendations";
@@ -25,6 +25,8 @@ export async function POST(req) {
   const guard = await guardJson(req, "aiHeavy", { signalsPolicy: true });
   if (!guard.ok) return guard.response;
   const body = guard.body;
+  // Validated against the fixed country list, so it can never carry free text into a prompt.
+  const country = normalizeCountry(body?.country);
 
   const { crawl, keywords } = body || {};
   if (!crawl?.pages?.length) {
@@ -86,11 +88,9 @@ export async function POST(req) {
     })
     .join("\n");
 
-  const system = `You are VertexRank AI, an Answer Engine Optimization analyst reasoning about an ENTIRE website, not a single page. You are given real crawled data from multiple real pages of the same site. You generate realistic questions a buyer would ask about this business as a whole, and for each you judge — using ONLY the page summaries given — whether some page on the site already appears to answer it, and if so which one. If you can't tell from the summaries, say the coverage is unclear rather than guessing. You never claim your scores are official Google or AI-platform data.`;
+  const system = `You are VertexRank AI, an Answer Engine Optimization analyst reasoning about an ENTIRE website, not a single page. You are given real crawled data from multiple real pages of the same site. You generate realistic questions a buyer would ask about this business as a whole, and for each you judge — using ONLY the page summaries given — whether some page on the site already appears to answer it, and if so which one. If you can't tell from the summaries, say the coverage is unclear rather than guessing. You never claim your scores are official Google or AI-platform data.` + marketPromptBlock(country);
 
-  const countryLine = countryPromptLine(body?.country);
   const prompt = `Website: ${crawl.domain}
-${countryLine}
 Pages crawled: ${pages.length}${crawl.truncated ? " (crawl was time/page-limited, so this may not be every page on the site)" : ""}
 Known target keywords: ${keywordList}
 Questions the site's own text already appears to ask/answer verbatim (aggregated across pages): ${existingQuestions.slice(0, 8).join(" | ") || "(none found)"}
@@ -119,7 +119,6 @@ Respond with ONLY a JSON object, no markdown fences, no commentary, in exactly t
   // after the other; two smaller ones finish in the time of the slower one,
   // and either can fail without taking the other down.
   const pagePrompt = `Website: ${crawl.domain}
-${countryLine}
 
 Weakest content pages that need page-level help (with what the crawl found missing on each):
 ${weakPageBlock}
@@ -132,7 +131,7 @@ Respond with ONLY a JSON object, no markdown fences, no commentary, in exactly t
     { "url": "string (exact URL from the list above)", "suggestedQuestions": [ { "question": "string", "answerOutline": "string" } ], "rewriteTip": "string" }
   ]
 }`;
-  const pageSystem = `You are VertexRank AI, an Answer Engine Optimization editor. You are given real crawled excerpts of specific weak pages. You suggest what each page should answer and the single best edit, grounded ONLY in the text given — you never invent facts, figures, prices or claims about the business.`;
+  const pageSystem = `You are VertexRank AI, an Answer Engine Optimization editor. You are given real crawled excerpts of specific weak pages. You suggest what each page should answer and the single best edit, grounded ONLY in the text given — you never invent facts, figures, prices or claims about the business.` + marketPromptBlock(country);
 
   const [qRes, pRes] = await Promise.allSettled([
     callOpenRouterJson({ system, prompt, maxTokens: 2400, temperature: 0.5 }),

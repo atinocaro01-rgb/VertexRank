@@ -1,6 +1,6 @@
+import { normalizeCountry, marketPromptBlock } from "../../../lib/market";
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
-import { countryPromptLine } from "../../../lib/country";
 import { classifyBacklinkOpportunities } from "../../../lib/backlinkClassifier";
 
 // Feature: Backlink Opportunities. Typically run against a CRAWL OF A
@@ -35,6 +35,8 @@ export async function POST(req) {
   const guard = await guardJson(req, "aiHeavy");
   if (!guard.ok) return guard.response;
   const body = guard.body;
+  // Validated against the fixed country list, so it can never carry free text into a prompt.
+  const country = normalizeCountry(body?.country);
 
   const { crawl, ourContext } = body || {};
   if (!crawl?.pages?.length) {
@@ -62,13 +64,11 @@ export async function POST(req) {
     .map((c, i) => `${i + 1}. [host=${c.host}] Type: ${c.destinationType}. Linked from ${c.linkingPageCount} page(s) on ${crawl.domain}. Example: anchor text "${c.examples[0]?.anchorText || "(none)"}" on "${c.examples[0]?.fromPageTitle}"${c.resourcePageMentions > 0 ? " (found on a resources/partners-style page)" : ""}`)
     .join("\n");
 
-  const system = `You are VertexRank AI. You are given a real list of external domains that a real competitor site links to, classified by type. Your ONLY job is to explain, for domains that look like genuine prospects, WHY that domain might be worth the client investigating as a possible backlink source — reasoning from the domain's type and how the competitor uses it. You MUST NOT claim any of these are existing backlinks for the client, that a link is guaranteed, or that VertexRank has contacted anyone. Use only cautious, prospecting language: "worth investigating", "a plausible prospect", "consider reaching out to" — never "you will get a backlink" or similar certainty. Skip any domain in the list that doesn't look like a genuine prospect (e.g. a one-off unrelated mention).`;
+  const system = `You are VertexRank AI. You are given a real list of external domains that a real competitor site links to, classified by type. Your ONLY job is to explain, for domains that look like genuine prospects, WHY that domain might be worth the client investigating as a possible backlink source — reasoning from the domain's type and how the competitor uses it. You MUST NOT claim any of these are existing backlinks for the client, that a link is guaranteed, or that VertexRank has contacted anyone. Use only cautious, prospecting language: "worth investigating", "a plausible prospect", "consider reaching out to" — never "you will get a backlink" or similar certainty. Skip any domain in the list that doesn't look like a genuine prospect (e.g. a one-off unrelated mention).` + marketPromptBlock(country);
 
   const contextLine = ourContext ? `The client's own business, for relevance judgment: ${String(ourContext).slice(0, 400)}` : "No description of the client's own business was provided — reason generally from each domain's type.";
 
-  const countryLine = countryPromptLine(body?.country);
   const prompt = `Competitor/target site analyzed: ${crawl.domain}
-${countryLine}
 ${contextLine}
 
 Candidate external domains this site links to (real, observed data):

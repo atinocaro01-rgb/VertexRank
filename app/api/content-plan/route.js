@@ -1,6 +1,6 @@
+import { normalizeCountry, marketPromptBlock } from "../../../lib/market";
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
-import { countryPromptLine } from "../../../lib/country";
 
 export const runtime = "nodejs";
 export const maxDuration = 60; // Vercel Hobby plan max
@@ -9,17 +9,17 @@ export async function POST(req) {
   const guard = await guardJson(req, "aiLight");
   if (!guard.ok) return guard.response;
   const body = guard.body;
+  // Validated against the fixed country list, so it can never carry free text into a prompt.
+  const country = normalizeCountry(body?.country);
 
   const { title, primaryKeyword, intent } = body || {};
   if (!title?.trim()) {
     return Response.json({ error: "A title is required." }, { status: 400 });
   }
 
-  const system = `You are VertexRank AI, planning real, specific SEO content. Ground every suggestion in the title and keyword actually given — write like a strategist who understands this specific topic, not a generic template.`;
+  const system = `You are VertexRank AI, planning real, specific SEO content. Ground every suggestion in the title and keyword actually given — write like a strategist who understands this specific topic, not a generic template.` + marketPromptBlock(country);
 
-  const countryLine = countryPromptLine(body?.country);
   const prompt = `Title: ${title}
-${countryLine}
 Primary keyword: ${primaryKeyword?.trim() || "(not specified — infer one from the title)"}
 Search intent: ${intent || "Informational"}
 

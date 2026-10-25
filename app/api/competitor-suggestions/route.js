@@ -1,6 +1,6 @@
+import { normalizeCountry, marketPromptBlock } from "../../../lib/market";
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
-import { countryPromptLine } from "../../../lib/country";
 import { truncate } from "../../../lib/textIntelligence";
 
 // Suggests plausible real-world competitors from VertexRank AI's general
@@ -18,17 +18,17 @@ export async function POST(req) {
   const guard = await guardJson(req, "aiLight");
   if (!guard.ok) return guard.response;
   const body = guard.body;
+  // Validated against the fixed country list, so it can never carry free text into a prompt.
+  const country = normalizeCountry(body?.country);
 
   const { scanMeta } = body || {};
   if (!scanMeta?.domain) {
     return Response.json({ error: "Scan data is required. Run a scan on this website first." }, { status: 400 });
   }
 
-  const system = `You are VertexRank AI. You are given real crawled data describing a business's own website. From your general training knowledge of this industry and any location signals present, suggest plausible real-world competitors — companies that likely compete for the same customers or search intent. You are NOT performing a live web search, so you never claim certainty: every suggestion must be labeled with an honest confidence level, and you never invent a company that you are not reasonably confident actually exists. If you are not confident a real competitor exists for this niche, return fewer suggestions rather than fabricating ones.`;
+  const system = `You are VertexRank AI. You are given real crawled data describing a business's own website. From your general training knowledge of this industry and any location signals present, suggest plausible real-world competitors — companies that likely compete for the same customers or search intent. You are NOT performing a live web search, so you never claim certainty: every suggestion must be labeled with an honest confidence level, and you never invent a company that you are not reasonably confident actually exists. If you are not confident a real competitor exists for this niche, return fewer suggestions rather than fabricating ones.` + marketPromptBlock(country);
 
-  const countryLine = countryPromptLine(body?.country);
   const prompt = `Website: ${scanMeta.domain}
-${countryLine}
 Page title: "${scanMeta.title || "(missing)"}"
 Meta description: "${scanMeta.metaDescription || "(missing)"}"
 H1: "${scanMeta.h1Text || "(missing)"}"

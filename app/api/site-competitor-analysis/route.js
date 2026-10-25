@@ -1,6 +1,6 @@
+import { normalizeCountry, marketPromptBlock } from "../../../lib/market";
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
-import { countryPromptLine } from "../../../lib/country";
 import { crawlSite } from "../../../lib/siteCrawler";
 import { extractKeywordCandidates, computeAeoSignals, computeGeoSignals, scoreFromFlags } from "../../../lib/textIntelligence";
 import { aggregateSiteFlags } from "../../../lib/siteSignals";
@@ -35,6 +35,8 @@ export async function POST(req) {
   const guard = await guardJson(req, "competitor");
   if (!guard.ok) return guard.response;
   const body = guard.body;
+  // Validated against the fixed country list, so it can never carry free text into a prompt.
+  const country = normalizeCountry(body?.country);
 
   const { competitorUrl, ourCrawl } = body || {};
   if (typeof competitorUrl !== "string" || !competitorUrl.trim() || competitorUrl.length > 2048) return Response.json({ error: "A competitor URL is required." }, { status: 400 });
@@ -82,11 +84,9 @@ export async function POST(req) {
   };
 
   // ---- AI layer ----
-  const system = `You are VertexRank AI comparing two real, freshly crawled websites at the site level. Everything you say must be grounded in the real observed comparison data given — topic lists, schema types, scores. You never claim to know search rankings, traffic, or backlink counts for either site, and you never invent topics not in the lists given.`;
+  const system = `You are VertexRank AI comparing two real, freshly crawled websites at the site level. Everything you say must be grounded in the real observed comparison data given — topic lists, schema types, scores. You never claim to know search rankings, traffic, or backlink counts for either site, and you never invent topics not in the lists given.` + marketPromptBlock(country);
 
-  const countryLine = countryPromptLine(body?.country);
   const prompt = `Our site: ${ourCrawl.domain} (${ourCrawl.pages.length} pages crawled)
-${countryLine}
 Competitor: ${competitorCrawl.domain} (${competitorCrawl.pages.length} pages crawled)
 
 Shared topics (both sites appear to cover): ${sharedTopics.slice(0, 20).join(", ") || "(none detected)"}

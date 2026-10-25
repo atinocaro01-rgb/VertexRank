@@ -8,13 +8,16 @@ import assert from "node:assert/strict";
 import { register } from "node:module";
 register("./hooks.mjs", import.meta.url);
 const { crawlSite } = await import("../../lib/siteCrawler.js");
+const { analyzeMarket } = await import("../../lib/marketChecks.js");
 
-const page = ({ title = "A page", canonical, robots, links = [], body = "" } = {}) => ({
+const page = ({ title = "A page", canonical, robots, links = [], body = "", lang, hreflangs = [], tel, jsonld } = {}) => ({
   type: "text/html; charset=utf-8",
-  body: `<html><head><title>${title}</title><meta name="description" content="d ${title}">` +
+  body: `<html${lang ? ` lang="${lang}"` : ""}><head><title>${title}</title><meta name="description" content="d ${title}">` +
     (canonical !== undefined ? `<link rel="canonical" href="${canonical}">` : "") +
     (robots ? `<meta name="robots" content="${robots}">` : "") +
-    `</head><body><h1>${title}</h1><p>${body || ("words about " + title + " ").repeat(80)}</p>${links.map((l) => `<a href="${l}">link</a>`).join("")}</body></html>`,
+    hreflangs.map(([l, h]) => `<link rel="alternate" hreflang="${l}" href="${h}">`).join("") +
+    (jsonld ? `<script type="application/ld+json">${JSON.stringify(jsonld)}</script>` : "") +
+    `</head><body><h1>${title}</h1><p>${body || ("words about " + title + " ").repeat(80)}</p>${links.map((l) => `<a href="${l}">link</a>`).join("")}${tel ? `<a href="tel:${tel}">call</a>` : ""}</body></html>`,
 });
 const sitemap = (urls) => ({ type: "application/xml", body: `<?xml version="1.0"?><urlset>${urls.map((u) => `<url><loc>${u}</loc></url>`).join("")}</urlset>` });
 const text = (body) => ({ type: "text/plain", body });
@@ -141,4 +144,34 @@ test("a clean site produces no technical findings and no penalty", async () => {
 test("private/invalid input is rejected before any request", async () => {
   setWeb({});
   assert.match((await crawlSite("not a url at all !!")).error ?? "", /valid URL|isn't/);
+});
+
+test("market signals are extracted from real crawl output and judged against the selected country", async () => {
+  const A = "https://a.com";
+  const ld = { "@context": "https://schema.org", "@type": "LocalBusiness", name: "Shop", telephone: "+1 555 0100", address: { "@type": "PostalAddress", addressCountry: "US" }, makesOffer: { "@type": "Offer", priceCurrency: "USD" } };
+  setWeb({
+    [`${A}/`]: page({ title: "Home", canonical: `${A}/`, lang: "de", links: ["/about"], tel: "+1%20555%200100", jsonld: ld,
+      hreflangs: [["en_US", `${A}/us`], ["de-DE", `${A}/`]] }),
+    [`${A}/about`]: page({ title: "About", canonical: `${A}/about`, links: ["/"] }),
+    [`${A}/robots.txt`]: text("User-agent: *\nDisallow:\n"), [`${A}/sitemap.xml`]: { status: 404, body: "" },
+  });
+  const r = await crawlSite("https://a.com");
+  const home = r.pages.find((p) => p.url === `${A}/`);
+  assert.equal(home.htmlLang, "de");
+  assert.deepEqual(home.hreflangs, [{ lang: "en_US", href: `${A}/us` }, { lang: "de-DE", href: `${A}/` }]);
+  assert.deepEqual(home.telLinks, ["+1 555 0100"]);
+  assert.deepEqual(home.schemaSignals.addressCountries, ["US"]); assert.deepEqual(home.schemaSignals.currencies, ["USD"]);
+  assert.equal(home.schemaSignals.hasLocalBusiness, true);
+  assert.equal(r.pages.find((p) => p.url === `${A}/about`).htmlLang, ""); // no lang attribute
+
+  // The same crawl, judged for two different markets: the country selection alone changes the findings.
+  const ids = (country) => analyzeMarket(r, country).map((f) => f.id);
+  assert.deepEqual(analyzeMarket(r, "Worldwide"), []);
+  const ke = ids("Kenya");
+  for (const id of ["mkt_lang_mismatch", "mkt_lang_missing", "mkt_hreflang_invalid", "mkt_hreflang_no_default", "mkt_schema_country", "mkt_schema_currency", "mkt_phone_country"]) assert.ok(ke.includes(id), `Kenya: missing ${id} in ${ke}`);
+  assert.ok(!ke.includes("mkt_no_local_signals"));
+  const de = ids("Germany");
+  assert.ok(!de.includes("mkt_lang_mismatch")); assert.ok(de.includes("mkt_schema_country")); // German page is fine for Germany; a US address still isn't
+  const us = ids("United States");
+  assert.ok(!us.includes("mkt_schema_country") && !us.includes("mkt_schema_currency") && !us.includes("mkt_phone_country"));
 });

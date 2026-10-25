@@ -102,15 +102,19 @@ The crawler respects robots.txt using `lib/robotsTxt.js` (user-agent groups, `*`
 
 Tests: `npm test` runs the unit tests plus `tests/e2e/crawler.e2e.mjs`, which runs the real crawler over a fake website. That test swaps in a small stand-in for cheerio and an in-memory network, so it checks the crawler's logic, not real HTML parsing or real HTTP.
 
-## Opportunity Queue and Action Center
+## Opportunity Queue and country targeting
 
-Everything the app suggests is one **opportunity** with one shape (`lib/opportunity.js`, tested in `tests/opportunity.test.mjs`): `sourceId`, `module`, `kind` (observed / AI analysis / AI estimate), `title`, `type`, `priority`, `confidence`, `evidence`, `recommendedAction`, `urls`, plus — once accepted — `status`, `country`, `crawlId` and timestamps.
+**Opportunity Queue** (sidebar → Opportunities, and the Dashboard's "Top opportunities"). One ranked list of everything found for a website: technical findings, market (country) checks, keyword, AEO, GEO / AI visibility, internal links, competitor gaps and content ideas (`lib/opportunityQueue.js`). Each item has a type, evidence, a recommended action, a priority and a confidence, and a transparent score: **priority points (Critical 100, High 75, Medium 50, Low 25) × confidence (High 1, Medium 0.85, Low 0.7) + up to 10 for how many URLs a technical finding affects**. Hover a score to see the arithmetic.
 
-- **Opportunity Queue** (the landing view) lists every finding from the crawl and every analysis, ranked: priority first, then observed before AI-inferred, then indexability and technical problems, then how many pages it affects. Each item is *Open*, or in the workflow. You can add it to the Action Center, dismiss it, or restore a dismissed one.
-- **Action Center** is the workflow state of that same list: only what you accepted (or dismissed), by status (New → Pending Approval → Approved → Marked done → Verified). Deleting an action that is still detected sends it back to the Queue as Open.
-- Findings are recomputed from the current analyses; only your decisions are stored (still under `bundle.actions`). A stored item from an older crawl, a different target country, or a finding that is no longer detected is flagged rather than silently dropped.
-- Workspaces saved before this change are migrated on load: old `detail` records are flattened, the Dashboard's old duplicate ids (`uni_*`) map back to the module's own id so one finding can't be added twice, and unknown values (country, crawl) stay unknown instead of being guessed.
+- Every opportunity has one canonical id. The old per-screen "Add to Action Center" buttons used different ids, so the same item could be added twice; the queue also recognises those older ids, so existing Action Center items still show as added.
+- The same opportunity reported by two modules is shown once (the higher-scoring one) and notes which other module flagged it.
+- Opportunities map to the Action Center: not added → in the Action Center → done/rejected. You can filter by type, priority, status and text, and add the top Critical/High items in one click.
+- Ideas still in the "Idea" status become opportunities; internal-link opportunities are one per target page and show as done once all suggested links are applied.
+- Opportunities from a comparison made against an earlier crawl of your site, or from AI analyses written for a different market than the one now selected, are kept but ranked lower and labelled.
 
-## Target country in AI prompts
+**Country targeting.** The country selected for a website is now used in three ways:
+1. **AI analyses.** AEO, GEO, keyword, content ideas, competitor suggestions and comparison, insights, content plans and backlink prospecting all receive the country (validated against `lib/market.js`, so free text can never reach a prompt) and are told to tailor what's location-sensitive — languages, currency, spelling, local directories and entities — without guessing about local specifics they're unsure of. "Worldwide" explicitly forbids assuming a market.
+2. **Deterministic market checks** (`lib/marketChecks.js`) against the crawl: page language vs the market's languages, missing `lang`, hreflang problems (malformed, relative, no self-reference, no x-default, or none targeting the market), schema address country and currency vs the market, phone country code, and absence of local-business signals. These run in the browser, so changing the country updates them instantly, and they appear in the SEO Audit and the queue.
+3. **Re-running on change.** Changing a website's country clears the AI results written for the old market and re-runs AEO, GEO and keyword analysis for the new one.
 
-`lib/country.js` holds the country list and the one prompt line every AI route uses. A country that isn't in the list (or is missing) becomes "Worldwide — do not assume any specific country or local market", which also means a client can't inject free text into a prompt through the country field. `tests/country.test.mjs` fails if any route that calls the model doesn't use it, or if a client call to an AI route doesn't send `country`.
+`lib/market.js` holds the country list and per-market reference data (languages, currency, English spelling, calling code). It is reference data for hints and consistency checks, not authority — review it for the markets you care about most.

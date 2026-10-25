@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   createTracker, resetDerived, migrateLegacyBundle, stampResult, isStaleForCrawl,
-  normalizeSiteKey, discardMessage, DERIVED_ANALYSIS_FIELDS,
+  normalizeSiteKey, discardMessage, DERIVED_ANALYSIS_FIELDS, isStaleForMarket,
 } from "../lib/crawlState.js";
 
 const mkBundle = (crawlId, extra = {}) => ({
@@ -134,4 +134,13 @@ test("isStaleForCrawl / stampResult / normalizeSiteKey", () => {
   assert.equal(normalizeSiteKey("HTTPS://Example.com/"), "example.com");
   assert.notEqual(normalizeSiteKey("example.com"), normalizeSiteKey("www.example.com"));
   assert.equal(normalizeSiteKey("example.com/blog/"), "example.com/blog");
+});
+
+test("stampResult records the market; isStaleForMarket only judges results that have one", () => {
+  assert.deepEqual(stampResult({ a: 1 }, "c1", "Kenya"), { a: 1, crawlId: "c1", market: "Kenya" });
+  assert.deepEqual(stampResult({ a: 1 }, "c1"), { a: 1, crawlId: "c1" }); // no market given -> none recorded
+  assert.equal(isStaleForMarket({ market: "Kenya" }, "Kenya"), false);
+  assert.equal(isStaleForMarket({ market: "Kenya" }, "Germany"), true);
+  assert.equal(isStaleForMarket({}, "Germany"), false); // results from before market targeting are neutral
+  assert.equal(isStaleForMarket(null, "Germany"), false);
 });

@@ -1,6 +1,5 @@
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
-import { countryPromptLine } from "../../../lib/country";
 import { findLinkCandidates } from "../../../lib/internalLinking";
 
 // Targets orphan pages and weakly-linked pages (already identified
@@ -69,9 +68,7 @@ export async function POST(req) {
 
   const system = `You are VertexRank AI, an internal linking strategist. You are given real target pages that currently have few or no internal links pointing at them, and a real, deterministically-ranked shortlist of other pages on the same site that share topical content overlap. Your job is to pick which of the GIVEN candidates make natural editorial sense to link from (not all candidates need to be used), and write natural anchor text for each — text a human editor would actually write, incorporating a relevant term, never generic text like "click here". You never invent a source page that wasn't in the candidate list given.`;
 
-  const countryLine = countryPromptLine(body?.country);
   const prompt = `Website: ${crawl.domain}
-${countryLine}
 
 ${targetBlock}
 

@@ -1,6 +1,6 @@
+import { normalizeCountry, marketPromptBlock } from "../../../lib/market";
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
-import { countryPromptLine } from "../../../lib/country";
 import { truncate } from "../../../lib/textIntelligence";
 
 export const runtime = "nodejs";
@@ -10,6 +10,8 @@ export async function POST(req) {
   const guard = await guardJson(req, "aiLight");
   if (!guard.ok) return guard.response;
   const body = guard.body;
+  // Validated against the fixed country list, so it can never carry free text into a prompt.
+  const country = normalizeCountry(body?.country);
 
   const { scanMeta, keywordOpportunities, aeoQuestions, geoOpportunities, count } = body || {};
   if (!scanMeta?.domain) {
@@ -21,11 +23,9 @@ export async function POST(req) {
   const missingQuestions = (aeoQuestions || []).filter((q) => q.coverage !== "Answered").slice(0, 8).map((q) => q.question).join(" | ") || "(none supplied)";
   const geoGaps = (geoOpportunities || []).slice(0, 6).map((o) => o.title).join(" | ") || "(none supplied)";
 
-  const system = `You are VertexRank AI, a content strategist. You propose real, specific content ideas grounded in the actual crawled website and the actual gaps already found by other VertexRank modules — never generic "10 tips" filler unrelated to this business.`;
+  const system = `You are VertexRank AI, a content strategist. You propose real, specific content ideas grounded in the actual crawled website and the actual gaps already found by other VertexRank modules — never generic "10 tips" filler unrelated to this business.` + marketPromptBlock(country);
 
-  const countryLine = countryPromptLine(body?.country);
   const prompt = `Website: ${scanMeta.domain}
-${countryLine}
 Page title: "${scanMeta.title || "(missing)"}"
 Meta description: "${scanMeta.metaDescription || "(missing)"}"
 H1: "${scanMeta.h1Text || "(missing)"}"

@@ -1,6 +1,6 @@
+import { normalizeCountry, marketPromptBlock } from "../../../lib/market";
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
-import { countryPromptLine } from "../../../lib/country";
 import { computeGeoSignals, extractEntityCandidates, scoreFromFlags, truncate } from "../../../lib/textIntelligence";
 import { aggregateSiteFlags, samplePagesForPrompt } from "../../../lib/siteSignals";
 
@@ -23,6 +23,8 @@ export async function POST(req) {
   const guard = await guardJson(req, "aiHeavy", { signalsPolicy: true });
   if (!guard.ok) return guard.response;
   const body = guard.body;
+  // Validated against the fixed country list, so it can never carry free text into a prompt.
+  const country = normalizeCountry(body?.country);
 
   const { crawl } = body || {};
   if (!crawl?.pages?.length) {
@@ -68,11 +70,9 @@ export async function POST(req) {
     .map((p) => `- "${p.title || "(untitled)"}" (${p.url}) — ${truncate(p.fullText, 220)}`)
     .join("\n");
 
-  const system = `You are VertexRank AI, a GEO (Generative/AI-search visibility) analyst reasoning about an ENTIRE website, not a single page. You are given real crawled data from multiple real pages of the same site and a real checklist of entity/authority signals already detected anywhere on the site. You judge how clearly an AI system reading these pages could understand who this business is, what it does, and why it should be trusted — grounded ONLY in the content given. You never claim inclusion in any AI system's answers is guaranteed, and you never invent facts not present in the text.`;
+  const system = `You are VertexRank AI, a GEO (Generative/AI-search visibility) analyst reasoning about an ENTIRE website, not a single page. You are given real crawled data from multiple real pages of the same site and a real checklist of entity/authority signals already detected anywhere on the site. You judge how clearly an AI system reading these pages could understand who this business is, what it does, and why it should be trusted — grounded ONLY in the content given. You never claim inclusion in any AI system's answers is guaranteed, and you never invent facts not present in the text.` + marketPromptBlock(country);
 
-  const countryLine = countryPromptLine(body?.country);
   const prompt = `Website: ${crawl.domain}
-${countryLine}
 Pages crawled: ${pages.length}${crawl.truncated ? " (crawl was time/page-limited, may not cover the whole site)" : ""}
 Entities/proper nouns detected across the site: ${entities.slice(0, 15).map((e) => e.entity).join(", ") || "(none detected)"}
 Site-wide signal checklist (true if ANY crawled page establishes it): ${Object.entries(siteFlags).map(([k, v]) => `${k}=${v}`).join(", ")}
