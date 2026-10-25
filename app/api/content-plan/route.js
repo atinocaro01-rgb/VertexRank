@@ -1,5 +1,6 @@
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
+import { countryPromptLine } from "../../../lib/country";
 
 export const runtime = "nodejs";
 export const maxDuration = 60; // Vercel Hobby plan max
@@ -16,7 +17,9 @@ export async function POST(req) {
 
   const system = `You are VertexRank AI, planning real, specific SEO content. Ground every suggestion in the title and keyword actually given — write like a strategist who understands this specific topic, not a generic template.`;
 
+  const countryLine = countryPromptLine(body?.country);
   const prompt = `Title: ${title}
+${countryLine}
 Primary keyword: ${primaryKeyword?.trim() || "(not specified — infer one from the title)"}
 Search intent: ${intent || "Informational"}
 

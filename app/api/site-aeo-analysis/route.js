@@ -1,5 +1,6 @@
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
+import { countryPromptLine } from "../../../lib/country";
 import { computeAeoSignals, extractExistingQuestions, scoreFromFlags, truncate } from "../../../lib/textIntelligence";
 import { aggregateSiteFlags, rankPagesByScore, samplePagesForPrompt } from "../../../lib/siteSignals";
 import { buildPageRecommendations, UTILITY_TYPES } from "../../../lib/aeoPageRecommendations";
@@ -87,7 +88,9 @@ export async function POST(req) {
 
   const system = `You are VertexRank AI, an Answer Engine Optimization analyst reasoning about an ENTIRE website, not a single page. You are given real crawled data from multiple real pages of the same site. You generate realistic questions a buyer would ask about this business as a whole, and for each you judge — using ONLY the page summaries given — whether some page on the site already appears to answer it, and if so which one. If you can't tell from the summaries, say the coverage is unclear rather than guessing. You never claim your scores are official Google or AI-platform data.`;
 
+  const countryLine = countryPromptLine(body?.country);
   const prompt = `Website: ${crawl.domain}
+${countryLine}
 Pages crawled: ${pages.length}${crawl.truncated ? " (crawl was time/page-limited, so this may not be every page on the site)" : ""}
 Known target keywords: ${keywordList}
 Questions the site's own text already appears to ask/answer verbatim (aggregated across pages): ${existingQuestions.slice(0, 8).join(" | ") || "(none found)"}
@@ -116,6 +119,7 @@ Respond with ONLY a JSON object, no markdown fences, no commentary, in exactly t
   // after the other; two smaller ones finish in the time of the slower one,
   // and either can fail without taking the other down.
   const pagePrompt = `Website: ${crawl.domain}
+${countryLine}
 
 Weakest content pages that need page-level help (with what the crawl found missing on each):
 ${weakPageBlock}

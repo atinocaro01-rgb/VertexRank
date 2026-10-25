@@ -1,5 +1,6 @@
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
+import { countryPromptLine } from "../../../lib/country";
 import { truncate } from "../../../lib/textIntelligence";
 
 export const runtime = "nodejs";
@@ -22,7 +23,9 @@ export async function POST(req) {
 
   const system = `You are VertexRank AI, a content strategist. You propose real, specific content ideas grounded in the actual crawled website and the actual gaps already found by other VertexRank modules — never generic "10 tips" filler unrelated to this business.`;
 
+  const countryLine = countryPromptLine(body?.country);
   const prompt = `Website: ${scanMeta.domain}
+${countryLine}
 Page title: "${scanMeta.title || "(missing)"}"
 Meta description: "${scanMeta.metaDescription || "(missing)"}"
 H1: "${scanMeta.h1Text || "(missing)"}"

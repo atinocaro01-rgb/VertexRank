@@ -7,14 +7,21 @@ import {
   ChevronDown, ChevronLeft, ChevronRight, Loader2, AlertTriangle, CheckCircle2,
   RefreshCw, Wand2, Zap, Search,
   SlidersHorizontal, ArrowUpDown, Info, Sparkles, ChevronUp, Building2, Newspaper,
-  Podcast, Handshake, BookOpen, MapPin, Bot, Target, ShieldCheck, ListPlus, Copy
+  Podcast, Handshake, BookOpen, MapPin, Bot, Target, ShieldCheck, ListPlus, Copy, Inbox
 } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
 import {
-  GEO_FACTORS, AEO_SIGNAL_LABELS, GEO_AUTHORITY_LABELS, PAGE_EXPORTERS, exportFullReport, buildUnifiedRecs,
+  GEO_FACTORS, AEO_SIGNAL_LABELS, GEO_AUTHORITY_LABELS, PAGE_EXPORTERS, exportFullReport,
   formatRecommendation, formatWeakPage, formatCompetitor, formatContentIdea, formatAction,
-  sectionUnifiedRecs, sectionAiInsights, sectionSimulator, computeSiteAuditIssues, copyTextToClipboard,
+  sectionAiInsights, sectionSimulator, computeSiteAuditIssues, describeEvidence, copyTextToClipboard,
 } from "../lib/copyExport";
+import { COUNTRIES, WORLDWIDE, normalizeCountry } from "../lib/country";
+import { DATA_LABEL_KINDS } from "../lib/dataLabel";
+import {
+  ACTION_TYPES, PRIORITIES, OPPORTUNITY_STATUSES, OPEN, toRecord, hasRecord, buildQueue, summarizeQueue, groupOf, migrateOpportunities,
+  fromAuditIssue, fromKeywordOpportunity, fromCannibalization, fromAeoQuestion, fromAeoRecommendation, fromAeoWeakPage,
+  fromGeoOpportunity, fromSimulatorQuery, fromCompetitorGap, fromCompetitorAeoGeoDiff,
+} from "../lib/opportunity";
 import {
   createTracker, resetDerived, stampResult, migrateLegacyBundle, discardMessage, isStaleForCrawl, normalizeSiteKey,
 } from "../lib/crawlState";
@@ -160,20 +167,16 @@ function siteKeywordList(b) {
 
 /* ============================== constants ============================== */
 
-// "Worldwide" first (for sites with no single target country), then A–Z.
-const COUNTRIES = ["Worldwide", "Algeria", "Argentina", "Australia", "Austria", "Bangladesh", "Belgium", "Botswana", "Brazil", "Cameroon", "Canada", "Chile", "China", "Colombia", "Czech Republic", "Côte d'Ivoire", "Denmark", "Egypt", "Ethiopia", "Finland", "France", "Germany", "Ghana", "Greece", "Hong Kong", "Hungary", "India", "Indonesia", "Ireland", "Israel", "Italy", "Japan", "Jordan", "Kenya", "Malawi", "Malaysia", "Mexico", "Morocco", "Mozambique", "Namibia", "Netherlands", "New Zealand", "Nigeria", "Norway", "Pakistan", "Peru", "Philippines", "Poland", "Portugal", "Qatar", "Romania", "Rwanda", "Saudi Arabia", "Senegal", "Singapore", "South Africa", "South Korea", "Spain", "Sri Lanka", "Sweden", "Switzerland", "Taiwan", "Tanzania", "Thailand", "Tunisia", "Turkey", "Uganda", "Ukraine", "United Arab Emirates", "United Kingdom", "United States", "Vietnam", "Zambia", "Zimbabwe"];
 // New websites still default to United States (not the first list entry).
 const DEFAULT_COUNTRY = "United States";
 const INTENTS = ["Informational", "Commercial", "Transactional", "Navigational"];
 const ISSUE_CATEGORIES = ["Technical", "Content", "On-Page", "Schema", "Internal Linking", "Indexing"];
 const SEVERITIES = ["Critical", "High", "Medium", "Low"];
-const ISSUE_STATUSES = ["New", "Pending Approval", "Approved", "Rejected", "Applied", "Verified"];
+const ISSUE_STATUSES = OPPORTUNITY_STATUSES;
 // VertexRank does not change anyone's website, so "Applied" can only mean "the user says they did it".
 // The stored value stays "Applied" (existing saved data uses it); only the label shown changes.
 const STATUS_LABEL = { Applied: "Marked done" };
 const statusLabel = (s) => STATUS_LABEL[s] || s;
-const ACTION_TYPES = ["Meta Fix", "Content Update", "Schema Markup", "Internal Link", "Technical Fix", "FAQ Addition"];
-const PRIORITIES = ["Critical", "High", "Medium", "Low"];
 
 const BRAND = {
   ink: "#161A23",
@@ -214,10 +217,11 @@ const PRIORITY_COLOR = {
 function PriorityBadge({ priority }) { return <Badge color={PRIORITY_COLOR[priority] || PRIORITY_COLOR.Medium}>{priority || "Medium"}</Badge>; }
 
 const NAV = [
+  { id: "queue", label: "Opportunity Queue", icon: Inbox },
+  { id: "actions", label: "Action Center", icon: ClipboardCheck },
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { id: "scanner", label: "Websites", icon: Globe2 },
   { id: "audit", label: "SEO Audit", icon: ListChecks },
-  { id: "actions", label: "Action Center", icon: ClipboardCheck },
   { id: "keywords", label: "Keyword Intelligence", icon: KeyRound },
   { id: "aeo", label: "AEO", icon: MessageCircleQuestion },
   { id: "geo", label: "GEO / AI Visibility", icon: RadarIcon },
@@ -336,7 +340,7 @@ function loadPersistedState() {
         contentIdeas: Array.isArray(b?.contentIdeas) ? b.contentIdeas : [],
         internalLinks: Array.isArray(b?.internalLinks) ? b.internalLinks : [],
         backlinks: Array.isArray(b?.backlinks) ? b.backlinks : [],
-        actions: Array.isArray(b?.actions) ? b.actions : [],
+        actions: migrateOpportunities(b?.actions),
         contentRoadmap: Array.isArray(b?.contentRoadmap) ? b.contentRoadmap : null,
       });
     }
@@ -711,7 +715,8 @@ function SiteCrawlGate({ body }) {
 /* ============================== layout ============================== */
 
 function Sidebar({ view, setView }) {
-  const { clearAllData } = useApp();
+  const { clearAllData, queueSummary } = useApp();
+  const badges = { queue: queueSummary?.open || 0, actions: queueSummary?.inWorkflow || 0 };
   const [confirmClear, setConfirmClear] = useState(false);
   return (
     <aside className="hidden md:flex md:w-60 shrink-0 flex-col" style={{ background: BRAND.surface, borderRight: `1px solid ${BRAND.line}` }}>
@@ -730,6 +735,10 @@ function Sidebar({ view, setView }) {
               style={{ background: active ? BRAND.primarySoft : "transparent", color: active ? BRAND.primary : BRAND.inkSoft }}>
               <n.icon size={16} />
               {n.label}
+              {badges[n.id] > 0 && (
+                <span className="ml-auto rounded-full px-1.5 py-0.5 text-[10px] font-semibold" style={{ background: active ? BRAND.surface : BRAND.primarySoft, color: BRAND.primary }}
+                  title={n.id === "queue" ? "Open opportunities waiting for a decision" : "Opportunities in the workflow"}>{badges[n.id]}</span>
+              )}
             </button>
           );
         })}
@@ -784,6 +793,7 @@ function TopBar({ view }) {
 /* ============================== AI Fix Generator ============================== */
 
 function AiFixModal({ issue, meta, onClose, onApply }) {
+  const { country } = useApp();
   const [stage, setStage] = useState("loading"); // loading | ready | error
   const [fix, setFix] = useState(null);
   const [errorMsg, setErrorMsg] = useState("");
@@ -794,7 +804,7 @@ function AiFixModal({ issue, meta, onClose, onApply }) {
     try {
       const data = await postJson("/api/ai-fix", {
         issue: { title: issue.title, category: issue.category, severity: issue.severity, why: issue.why, fix: issue.fix, before: issue.before },
-        meta: meta || {},
+        meta: meta || {}, country,
       });
       setFix(data.fix);
       setStage("ready");
@@ -908,27 +918,20 @@ function AiInsightsBody({ data, error }) {
 }
 
 function Dashboard() {
-  const { websites, bundle, setBundles, setView, currentWebsiteId, toast, addAction } = useApp();
+  const { websites, bundle, setBundles, setView, currentWebsiteId, toast, addOpportunity, country, queue, queueSummary } = useApp();
   const b = bundle();
   const [siteInsightsLoading, setSiteInsightsLoading] = useState(false);
   const [siteInsightsError, setSiteInsightsError] = useState("");
-
-  // Unified AI Recommendation Engine: merges the grounded opportunities
-  // already produced by site-wide Keyword Intelligence, AEO, and GEO (see
-  // buildUnifiedRecs) into one prioritized list, each traceable back to its
-  // module and evidence. This MUST run before the early-return guard below —
-  // every hook in a component has to run on every render, or React throws
-  // "Rendered more hooks than during the previous render" (error #310) the
-  // moment currentWebsiteId flips from null to set, which happens on every
-  // reload once a website is saved.
-  const unifiedRecs = useMemo(() => buildUnifiedRecs(b, 8), [b.siteKeywordClusters, b.siteAeoAnalysis, b.siteGeoAnalysis]);
 
   if (!currentWebsiteId) {
     return <EmptyState icon={Globe2} title="No website yet" body="Add a website — a full-site crawl starts automatically and powers the real technical and on-page audit." action={<Button icon={Plus} onClick={() => setView("scanner")}>Add a website</Button>} />;
   }
   const scores = websites.find((w) => w.id === currentWebsiteId)?.scores || {};
   const crawled = !!b.siteCrawl;
-  const issueSource = (b.siteCrawl?.siteWide?.recurringIssues || []).map((e, idx) => ({ ...e, id: `dash_ci_${idx}` }));
+  const issueSource = [
+    ...(b.siteCrawl?.siteWide?.technical?.findings || []), // broken links, redirects, canonicals, indexability, sitemap
+    ...(b.siteCrawl?.siteWide?.recurringIssues || []).map((e, idx) => ({ ...e, id: `dash_ci_${idx}` })),
+  ];
   const critical = issueSource.filter((i) => i.severity === "Critical" || i.severity === "High").slice(0, 4);
   const quickWins = issueSource.filter((i) => i.severity === "Low" || i.severity === "Medium").slice(0, 4);
   const recentActions = [...b.actions].sort((a, c) => new Date(c.createdAt) - new Date(a.createdAt)).slice(0, 5);
@@ -943,7 +946,7 @@ function Dashboard() {
     try {
       const data = await postJson("/api/site-insights", {
         crawl: b.siteCrawl, siteAeoAnalysis: b.siteAeoAnalysis, siteGeoAnalysis: b.siteGeoAnalysis,
-        siteKeywordClusters: b.siteKeywordClusters, internalLinkRecs: b.internalLinkRecs,
+        siteKeywordClusters: b.siteKeywordClusters, internalLinkRecs: b.internalLinkRecs, country,
       });
       if (!analysisUsable(ticket, toast)) return;
       setBundles((prev) => {
@@ -964,14 +967,8 @@ function Dashboard() {
     { name: "Content", value: scores.content != null ? 100 - scores.content : 0 },
   ];
 
-  function addUnifiedToActions(rec) {
-    addAction({
-      title: rec.title, type: rec.actionType || "Content Update", status: "New",
-      detail: { sourceId: rec.id, module: rec.module, evidence: rec.evidence, recommendedAction: rec.recommendedAction, priority: rec.priority, confidence: rec.confidence, source: rec.source },
-    });
-    toast("Added to Action Center");
-  }
-  function isAdded(id) { return b.actions.some((a) => a.detail?.sourceId === id); }
+  const topOpen = queue.filter((i) => i.state === OPEN).slice(0, 6);
+  function isAdded(id) { return hasRecord(b.actions, id); }
 
   return (
     <div className="space-y-6">
@@ -1051,30 +1048,35 @@ function Dashboard() {
       </Card>
 
       <Card className="p-5">
-        <div className="flex items-center justify-between gap-2 mb-1">
+        <div className="flex items-center justify-between gap-2 mb-1 flex-wrap">
           <div className="flex items-center gap-2">
             <Target size={16} style={{ color: BRAND.primary }} />
-            <h3 className="font-semibold vr-display">Unified AI Recommendations</h3>
+            <h3 className="font-semibold vr-display">Top of your Opportunity Queue</h3>
           </div>
-          {unifiedRecs.length > 0 && (
-            <CopyButton label="Copy all" title="Copy every unified recommendation (all of them, not just the top 8 shown)"
-              getText={() => sectionUnifiedRecs(buildUnifiedRecs(b))} />
-          )}
+          <div className="flex items-center gap-1.5">
+            {topOpen.length > 0 && (
+              <CopyButton label="Copy queue" title="Copy the whole Opportunity Queue (every item, not just the top 6 shown)"
+                getText={() => PAGE_EXPORTERS.queue(websites.find((w) => w.id === currentWebsiteId), b)} />
+            )}
+            <Button size="sm" variant="outline" icon={Inbox} onClick={() => setView("queue")}>Open the Queue ({queueSummary.open} open)</Button>
+          </div>
         </div>
         <p className="text-sm mb-4" style={{ color: BRAND.inkSoft }}>
-          Every gap found by Keyword Intelligence, AEO, and GEO — site-wide versions preferred once you've run them — reasoned together, ranked by priority, and one click from the Action Center.
+          The highest-ranked findings nobody has decided on yet — crawl facts first, then AI analysis — one click from the Action Center.
         </p>
-        {unifiedRecs.length === 0 ? (
+        {topOpen.length === 0 ? (
           <p className="text-sm" style={{ color: BRAND.inkSoft }}>
-            Run Keyword Intelligence, AEO, and GEO analysis (from their sections in the sidebar) to see combined recommendations here.
+            {queueSummary.total === 0
+              ? "Nothing yet. Run Keyword Intelligence, AEO, and GEO analysis (from their sections in the sidebar) to add their findings to the queue."
+              : "Every finding has been added to the Action Center or dismissed."}
           </p>
         ) : (
           <div className="space-y-3">
-            {unifiedRecs.map((rec) => (
-              <RecommendationCard key={rec.id}
-                title={rec.title} module={rec.module} evidence={rec.evidence}
-                recommendedAction={rec.recommendedAction} priority={rec.priority} confidence={rec.confidence}
-                source={rec.source} added={isAdded(rec.id)} onAdd={() => addUnifiedToActions(rec)} />
+            {topOpen.map((item) => (
+              <RecommendationCard key={item.sourceId}
+                title={item.title} module={item.module} evidence={item.evidence}
+                recommendedAction={item.recommendedAction} priority={item.priority} confidence={item.confidence}
+                source={item.source} added={isAdded(item.sourceId)} onAdd={() => { addOpportunity(item); toast("Added to Action Center"); }} />
             ))}
           </div>
         )}
@@ -1276,9 +1278,9 @@ function ScannerView() {
       // One ticket per module, tied to THIS crawl's ID (the store may not reflect the new crawl yet,
       // so the ID is passed explicitly). The quick and the full request of a module share its ticket.
       const modules = [
-        { url: "/api/site-aeo-analysis", extra: { keywords: [] }, field: "siteAeoAnalysis", scoreKey: "aeo", scoreProp: "readinessScore" },
-        { url: "/api/site-geo-analysis", extra: {}, field: "siteGeoAnalysis", scoreKey: "geo", scoreProp: "visibilityScore" },
-        { url: "/api/site-keyword-clusters", extra: {}, field: "siteKeywordClusters", scoreKey: "keyword", scoreProp: "keywordScore" },
+        { url: "/api/site-aeo-analysis", extra: { keywords: [], country: normalizeCountry(w.country) }, field: "siteAeoAnalysis", scoreKey: "aeo", scoreProp: "readinessScore" },
+        { url: "/api/site-geo-analysis", extra: { country: normalizeCountry(w.country) }, field: "siteGeoAnalysis", scoreKey: "geo", scoreProp: "visibilityScore" },
+        { url: "/api/site-keyword-clusters", extra: { country: normalizeCountry(w.country) }, field: "siteKeywordClusters", scoreKey: "keyword", scoreProp: "keywordScore" },
       ];
       const crawlId = data.crawlId;
       const tickets = Object.fromEntries(modules.map((m) => [m.field, tracker.beginAnalysis(w.id, m.field, crawlId)]));
@@ -1431,7 +1433,7 @@ function AuditView() {
  *  but only to word one concrete fix for one real affected page — the
  *  finding itself is never invented. */
 function SiteAuditPanel() {
-  const { bundle, currentWebsiteId, toast, addAction } = useApp();
+  const { bundle, currentWebsiteId, toast, addOpportunity } = useApp();
   const b = bundle();
   const [expanded, setExpanded] = useState(null);
   const [fixIssue, setFixIssue] = useState(null); // { issue, meta }
@@ -1450,12 +1452,9 @@ function SiteAuditPanel() {
 
   if (!crawl) return <SiteCrawlGate body="A site-wide audit runs the same real technical and on-page checks across every crawled page — one entry per problem, with every affected URL, instead of the same issue repeated per page." />;
 
-  function isAdded(id) { return b.actions.some((a) => a.detail?.sourceId === id); }
+  function isAdded(id) { return hasRecord(b.actions, id); }
   function addIssueToActions(issue) {
-    addAction({
-      title: issue.title, type: issue.category === "Content" ? "Content Update" : issue.category === "Schema" ? "Schema Markup" : "Technical Fix", status: "New",
-      detail: { sourceId: issue.id, module: "Site-wide Audit", evidence: `Affects ${issue.urls.length} page${issue.urls.length === 1 ? "" : "s"}: ${issue.urls.slice(0, 3).join(", ")}${issue.urls.length > 3 ? "…" : ""}`, recommendedAction: issue.fix, priority: issue.severity === "Critical" || issue.severity === "High" ? "High" : issue.severity === "Medium" ? "Medium" : "Low", confidence: "High", source: "Crawled Data" },
-    });
+    addOpportunity(fromAuditIssue(issue, describeEvidence));
     toast("Added to Action Center");
   }
   function openAiFix(issue) {
@@ -1473,10 +1472,22 @@ function SiteAuditPanel() {
         {crawl.pagesCrawled} pages crawled from {crawl.domain} · {allIssues.length} distinct issue{allIssues.length === 1 ? "" : "s"} found · every finding below is real crawl data, not an AI guess.
       </AnalysisBanner>
 
+      {crawl.siteWide?.technical?.coverage && (
+        <p className="text-xs px-1" style={{ color: BRAND.inkSoft }}>
+          Technical checks: status-checked {crawl.siteWide.technical.coverage.linkChecks.checked} more internal link, canonical and sitemap URLs beyond the {crawl.pagesCrawled} pages crawled
+          {crawl.siteWide.technical.coverage.linkChecks.candidates > crawl.siteWide.technical.coverage.linkChecks.checked ? ` (${crawl.siteWide.technical.coverage.linkChecks.candidates - crawl.siteWide.technical.coverage.linkChecks.checked} more weren't checked — this is a bounded sample, not the whole site)` : ""}.
+          {crawl.startRedirect ? ` Your URL redirects to ${crawl.startRedirect.to}, which is what was crawled.` : ""}
+        </p>
+      )}
+
       <Card className="p-5 flex flex-wrap items-center gap-6 justify-around">
         <div className="flex flex-col items-center gap-1">
           <ScoreDial label="Site Technical" value={crawl.siteScores?.technical ?? null} size={100} accent={BRAND.amber} />
-          <span className="text-[10px] font-medium" style={{ color: BRAND.visibility }}>Avg. across {crawl.pagesCrawled} pages</span>
+          <span className="text-[10px] font-medium" style={{ color: BRAND.visibility }}>
+            {crawl.siteScores?.technicalDetail?.siteLevelPenalty > 0
+              ? `Page avg ${crawl.siteScores.technicalDetail.pageAverage} − ${crawl.siteScores.technicalDetail.siteLevelPenalty} for site-level issues`
+              : `Avg. across ${crawl.pagesCrawled} pages`}
+          </span>
         </div>
         <div className="flex flex-col items-center gap-1">
           <ScoreDial label="Site Content" value={crawl.siteScores?.content ?? null} size={100} accent={BRAND.amber} />
@@ -1531,6 +1542,20 @@ function SiteAuditPanel() {
                       {issue.urls.length > 12 && <span className="text-[10px]" style={{ color: BRAND.inkSoft }}>+{issue.urls.length - 12} more</span>}
                     </div>
                   </div>
+                  {issue.evidence?.length > 0 && (
+                    <div>
+                      <p className="text-xs font-semibold mb-1.5" style={{ color: BRAND.inkSoft }}>Evidence</p>
+                      <div className="space-y-1">
+                        {issue.evidence.slice(0, 8).map((e, i) => (
+                          <div key={`${e.url}-${i}`} className="text-[11px] rounded px-2 py-1.5 break-words" style={{ background: BRAND.canvas, color: BRAND.inkSoft }}>
+                            <span className="vr-mono" style={{ color: BRAND.ink }}>{e.url}</span>
+                            {describeEvidence(e) && <span> — {describeEvidence(e)}</span>}
+                          </div>
+                        ))}
+                        {issue.evidence.length > 8 && <p className="text-[10px]" style={{ color: BRAND.inkSoft }}>+{issue.evidence.length - 8} more</p>}
+                      </div>
+                    </div>
+                  )}
                   <div className="flex items-center gap-2 flex-wrap">
                     <Button size="sm" icon={Wand2} onClick={() => openAiFix(issue)}>Generate AI Fix</Button>
                     <Button size="sm" variant={isAdded(issue.id) ? "outline" : "soft"} icon={isAdded(issue.id) ? Check : ListPlus} disabled={isAdded(issue.id)} onClick={() => addIssueToActions(issue)}>
@@ -1552,50 +1577,236 @@ function SiteAuditPanel() {
 
 /* ============================== Action Center ============================== */
 
-function ActionCenter() {
-  const { bundle, setBundles, currentWebsiteId, toast } = useApp();
+/* ============================== Opportunity Queue & Action Center ==============================
+ * ONE list of everything worth doing (lib/opportunity.js). The Queue is the primary view: every finding from every
+ * module, ranked, each either Open (nobody has decided) or in the workflow. The Action Center is that same list
+ * restricted to what was accepted, organised by workflow status — not a second, separately-maintained list. */
+
+function KindBadge({ kind }) {
+  const m = DATA_LABEL_KINDS[kind];
+  if (!m) return null;
+  return <span title={m.description}><Badge color={m.color}>{m.label}</Badge></span>;
+}
+
+function OpportunityFlags({ item }) {
+  return (
+    <>
+      {item.stale && <span title="This was added from an earlier crawl; the site has been crawled again since."><Badge color={{ fg: BRAND.amber, bg: BRAND.amberSoft }}>From an earlier crawl</Badge></span>}
+      {item.otherMarket && <span title="The site's target country has changed since this was added."><Badge color={{ fg: BRAND.amber, bg: BRAND.amberSoft }}>Made for {item.record.country}</Badge></span>}
+      {item.record && !item.current && <span title="The latest analyses don't contain this finding any more — it may be fixed, or that analysis hasn't been re-run since the last crawl."><Badge color={{ fg: BRAND.inkSoft, bg: "#EEEFF3" }}>Not in latest analysis</Badge></span>}
+    </>
+  );
+}
+
+function OpportunityBody({ item }) {
+  const urls = item.urls || [];
+  return (
+    <div className="space-y-2">
+      {item.evidence && (
+        <div className="rounded p-2" style={{ background: BRAND.surface, border: `1px solid ${BRAND.line}` }}>
+          <p className="text-[10px] font-semibold mb-0.5" style={{ color: BRAND.inkSoft }}>EVIDENCE{item.kind === "observed" ? " FROM CRAWL" : ""}</p>
+          <p className="text-xs whitespace-pre-line">{item.evidence}</p>
+        </div>
+      )}
+      {item.recommendedAction && (
+        <div className="rounded p-2" style={{ background: BRAND.visibilitySoft }}>
+          <p className="text-[10px] font-semibold mb-0.5" style={{ color: BRAND.visibility }}>RECOMMENDED ACTION</p>
+          <p className="text-xs whitespace-pre-line">{item.recommendedAction}</p>
+        </div>
+      )}
+      {urls.length > 0 && (
+        <details className="text-xs">
+          <summary className="cursor-pointer" style={{ color: BRAND.inkSoft }}>{urls.length} affected URL{urls.length === 1 ? "" : "s"}</summary>
+          <ul className="mt-1 space-y-0.5 vr-mono font-normal" style={{ color: BRAND.inkSoft }}>
+            {urls.slice(0, 15).map((u) => <li key={u} className="break-all">{u}</li>)}
+            {urls.length > 15 && <li>…and {urls.length - 15} more</li>}
+          </ul>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function OpportunityQueue() {
+  const { queue, queueSummary, currentWebsiteId, country, addOpportunity, updateOpportunity, toast, setView, bundle } = useApp();
   const b = bundle();
+  const [tab, setTab] = useState("open");
+  const [moduleFilter, setModuleFilter] = useState("All");
+  const [priorityFilter, setPriorityFilter] = useState("All");
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(null);
+
+  const modules = useMemo(() => [...new Set(queue.map((i) => i.module))].sort(), [queue]);
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return queue.filter((i) => (tab === "all" || groupOf(i) === tab)
+      && (moduleFilter === "All" || i.module === moduleFilter)
+      && (priorityFilter === "All" || i.priority === priorityFilter)
+      && (!q || `${i.title} ${i.evidence} ${i.recommendedAction} ${i.module}`.toLowerCase().includes(q)));
+  }, [queue, tab, moduleFilter, priorityFilter, query]);
+  const { page, setPage, totalPages, paged } = usePagination(filtered, 10);
+
+  if (!currentWebsiteId) return <EmptyState icon={Globe2} title="No website yet" body="Add a website — a full-site crawl starts automatically and every finding lands in this queue, ranked." action={<Button icon={Plus} onClick={() => setView("scanner")}>Add a website</Button>} />;
+  if (!b.siteCrawl) return <SiteCrawlGate body="The Opportunity Queue ranks everything worth doing on your site — crawl findings first, then AI analyses. It starts with the crawl." />;
+
+  const tabs = [
+    { id: "open", label: "Open", n: queueSummary.open, hint: "Needs a decision" },
+    { id: "workflow", label: "In workflow", n: queueSummary.inWorkflow, hint: "Accepted, not finished" },
+    { id: "done", label: "Marked done", n: queueSummary.done, hint: "Done or verified" },
+    { id: "dismissed", label: "Dismissed", n: queueSummary.dismissed, hint: "Not doing these" },
+    { id: "all", label: "All", n: queueSummary.total, hint: "Everything" },
+  ];
+  const marketText = country === WORLDWIDE ? "Worldwide — no single market is assumed" : country;
+
+  function accept(item) { addOpportunity(item.candidate || item); toast("Added to Action Center"); }
+  function dismiss(item) { addOpportunity(item.candidate || item, { status: "Rejected" }); toast("Dismissed — you can restore it from the Dismissed tab"); }
+  function restore(item) { updateOpportunity(item.record.id, { status: "New" }); toast("Moved back into the workflow"); }
+
+  return (
+    <div className="space-y-4">
+      <AnalysisBanner icon={ListChecks}>
+        Every finding from the crawl and each analysis, ranked: priority first, then proven (observed) over inferred, then indexability and technical problems, then reach. Recommendations are written for: <strong>{marketText}</strong>.
+      </AnalysisBanner>
+
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+        {tabs.map((t) => (
+          <button key={t.id} onClick={() => setTab(t.id)} className="vr-focus rounded-lg px-3 py-2.5 text-left transition-colors" title={t.hint}
+            style={{ background: tab === t.id ? BRAND.primarySoft : BRAND.surface, border: `1px solid ${tab === t.id ? BRAND.primary : BRAND.line}` }}>
+            <p className="text-lg font-semibold vr-display" style={{ color: tab === t.id ? BRAND.primary : BRAND.ink }}>{t.n}</p>
+            <p className="text-xs" style={{ color: BRAND.inkSoft }}>{t.label}</p>
+          </button>
+        ))}
+      </div>
+
+      <div className="flex flex-wrap gap-2 items-center justify-between">
+        <div className="flex flex-wrap gap-2 items-center">
+          <SearchInput value={query} onChange={setQuery} placeholder="Search opportunities…" />
+          <Select value={moduleFilter} onChange={(e) => setModuleFilter(e.target.value)}>
+            <option value="All">All modules</option>{modules.map((m) => <option key={m} value={m}>{m}</option>)}
+          </Select>
+          <Select value={priorityFilter} onChange={(e) => setPriorityFilter(e.target.value)}>
+            <option value="All">All priorities</option>{PRIORITIES.map((p) => <option key={p}>{p}</option>)}
+          </Select>
+        </div>
+        <Button variant="outline" icon={ClipboardCheck} onClick={() => setView("actions")}>Action Center ({queueSummary.inWorkflow + queueSummary.done + queueSummary.dismissed})</Button>
+      </div>
+
+      {filtered.length === 0 ? (
+        <Card>
+          <EmptyState icon={tab === "open" && queueSummary.total > 0 ? CheckCircle2 : Inbox}
+            title={queueSummary.total === 0 ? "Nothing to act on yet" : tab === "open" ? "Nothing waiting for a decision" : "Nothing here"}
+            body={queueSummary.total === 0
+              ? "The crawl found nothing to fix. Run Keyword Intelligence, AEO and GEO from the sidebar and their findings will appear here."
+              : tab === "open" && !query && moduleFilter === "All" && priorityFilter === "All" ? "Every finding has been added to the Action Center or dismissed. Run more analyses and new findings will show up here." : "No opportunities match these filters."} />
+        </Card>
+      ) : (
+        <Card className="overflow-hidden">
+          <div className="divide-y" style={{ borderColor: BRAND.line }}>
+            {paged.map((item) => {
+              const key = item.record?.id || item.sourceId;
+              const expanded = open === key;
+              return (
+                <div key={key} className="p-4">
+                  <div className="flex items-start gap-3">
+                    <button className="vr-focus mt-0.5" onClick={() => setOpen(expanded ? null : key)} aria-label={expanded ? "Collapse" : "Expand"}>
+                      <ChevronRight size={14} style={{ transform: expanded ? "rotate(90deg)" : "none", transition: "transform .15s", color: BRAND.inkSoft }} />
+                    </button>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-start justify-between gap-2 flex-wrap">
+                        <p className="text-sm font-medium pr-2">{item.title}</p>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <PriorityBadge priority={item.priority} />
+                          <KindBadge kind={item.kind} />
+                          {item.record && <StatusBadge status={item.state} />}
+                        </div>
+                      </div>
+                      <p className="text-[11px] mt-0.5 flex items-center gap-1.5 flex-wrap" style={{ color: BRAND.inkSoft }}>
+                        {item.module} · {item.type}{item.urls?.length ? ` · ${item.urls.length} page${item.urls.length === 1 ? "" : "s"}` : ""}
+                        <OpportunityFlags item={item} />
+                      </p>
+                      {expanded && <div className="mt-3"><OpportunityBody item={item} /></div>}
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <CopyButton iconOnly label="Copy this opportunity" getText={() => formatAction(item, "##")} />
+                      {item.state === OPEN ? (
+                        <>
+                          <Button size="sm" variant="ghost" onClick={() => dismiss(item)}>Dismiss</Button>
+                          <Button size="sm" variant="soft" icon={ListPlus} onClick={() => accept(item)}>Add to Action Center</Button>
+                        </>
+                      ) : item.state === "Rejected" ? (
+                        <Button size="sm" variant="outline" onClick={() => restore(item)}>Restore</Button>
+                      ) : (
+                        <Button size="sm" variant="outline" onClick={() => setView("actions")}>Open in Action Center</Button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <Pagination page={page} totalPages={totalPages} setPage={setPage} />
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/** The workflow state of the Queue: only opportunities somebody accepted (or dismissed), by status. */
+function ActionCenter() {
+  const { queue, queueSummary, currentWebsiteId, updateOpportunity, removeOpportunity, toast, setView } = useApp();
   const [statusFilter, setStatusFilter] = useState("All");
   const [modal, setModal] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [form, setForm] = useState({ title: "", type: ACTION_TYPES[0], status: "New" });
   const [expanded, setExpanded] = useState(null);
 
-  // usePagination must run on every render regardless of currentWebsiteId —
-  // moved above the early-return guard below for the same reason as
-  // Dashboard's useMemo (see the comment there): skipping a hook call on
-  // some renders but not others is React error #310.
-  const actions = b.actions.filter((a) => statusFilter === "All" || a.status === statusFilter);
-  const { page, setPage, totalPages, paged } = usePagination(actions);
+  // Hooks run on every render regardless of currentWebsiteId (React error #310 otherwise).
+  const records = useMemo(() => queue.filter((i) => i.record), [queue]);
+  const counts = useMemo(() => Object.fromEntries(ISSUE_STATUSES.map((s) => [s, records.filter((i) => i.state === s).length])), [records]);
+  const shown = records.filter((i) => statusFilter === "All" || i.state === statusFilter);
+  const { page, setPage, totalPages, paged } = usePagination(shown);
 
   if (!currentWebsiteId) return <EmptyState icon={Globe2} title="Select a website" body="Choose a website from the top bar to manage its actions." />;
 
-  function mutate(fn) {
-    setBundles((prev) => {
-      const site = prev[currentWebsiteId] || emptyBundle();
-      return { ...prev, [currentWebsiteId]: { ...site, actions: fn(site.actions) } };
-    });
-  }
-  function openEdit(a) { setForm({ title: a.title, type: a.type, status: a.status }); setModal({ mode: "edit", action: a }); }
+  function openEdit(i) { setForm({ title: i.title, type: i.type, status: i.state }); setModal({ record: i.record }); }
   function save() {
     if (!form.title.trim()) return;
-    mutate((arr) => arr.map((a) => (a.id === modal.action.id ? { ...a, ...form } : a)));
+    updateOpportunity(modal.record.id, { title: form.title.trim(), type: form.type, status: form.status });
     toast("Action updated");
     setModal(null);
   }
-  function setStatus(id, status) { mutate((arr) => arr.map((a) => (a.id === id ? { ...a, status } : a))); toast(`Status set to ${status}`); }
-  function del(id) { mutate((arr) => arr.filter((a) => a.id !== id)); toast("Action deleted"); }
+  function setStatus(id, status) { updateOpportunity(id, { status }); toast(`Status set to ${statusLabel(status)}`); }
+  function del(i) {
+    removeOpportunity(i.record.id);
+    toast(i.current ? "Removed — it's back in the Queue as Open" : "Action deleted");
+  }
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap gap-2 items-center justify-between">
-        <Select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
-          <option value="All">All</option>{ISSUE_STATUSES.map((s) => <option key={s} value={s}>{statusLabel(s)}</option>)}
-        </Select>
+      <AnalysisBanner icon={ClipboardCheck}>
+        This is the workflow for the Opportunity Queue: what you accepted, and how far along it is. New findings are decided in the Queue — {queueSummary.open} {queueSummary.open === 1 ? "is" : "are"} waiting.
+        <button className="vr-focus underline ml-1.5 font-medium" onClick={() => setView("queue")}>Open the Queue</button>
+      </AnalysisBanner>
+
+      <div className="flex flex-wrap gap-1.5">
+        {["All", ...ISSUE_STATUSES].map((s) => {
+          const n = s === "All" ? records.length : counts[s];
+          const active = statusFilter === s;
+          return (
+            <button key={s} onClick={() => setStatusFilter(s)} className="vr-focus rounded-full px-3 py-1 text-xs font-medium"
+              style={{ background: active ? BRAND.primarySoft : BRAND.surface, color: active ? BRAND.primary : BRAND.inkSoft, border: `1px solid ${active ? BRAND.primary : BRAND.line}` }}>
+              {s === "All" ? "All" : statusLabel(s)} · {n}
+            </button>
+          );
+        })}
       </div>
 
       <Card className="overflow-hidden">
-        {actions.length === 0 ? <EmptyState icon={ClipboardCheck} title="No actions yet" body="Actions appear here once you click 'Add to Action Center' on a real finding from any module — nothing here is invented." /> : (
+        {shown.length === 0 ? (
+          <EmptyState icon={ClipboardCheck} title={records.length === 0 ? "Nothing in the workflow yet" : "Nothing with this status"}
+            body={records.length === 0 ? "Accept a finding from the Opportunity Queue (or 'Add to Action Center' on any module) and it starts here as New — nothing here is invented." : "Pick another status above."}
+            action={records.length === 0 ? <Button icon={ListChecks} onClick={() => setView("queue")}>Go to the Queue</Button> : undefined} />
+        ) : (
           <>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -1603,60 +1814,63 @@ function ActionCenter() {
                   <th className="px-4 py-2.5"></th>
                   <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Action</th>
                   <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Type</th>
-                  <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Created</th>
+                  <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Added</th>
                   <th className="text-left px-4 py-2.5 text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>Status</th>
                   <th className="px-4 py-2.5"></th>
                 </tr></thead>
                 <tbody>
-                  {paged.map((a) => (
-                    <React.Fragment key={a.id}>
-                    <tr className="vr-row" style={{ borderBottom: a.detail && expanded === a.id ? "none" : `1px solid ${BRAND.line}` }}>
-                      <td className="px-4 py-2.5">
-                        {a.detail && (
-                          <button className="vr-focus" onClick={() => setExpanded(expanded === a.id ? null : a.id)}>
-                            <ChevronRight size={14} style={{ transform: expanded === a.id ? "rotate(90deg)" : "none", transition: "transform .15s", color: BRAND.inkSoft }} />
-                          </button>
-                        )}
-                      </td>
-                      <td className="px-4 py-2.5">
-                        <div className="flex items-center gap-2">
-                          {a.title}
-                          {a.detail?.priority && <PriorityBadge priority={a.detail.priority} />}
-                        </div>
-                        {a.detail?.module && <p className="text-[11px] mt-0.5" style={{ color: BRAND.inkSoft }}>{a.detail.module}</p>}
-                      </td>
-                      <td className="px-4 py-2.5" style={{ color: BRAND.inkSoft }}>{a.type}</td>
-                      <td className="px-4 py-2.5" style={{ color: BRAND.inkSoft }}>{fmtDate(a.createdAt)}</td>
-                      <td className="px-4 py-2.5">
-                        <select value={a.status} onChange={(e) => setStatus(a.id, e.target.value)}
-                          className="vr-focus text-xs font-medium rounded px-2 py-1 border-0" style={{ color: STATUS_COLOR[a.status].fg, background: STATUS_COLOR[a.status].bg }}>
-                          {ISSUE_STATUSES.map((s) => <option key={s} value={s}>{statusLabel(s)}</option>)}
-                        </select>
-                      </td>
-                      <td className="px-4 py-2.5">
-                        <div className="flex gap-0.5 justify-end">
-                          <CopyButton iconOnly label="Copy this action" getText={() => formatAction(a, "##")} />
-                          <IconButton icon={Pencil} onClick={() => openEdit(a)} title="Edit" />
-                          <IconButton icon={Trash2} danger onClick={() => setConfirmDelete(a)} title="Delete" />
-                        </div>
-                      </td>
-                    </tr>
-                    {a.detail && expanded === a.id && (
-                      <tr style={{ borderBottom: `1px solid ${BRAND.line}` }}>
-                        <td colSpan={6} className="px-4 pb-4 pt-0">
-                          <div className="rounded-lg p-3.5 space-y-2" style={{ background: BRAND.canvas }}>
-                            {a.detail.evidence && <div><p className="text-xs font-semibold mb-0.5" style={{ color: BRAND.inkSoft }}>Evidence from crawl</p><p className="text-sm">{a.detail.evidence}</p></div>}
-                            {a.detail.recommendedAction && <div><p className="text-xs font-semibold mb-0.5" style={{ color: BRAND.inkSoft }}>Recommended action</p><p className="text-sm">{a.detail.recommendedAction}</p></div>}
-                            <div className="flex items-center gap-3 flex-wrap pt-1">
-                              {a.detail.confidence && <span className="text-xs" style={{ color: BRAND.inkSoft }}>Confidence: {a.detail.confidence}</span>}
-                              {a.detail.source && <span className="text-xs rounded px-1.5 py-0.5" style={{ background: BRAND.primarySoft, color: BRAND.primary }}>{a.detail.source}</span>}
+                  {paged.map((i) => {
+                    const a = i.record;
+                    const isOpen = expanded === a.id;
+                    return (
+                      <React.Fragment key={a.id}>
+                        <tr className="vr-row" style={{ borderBottom: isOpen ? "none" : `1px solid ${BRAND.line}` }}>
+                          <td className="px-4 py-2.5">
+                            <button className="vr-focus" onClick={() => setExpanded(isOpen ? null : a.id)} aria-label={isOpen ? "Collapse" : "Expand"}>
+                              <ChevronRight size={14} style={{ transform: isOpen ? "rotate(90deg)" : "none", transition: "transform .15s", color: BRAND.inkSoft }} />
+                            </button>
+                          </td>
+                          <td className="px-4 py-2.5">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              {a.title}
+                              <PriorityBadge priority={a.priority} />
+                              <KindBadge kind={a.kind} />
                             </div>
-                          </div>
-                        </td>
-                      </tr>
-                    )}
-                    </React.Fragment>
-                  ))}
+                            <p className="text-[11px] mt-0.5 flex items-center gap-1.5 flex-wrap" style={{ color: BRAND.inkSoft }}>{a.module}<OpportunityFlags item={i} /></p>
+                          </td>
+                          <td className="px-4 py-2.5" style={{ color: BRAND.inkSoft }}>{a.type}</td>
+                          <td className="px-4 py-2.5" style={{ color: BRAND.inkSoft }}>{fmtDate(a.createdAt)}</td>
+                          <td className="px-4 py-2.5">
+                            <select value={a.status} onChange={(e) => setStatus(a.id, e.target.value)}
+                              className="vr-focus text-xs font-medium rounded px-2 py-1 border-0" style={{ color: STATUS_COLOR[a.status]?.fg, background: STATUS_COLOR[a.status]?.bg }}>
+                              {ISSUE_STATUSES.map((s) => <option key={s} value={s}>{statusLabel(s)}</option>)}
+                            </select>
+                          </td>
+                          <td className="px-4 py-2.5">
+                            <div className="flex gap-0.5 justify-end">
+                              <CopyButton iconOnly label="Copy this action" getText={() => formatAction(a, "##")} />
+                              <IconButton icon={Pencil} onClick={() => openEdit(i)} title="Edit" />
+                              <IconButton icon={Trash2} danger onClick={() => setConfirmDelete(i)} title="Delete" />
+                            </div>
+                          </td>
+                        </tr>
+                        {isOpen && (
+                          <tr style={{ borderBottom: `1px solid ${BRAND.line}` }}>
+                            <td colSpan={6} className="px-4 pb-4 pt-0">
+                              <div className="rounded-lg p-3.5 space-y-2" style={{ background: BRAND.canvas }}>
+                                <OpportunityBody item={a} />
+                                <div className="flex items-center gap-3 flex-wrap pt-1">
+                                  <span className="text-xs" style={{ color: BRAND.inkSoft }}>Confidence: {a.confidence}</span>
+                                  {a.source && <span className="text-xs rounded px-1.5 py-0.5" style={{ background: BRAND.primarySoft, color: BRAND.primary }}>{a.source}</span>}
+                                  {a.country && <span className="text-xs" style={{ color: BRAND.inkSoft }}>Market: {a.country}</span>}
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -1671,7 +1885,9 @@ function ActionCenter() {
         <Field label="Type"><Select value={form.type} onChange={(e) => setForm((f) => ({ ...f, type: e.target.value }))}>{ACTION_TYPES.map((t) => <option key={t}>{t}</option>)}</Select></Field>
         <Field label="Status"><Select value={form.status} onChange={(e) => setForm((f) => ({ ...f, status: e.target.value }))}>{ISSUE_STATUSES.map((s) => <option key={s} value={s}>{statusLabel(s)}</option>)}</Select></Field>
       </Modal>
-      <ConfirmDialog open={!!confirmDelete} onClose={() => setConfirmDelete(null)} title="Delete action" body="This action will be permanently removed." onConfirm={() => del(confirmDelete.id)} />
+      <ConfirmDialog open={!!confirmDelete} onClose={() => setConfirmDelete(null)} title="Delete action"
+        body={confirmDelete?.current ? "This removes it from the workflow. The finding is still detected, so it returns to the Opportunity Queue as Open." : "This action will be permanently removed."}
+        onConfirm={() => del(confirmDelete)} />
     </div>
   );
 }
@@ -1705,7 +1921,7 @@ function KeywordsView() {
  *  same cluster. Deterministic clustering always shows even if the AI
  *  labeling step fails; see app/api/site-keyword-clusters/route.js. */
 function SiteKeywordClusteringPanel() {
-  const { bundle, setBundles, currentWebsiteId, toast, addAction, setScore } = useApp();
+  const { bundle, setBundles, currentWebsiteId, toast, addOpportunity, setScore, country } = useApp();
   const b = bundle();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -1716,7 +1932,7 @@ function SiteKeywordClusteringPanel() {
     setLoading(true); setError("");
     const ticket = tracker.beginAnalysis(currentWebsiteId, "siteKeywordClusters");
     try {
-      const res = await postJson("/api/site-keyword-clusters", { crawl: slimCrawl(b.siteCrawl) });
+      const res = await postJson("/api/site-keyword-clusters", { crawl: slimCrawl(b.siteCrawl), country });
       if (!analysisUsable(ticket, toast)) return;
       setBundles((prev) => {
         const site = prev[currentWebsiteId];
@@ -1734,13 +1950,13 @@ function SiteKeywordClusteringPanel() {
     }
   }
 
-  function isAdded(id) { return b.actions.some((a) => a.detail?.sourceId === id); }
-  function addOpportunity(o) {
-    addAction({ title: o.problem, type: "Content Update", status: "New", detail: { sourceId: o.id, module: "Site-wide Keyword Intelligence", evidence: o.evidence, recommendedAction: o.recommendedAction, priority: o.priority, confidence: o.confidence, source: o.source } });
+  function isAdded(id) { return hasRecord(b.actions, id); }
+  function addKeywordOpportunity(o) {
+    addOpportunity(fromKeywordOpportunity(o));
     toast("Added to Action Center");
   }
   function addCannibalGuidance(g) {
-    addAction({ title: `${g.recommendedAction} competing pages`, type: "Content Update", status: "New", detail: { sourceId: g.id, module: "Site-wide Keyword Intelligence", evidence: g.explanation, recommendedAction: g.reasoning, priority: "High", confidence: "Medium", source: g.source } });
+    addOpportunity(fromCannibalization(g));
     toast("Added to Action Center");
   }
 
@@ -1783,7 +1999,7 @@ function SiteKeywordClusteringPanel() {
           <h3 className="font-semibold vr-display mb-3">Keyword Opportunity Analysis</h3>
           <div className="space-y-3">
             {data.opportunities.map((o) => (
-              <RecommendationCard key={o.id} title={o.problem} evidence={o.evidence} recommendedAction={o.recommendedAction} priority={o.priority} confidence={o.confidence} source={o.source} onAdd={() => addOpportunity(o)} added={isAdded(o.id)} />
+              <RecommendationCard key={o.id} title={o.problem} evidence={o.evidence} recommendedAction={o.recommendedAction} priority={o.priority} confidence={o.confidence} source={o.source} onAdd={() => addKeywordOpportunity(o)} added={isAdded(o.id)} />
             ))}
           </div>
         </Card>
@@ -1893,7 +2109,7 @@ function SiteKeywordClusteringPanel() {
 
 
 function ManualKeywordTracker() {
-  const { bundle, setBundles, currentWebsiteId, toast } = useApp();
+  const { bundle, setBundles, currentWebsiteId, toast, country } = useApp();
   const b = bundle();
   const [search, setSearch] = useState("");
   const [intent, setIntent] = useState("All");
@@ -1938,7 +2154,7 @@ function ManualKeywordTracker() {
       let clusters = b.siteKeywordClusters;
       if (!clusters) {
         const ticket = tracker.beginAnalysis(currentWebsiteId, "siteKeywordClusters");
-        const data = await postJson("/api/site-keyword-clusters", { crawl: slimCrawl(b.siteCrawl) });
+        const data = await postJson("/api/site-keyword-clusters", { crawl: slimCrawl(b.siteCrawl), country });
         if (!analysisUsable(ticket, toast)) return;
         clusters = stampResult(data.result, ticket.crawlId);
         setBundles((prev) => {
@@ -2097,7 +2313,7 @@ const COVERAGE_COLOR = {
  *  whichever one a naive single-page look would have happened to check.
  *  Reads b.siteCrawl, from the full-site crawl. */
 function SiteAeoPanel() {
-  const { bundle, setBundles, currentWebsiteId, toast, addAction, setScore } = useApp();
+  const { bundle, setBundles, currentWebsiteId, toast, addOpportunity, setScore, country } = useApp();
   const b = bundle();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -2110,7 +2326,7 @@ function SiteAeoPanel() {
     setLoading(true); setError("");
     const ticket = tracker.beginAnalysis(currentWebsiteId, "siteAeoAnalysis");
     try {
-      const data = await postJson("/api/site-aeo-analysis", { crawl: slimCrawl(b.siteCrawl), keywords: siteKeywordList(b) });
+      const data = await postJson("/api/site-aeo-analysis", { crawl: slimCrawl(b.siteCrawl), keywords: siteKeywordList(b), country });
       if (!analysisUsable(ticket, toast)) return;
       setBundles((prev) => {
         const site = prev[currentWebsiteId];
@@ -2128,19 +2344,18 @@ function SiteAeoPanel() {
   }
 
   function addQuestionToActions(q) {
-    addAction({ title: `Answer: "${q.question}"`, type: "FAQ Addition", status: "New", detail: { sourceId: `saeoq_${q.id}`, module: "Site-wide AEO", evidence: q.missingInfo, recommendedAction: q.recommendedAnswer, priority: q.priority, confidence: "Medium", source: q.source } });
+    addOpportunity(fromAeoQuestion(q));
     toast("Added to Action Center");
   }
   function addRecToActions(r) {
-    addAction({ title: r.recommendation, type: "Content Update", status: "New", detail: { sourceId: `saeor_${r.id}`, module: "Site-wide AEO", evidence: r.why, recommendedAction: r.recommendation, priority: r.priority, confidence: "Medium", source: r.source } });
+    addOpportunity(fromAeoRecommendation(r));
     toast("Added to Action Center");
   }
   function addPageToActions(p) {
-    const fixes = (p.fixes || []).map((f) => `${f.label} (+${f.points}): ${f.action}`).join("\n");
-    addAction({ title: `Improve AEO on: ${p.title}`, type: "Content Update", status: "New", detail: { sourceId: `saeop_${p.url}`, module: "Site-wide AEO", evidence: `Scores ${p.score}/100 on the AEO signal checklist (${p.url}).`, recommendedAction: [fixes, p.aiSuggestions?.rewriteTip].filter(Boolean).join("\n"), priority: p.priority, confidence: "High", source: "VertexRank crawl signals" } });
+    addOpportunity(fromAeoWeakPage(p));
     toast("Added to Action Center");
   }
-  function isAdded(id) { return b.actions.some((a) => a.detail?.sourceId === id); }
+  function isAdded(id) { return hasRecord(b.actions, id); }
 
   if (!b.siteCrawl) return <SiteCrawlGate body="Site-wide AEO checks whether ANY page on your site answers a given buyer question — not just whichever one page you might otherwise think to check. That needs a full-site crawl." />;
 
@@ -2334,7 +2549,7 @@ function SiteAeoPanel() {
 }
 
 function ManualAeoTracker() {
-  const { bundle, setBundles, currentWebsiteId, toast } = useApp();
+  const { bundle, setBundles, currentWebsiteId, toast, country } = useApp();
   const b = bundle();
   const [modal, setModal] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
@@ -2367,7 +2582,7 @@ function ManualAeoTracker() {
       let aeo = b.siteAeoAnalysis;
       if (!aeo) {
         const ticket = tracker.beginAnalysis(currentWebsiteId, "siteAeoAnalysis");
-        const data = await postJson("/api/site-aeo-analysis", { crawl: slimCrawl(b.siteCrawl), keywords: siteKeywordList(b) });
+        const data = await postJson("/api/site-aeo-analysis", { crawl: slimCrawl(b.siteCrawl), keywords: siteKeywordList(b), country });
         if (!analysisUsable(ticket, toast)) return;
         aeo = stampResult(data.result, ticket.crawlId);
         setBundles((prev) => {
@@ -2487,7 +2702,7 @@ const READINESS_COLOR = {
  *  trust signals from a full-site crawl, plus entities detected across every
  *  crawled page — not just one URL. */
 function SiteGeoPanel() {
-  const { bundle, setBundles, currentWebsiteId, toast, addAction, setScore } = useApp();
+  const { bundle, setBundles, currentWebsiteId, toast, addOpportunity, setScore, country } = useApp();
   const b = bundle();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -2497,7 +2712,7 @@ function SiteGeoPanel() {
     setLoading(true); setError("");
     const ticket = tracker.beginAnalysis(currentWebsiteId, "siteGeoAnalysis");
     try {
-      const data = await postJson("/api/site-geo-analysis", { crawl: slimCrawl(b.siteCrawl) });
+      const data = await postJson("/api/site-geo-analysis", { crawl: slimCrawl(b.siteCrawl), country });
       if (!analysisUsable(ticket, toast)) return;
       setBundles((prev) => {
         const site = prev[currentWebsiteId];
@@ -2515,10 +2730,10 @@ function SiteGeoPanel() {
   }
 
   function addOppToActions(o) {
-    addAction({ title: o.title, type: "Schema Markup", status: "New", detail: { sourceId: `sgeoo_${o.id}`, module: "Site-wide GEO", evidence: o.why, recommendedAction: o.title, priority: o.priority, confidence: "Medium", source: o.source } });
+    addOpportunity(fromGeoOpportunity(o));
     toast("Added to Action Center");
   }
-  function isAdded(id) { return b.actions.some((a) => a.detail?.sourceId === id); }
+  function isAdded(id) { return hasRecord(b.actions, id); }
 
   if (!b.siteCrawl) return <SiteCrawlGate body="Site-wide GEO looks for entity/authority signals — About, Contact, credentials, testimonials — across EVERY page, since a business either clearly has these somewhere on the site or it doesn't. That needs a full-site crawl." />;
 
@@ -2611,12 +2826,11 @@ function SiteGeoPanel() {
 }
 
 function AiVisibilitySimulatorPanel() {
-  const { bundle, setBundles, currentWebsiteId, toast, addAction, websites } = useApp();
+  const { bundle, setBundles, currentWebsiteId, toast, addOpportunity, country } = useApp();
   const b = bundle();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const sim = b.aiVisibility;
-  const siteCountry = (websites || []).find((w) => w.id === currentWebsiteId)?.country;
 
   async function runSimulation() {
     const siteMeta = siteMetaFrom(b);
@@ -2625,14 +2839,14 @@ function AiVisibilitySimulatorPanel() {
     const ticket = tracker.beginAnalysis(currentWebsiteId, "aiVisibility");
     try {
       const data = await postJson("/api/ai-visibility-simulator", {
-        scanMeta: siteMeta, keywords: siteKeywordList(b), country: siteCountry || "Worldwide",
+        scanMeta: siteMeta, keywords: siteKeywordList(b), country,
       });
       // Also discarded if the country was edited while this ran (the edit supersedes this field).
       if (!analysisUsable(ticket, toast)) return;
       setBundles((prev) => {
         const site = prev[currentWebsiteId];
         if (!site) return prev;
-        return { ...prev, [currentWebsiteId]: { ...site, aiVisibility: stampResult({ ...data.result, country: siteCountry || "Worldwide" }, ticket.crawlId) } };
+        return { ...prev, [currentWebsiteId]: { ...site, aiVisibility: stampResult({ ...data.result, country }, ticket.crawlId) } };
       });
       toast("AI Visibility Simulation generated");
     } catch (err) {
@@ -2642,13 +2856,10 @@ function AiVisibilitySimulatorPanel() {
     }
   }
   function addToActions(q) {
-    addAction({
-      title: `Improve AI visibility for: "${q.query}"`, type: "Content Update", status: "New",
-      detail: { sourceId: `sim_${q.id}`, module: "AI Visibility Simulator", evidence: q.missingInfo, recommendedAction: q.recommendedImprovement, priority: q.answerReadiness === "Weak" ? "High" : "Medium", confidence: "Medium", source: "VertexRank AI Visibility Simulation" },
-    });
+    addOpportunity(fromSimulatorQuery(q));
     toast("Added to Action Center");
   }
-  function isAdded(id) { return b.actions.some((a) => a.detail?.sourceId === id); }
+  function isAdded(id) { return hasRecord(b.actions, id); }
 
   return (
     <div className="space-y-5">
@@ -2701,7 +2912,7 @@ function AiVisibilitySimulatorPanel() {
 /* ============================== Competitors ============================== */
 
 function CompetitorsView() {
-  const { bundle, setBundles, currentWebsiteId, toast, addAction } = useApp();
+  const { bundle, setBundles, currentWebsiteId, toast, addOpportunity, country } = useApp();
   const b = bundle();
   const [modal, setModal] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
@@ -2748,7 +2959,7 @@ function CompetitorsView() {
     // Compares against OUR crawl, so the result is tied to that crawl's ID.
     const ticket = tracker.beginAnalysis(currentWebsiteId, `competitor:${c.id}`);
     try {
-      const data = await postJson("/api/site-competitor-analysis", { competitorUrl: c.url, ourCrawl: b.siteCrawl });
+      const data = await postJson("/api/site-competitor-analysis", { competitorUrl: c.url, ourCrawl: b.siteCrawl, country });
       if (!analysisUsable(ticket, toast)) return;
       mutate((arr) => arr.map((x) => (x.id === c.id ? { ...x, siteAnalysis: stampResult(data.result, ticket.crawlId) } : x)));
       setExpanded(c.id);
@@ -2758,7 +2969,7 @@ function CompetitorsView() {
         try {
           const ourMeta = siteMetaFrom(b);
           const bl = await postJson("/api/backlink-opportunities", {
-            crawl: data.competitorCrawl,
+            crawl: data.competitorCrawl, country,
             ourContext: ourMeta?.title ? `${ourMeta.domain} — ${ourMeta.title}` : (b.siteCrawl?.domain || ""),
           });
           if (tracker.checkAnalysis(ticket) !== "ok") return;
@@ -2776,20 +2987,14 @@ function CompetitorsView() {
     }
   }
   function addGapToActions(c, g) {
-    addAction({
-      title: g.gap, type: "Content Update", status: "New",
-      detail: { sourceId: `${c.id}_${g.id}`, module: `Competitor: ${c.name}`, evidence: g.evidence, recommendedAction: g.recommendedAction, priority: g.priority, confidence: "Medium", source: g.source },
-    });
+    addOpportunity(fromCompetitorGap(c, g));
     toast("Added to Action Center");
   }
   function addAeoGeoDiffToActions(c, d) {
-    addAction({
-      title: d.difference, type: "Schema Markup", status: "New",
-      detail: { sourceId: `${c.id}_${d.id}`, module: `Competitor: ${c.name} (AEO/GEO)`, recommendedAction: d.recommendedAction, priority: d.priority, confidence: "Medium", source: d.source },
-    });
+    addOpportunity(fromCompetitorAeoGeoDiff(c, d));
     toast("Added to Action Center");
   }
-  function isAdded(id) { return b.actions.some((a) => a.detail?.sourceId === id); }
+  function isAdded(id) { return hasRecord(b.actions, id); }
   function isBacklinkTracked(host) { return b.backlinks.some((x) => x.name === host); }
   function addBacklinkToTracker(o) {
     setBundles((prev) => {
@@ -2815,7 +3020,7 @@ function CompetitorsView() {
     if (!siteMeta) { toast("Add a website first — a full-site crawl starts automatically and powers this.", "error"); return; }
     setSuggesting(true);
     try {
-      const data = await postJson("/api/competitor-suggestions", { scanMeta: siteMeta });
+      const data = await postJson("/api/competitor-suggestions", { scanMeta: siteMeta, country });
       const existing = new Set(b.competitors.map((c) => c.name.toLowerCase()));
       const fresh = (data.result.suggestions || []).filter((s) => s.name && !existing.has(s.name.toLowerCase()));
       setSuggestions(() => fresh);
@@ -2998,7 +3203,7 @@ function CompetitorsView() {
 /* ============================== Content Planner ============================== */
 
 function ContentPlannerView() {
-  const { bundle, setBundles, currentWebsiteId, toast } = useApp();
+  const { bundle, setBundles, currentWebsiteId, toast, country } = useApp();
   const b = bundle();
   const [modal, setModal] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
@@ -3028,7 +3233,7 @@ function ContentPlannerView() {
     if (!form.title.trim()) { toast("Add a title first", "error"); return; }
     setGenerating(true);
     try {
-      const data = await postJson("/api/content-plan", { title: form.title, primaryKeyword: form.primaryKeyword, intent: form.intent });
+      const data = await postJson("/api/content-plan", { title: form.title, primaryKeyword: form.primaryKeyword, intent: form.intent, country });
       const plan = data.plan;
       setForm((f) => ({
         ...f,
@@ -3077,7 +3282,7 @@ function ContentPlannerView() {
       const keywordOpportunities = (b.siteKeywordClusters?.opportunities || []).map((o) => ({ problem: o.problem, evidence: o.evidence }));
       const aeoQuestions = b.siteAeoAnalysis?.questions || [];
       const geoOpportunities = b.siteGeoAnalysis?.opportunities || [];
-      const data = await postJson("/api/content-ideas", { scanMeta: siteMeta, keywordOpportunities, aeoQuestions, geoOpportunities, count: 4 });
+      const data = await postJson("/api/content-ideas", { scanMeta: siteMeta, keywordOpportunities, aeoQuestions, geoOpportunities, count: 4, country });
       // Ideas are grounded in the crawl and its analyses; if the crawl changed meanwhile they'd be off-target.
       if (!analysisUsable(ticket, toast)) return;
       const existing = new Set(b.contentIdeas.map((c) => c.title.toLowerCase()));
@@ -3174,7 +3379,7 @@ function ContentPlannerView() {
 /* ============================== Internal Links ============================== */
 
 function InternalLinksView() {
-  const { bundle, setBundles, currentWebsiteId, toast } = useApp();
+  const { bundle, setBundles, currentWebsiteId, toast, country } = useApp();
   const b = bundle();
   const [modal, setModal] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
@@ -3207,7 +3412,7 @@ function InternalLinksView() {
     setLoading(true); setError("");
     const ticket = tracker.beginAnalysis(currentWebsiteId, "internalLinkRecs");
     try {
-      const data = await postJson("/api/internal-linking", { crawl: b.siteCrawl });
+      const data = await postJson("/api/internal-linking", { crawl: b.siteCrawl, country });
       if (!analysisUsable(ticket, toast)) return;
       setBundles((prev) => {
         const site = prev[currentWebsiteId];
@@ -3321,7 +3526,7 @@ function InternalLinksView() {
 /* ============================== Backlink Radar ============================== */
 
 function BacklinksView() {
-  const { bundle, setBundles, currentWebsiteId, toast } = useApp();
+  const { bundle, setBundles, currentWebsiteId, toast, country } = useApp();
   const b = bundle();
   const [filter, setFilter] = useState("All");
   const [modal, setModal] = useState(null);
@@ -3376,7 +3581,7 @@ function BacklinksView() {
     try {
       const crawl = await postJson("/api/site-scan", { url: discoverUrl.trim(), maxPages: 25 });
       const ourMeta = siteMetaFrom(b);
-      const bl = await postJson("/api/backlink-opportunities", { crawl, ourContext: ourMeta?.title ? `${ourMeta.domain} — ${ourMeta.title}` : (b.siteCrawl?.domain || "") });
+      const bl = await postJson("/api/backlink-opportunities", { crawl, country, ourContext: ourMeta?.title ? `${ourMeta.domain} — ${ourMeta.title}` : (b.siteCrawl?.domain || "") });
       setManualDiscovery(bl.result);
       toast(`Found ${bl.result.candidateDomainsFound} candidate domain${bl.result.candidateDomainsFound === 1 ? "" : "s"} linked from ${crawl.domain}`);
     } catch (err) {
@@ -3512,7 +3717,7 @@ function VertexRankApp() {
     setBundlesState(next);
   }, []);
   const [currentWebsiteId, setCurrentWebsiteId] = useState(seeded.websites[0]?.id || null);
-  const [view, setView] = useState("dashboard");
+  const [view, setView] = useState("queue");
   const [toasts, setToasts] = useState([]);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [hydrated, setHydrated] = useState(false);
@@ -3548,12 +3753,37 @@ function VertexRankApp() {
   function bundle() {
     return bundles[currentWebsiteId] || emptyBundle();
   }
-  function addAction(a) {
-    setBundles((prev) => {
-      const site = prev[currentWebsiteId] || emptyBundle();
-      if (!site) return prev;
-      return { ...prev, [currentWebsiteId]: { ...site, actions: [{ id: uid("act"), websiteId: currentWebsiteId, createdAt: new Date().toISOString(), ...a }, ...site.actions] } };
+  const country = normalizeCountry((websites.find((w) => w.id === currentWebsiteId) || {}).country);
+
+  /** The Opportunity Queue for the current website: every finding the analyses support plus every stored record
+   *  (lib/opportunity.js). Computed once here and shared by the Queue, Action Center, Dashboard and sidebar. */
+  const queue = useMemo(() => {
+    const site = bundles[currentWebsiteId];
+    if (!site) return [];
+    let auditIssues = [];
+    try { auditIssues = computeSiteAuditIssues(site.siteCrawl); } catch { /* a crawl saved by a much older version: skip its audit findings rather than crash the app */ }
+    return buildQueue(site, { auditIssues, describeEvidence, country });
+  }, [bundles, currentWebsiteId, country]);
+  const queueSummary = useMemo(() => summarizeQueue(queue), [queue]);
+
+  const editActions = (fn) => setBundles((prev) => {
+    const site = prev[currentWebsiteId];
+    return site ? { ...prev, [currentWebsiteId]: { ...site, actions: fn(site) } } : prev;
+  });
+  /** Accepts a candidate into the workflow (or, with status "Rejected", dismisses it). Idempotent per finding:
+   *  a double-click or two views adding the same finding can never create two records. */
+  function addOpportunity(candidate, { status = "New" } = {}) {
+    editActions((site) => {
+      if (!candidate || hasRecord(site.actions, candidate.sourceId)) return site.actions;
+      const rec = toRecord(candidate, { id: uid("act"), websiteId: currentWebsiteId, country, crawlId: site.siteCrawl?.crawlId, status });
+      return rec ? [rec, ...site.actions] : site.actions;
     });
+  }
+  function updateOpportunity(id, patch) {
+    editActions((site) => site.actions.map((a) => (a.id === id ? { ...a, ...patch, updatedAt: new Date().toISOString() } : a)));
+  }
+  function removeOpportunity(id) {
+    editActions((site) => site.actions.filter((a) => a.id !== id));
   }
   /** Keeps the per-website score shown on the Websites cards and the
    *  bundle-level score shown on the Dashboard dial in sync — Keyword/AEO/GEO
@@ -3576,10 +3806,10 @@ function VertexRankApp() {
     toast("All saved data cleared");
   }
 
-  const ctx = { websites, setWebsites, bundles, setBundles, bundle, currentWebsiteId, setCurrentWebsiteId, toast, toasts, addAction, setScore, clearAllData, view, setView };
+  const ctx = { country, queue, queueSummary, updateOpportunity, removeOpportunity, websites, setWebsites, bundles, setBundles, bundle, currentWebsiteId, setCurrentWebsiteId, toast, toasts, addOpportunity, setScore, clearAllData, view, setView };
 
   const views = {
-    dashboard: Dashboard, scanner: ScannerView, audit: AuditView, actions: ActionCenter, keywords: KeywordsView,
+    queue: OpportunityQueue, dashboard: Dashboard, scanner: ScannerView, audit: AuditView, actions: ActionCenter, keywords: KeywordsView,
     aeo: AeoView, geo: GeoView, competitors: CompetitorsView, content: ContentPlannerView, links: InternalLinksView, backlinks: BacklinksView,
   };
   const ViewComp = views[view] || Dashboard;

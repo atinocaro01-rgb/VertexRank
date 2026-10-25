@@ -1,5 +1,6 @@
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
+import { countryPromptLine } from "../../../lib/country";
 import { classifyBacklinkOpportunities } from "../../../lib/backlinkClassifier";
 
 // Feature: Backlink Opportunities. Typically run against a CRAWL OF A
@@ -65,7 +66,9 @@ export async function POST(req) {
 
   const contextLine = ourContext ? `The client's own business, for relevance judgment: ${String(ourContext).slice(0, 400)}` : "No description of the client's own business was provided — reason generally from each domain's type.";
 
+  const countryLine = countryPromptLine(body?.country);
   const prompt = `Competitor/target site analyzed: ${crawl.domain}
+${countryLine}
 ${contextLine}
 
 Candidate external domains this site links to (real, observed data):

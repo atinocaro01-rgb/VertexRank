@@ -136,3 +136,16 @@ test("reports HTTP errors without a body", async () => {
   const r = await sf.safeFetchText(U("/missing"));
   assert.equal(r.ok, false); assert.equal(r.status, 404); assert.equal(r.text, "");
 });
+
+test("headersOnly returns status and headers without downloading the body, and still follows safe redirects", async () => {
+  const big = await sf.safeFetchText(U("/big"), { headersOnly: true });
+  assert.equal(big.ok, true); assert.equal(big.status, 200); assert.equal(big.text, ""); assert.match(big.headers["content-type"], /text\/html/);
+  const missing = await sf.safeFetchText(U("/missing"), { headersOnly: true });
+  assert.equal(missing.status, 404); assert.equal(missing.ok, false);
+  const r = await sf.safeFetchText(U("/redir-ok"), { headersOnly: true });
+  assert.equal(r.status, 200); assert.equal(r.redirects.length, 1); assert.ok(r.finalUrl.endsWith("/ok"));
+  const blocked = await sf.safeFetchText(U("/redir-internal"), { headersOnly: true });
+  assert.equal(blocked.errorCode, "BLOCKED_ADDRESS"); // SSRF checks still apply
+  const pdf = await sf.safeFetchText(U("/pdf"), { headersOnly: true, accept: ["text/html"] });
+  assert.equal(pdf.ok, true); assert.match(pdf.headers["content-type"], /pdf/); // type is reported, not enforced, in headers-only mode
+});

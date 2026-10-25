@@ -1,5 +1,6 @@
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
+import { countryPromptLine } from "../../../lib/country";
 import { truncate } from "../../../lib/textIntelligence";
 
 // Suggests plausible real-world competitors from VertexRank AI's general
@@ -25,7 +26,9 @@ export async function POST(req) {
 
   const system = `You are VertexRank AI. You are given real crawled data describing a business's own website. From your general training knowledge of this industry and any location signals present, suggest plausible real-world competitors — companies that likely compete for the same customers or search intent. You are NOT performing a live web search, so you never claim certainty: every suggestion must be labeled with an honest confidence level, and you never invent a company that you are not reasonably confident actually exists. If you are not confident a real competitor exists for this niche, return fewer suggestions rather than fabricating ones.`;
 
+  const countryLine = countryPromptLine(body?.country);
   const prompt = `Website: ${scanMeta.domain}
+${countryLine}
 Page title: "${scanMeta.title || "(missing)"}"
 Meta description: "${scanMeta.metaDescription || "(missing)"}"
 H1: "${scanMeta.h1Text || "(missing)"}"

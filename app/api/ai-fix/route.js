@@ -1,5 +1,6 @@
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
+import { countryPromptLine } from "../../../lib/country";
 
 export const runtime = "nodejs";
 export const maxDuration = 60; // Vercel Hobby plan max
@@ -17,7 +18,9 @@ export async function POST(req) {
 
   const system = `You are VertexRank AI, a precise SEO engineer fixing a real, specific issue on a real website. You use the real page content you're given — the actual current title, description, headings, and text — rather than inventing a generic fictional business. If the issue already includes the real current text as "before", reuse it exactly rather than making up a different one.`;
 
+  const countryLine = countryPromptLine(body?.country);
   const prompt = `Website: ${meta.domain || "(unknown)"}
+${countryLine}
 Page title: "${meta.title || "(missing)"}"
 Meta description: "${meta.metaDescription || "(missing)"}"
 Main heading (H1): "${meta.h1Text || "(missing)"}"

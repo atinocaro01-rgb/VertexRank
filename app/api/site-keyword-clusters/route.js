@@ -1,5 +1,6 @@
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
+import { countryPromptLine } from "../../../lib/country";
 import { clusterSiteKeywords, aggregateSiteKeywords, aggregateSiteEntities, auditKeywordUsage, scoreKeywordUsage } from "../../../lib/keywordClustering";
 
 // Site-wide Keyword Intelligence. Everything factual is computed
@@ -122,7 +123,7 @@ export async function POST(req) {
 
   const system = `You are VertexRank AI, a practical on-page keyword strategist. You are given a real, deterministically-computed keyword usage audit from a full crawl of every page on a site — the relevance scores, placement facts, and flagged problems are FACT, not your invention; you never re-score or contradict them. Your job is narrow: (1) write one concrete, one-sentence fix for each flagged keyword, grounded only in where it's currently used/not used, (2) propose a short list of genuinely new, specific keyword phrases this site should target but currently doesn't (never repeat a keyword already in the audited table), grounded in the real entities/topics found on the site, (3) estimate ranking difficulty (0-100, 0=trivial 100=extremely competitive) with a confidence level for every keyword listed, real or newly suggested, and (4) explain cannibalization risk in plain language. Difficulty is a professional estimate based on keyword specificity/competitiveness, not a claim of real search data. You never invent search volume, ranking positions, or traffic figures.`;
 
-  const header = `Website: ${crawl.domain}\nPages crawled: ${crawl.pages.length}\n`;
+  const header = `Website: ${crawl.domain}\n${countryPromptLine(body?.country)}\nPages crawled: ${crawl.pages.length}\n`;
 
   // The reply used to be ONE ~5,500-token JSON object, so the wait was the
   // sum of everything the model had to write. It's now two independent

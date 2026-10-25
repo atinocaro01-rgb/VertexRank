@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "test": "node --test tests/safeFetch.test.mjs tests/apiGuard.test.mjs tests/crawlState.test.mjs"
+    "test": "node --test tests/*.test.mjs tests/e2e/crawler.e2e.mjs"
   },
   "dependencies": {
     "next": "14.2.5",

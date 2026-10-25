@@ -85,3 +85,32 @@ Every crawl gets a `crawlId` (minted in `lib/siteCrawler.js`). Analyses (AEO, GE
 - Deleting a website while something is running can't bring it back.
 - Changing the country clears the AI Visibility Simulation (it is written for one market).
 - Workspaces saved before this change are migrated automatically and are not treated as stale.
+
+## Technical SEO checks
+
+Each crawl records, for every URL it requests, the HTTP status and redirect chain, `noindex` (meta robots and `X-Robots-Tag`), and every `rel=canonical` tag. Near the end of the time budget it also makes header-only status checks (no page download) of up to 40 internal link targets, canonical targets and sitemap URLs it hasn't fetched. `lib/technicalChecks.js` turns those facts into findings that appear in the SEO Audit, the Dashboard and the exports:
+
+- **Indexability:** homepage `noindex`, other `noindex` pages, robots.txt blocking Googlebot site-wide, internal links to robots-blocked URLs, missing robots.txt.
+- **Broken links and errors:** internal links to 404/410 and other 4xx, 5xx errors, unreachable URLs, and 401/403 (low severity, since these are often bot-blocking). Timeouts and rate limits are never reported as broken.
+- **Redirects:** internal links to redirecting URLs, chains of 2+ hops, loops, https→http downgrades, off-site redirects, trailing-slash-only redirects (low).
+- **Canonicals:** multiple, invalid, protocol/host mismatches, cross-domain, targets that are broken / redirecting / `noindex`, canonical chains, `noindex` + canonical conflicts.
+- **Sitemap consistency:** no sitemap, unparsable sitemap, host mismatch (www vs apex), URLs that error / redirect / are `noindex` / are non-canonical / are blocked by robots.txt, and linked pages missing from a complete sitemap.
+
+The Site Technical score is the average of the pages' technical scores minus a capped deduction for these site-level findings (Critical 11, High 7, Medium 4, Low 2 points each, 35 max); the Audit page shows the breakdown. Coverage is shown honestly: link and sitemap checks are a bounded sample, and the audit says how many URLs were and weren't checked.
+
+The crawler respects robots.txt using `lib/robotsTxt.js` (user-agent groups, `*` and `$` wildcards, longest-match precedence). If robots.txt blocks the page you enter, the crawl stops with an explanation instead of returning nothing. If your URL redirects (http→https, apex→www), the crawl follows it once and audits the host the site actually serves.
+
+Tests: `npm test` runs the unit tests plus `tests/e2e/crawler.e2e.mjs`, which runs the real crawler over a fake website. That test swaps in a small stand-in for cheerio and an in-memory network, so it checks the crawler's logic, not real HTML parsing or real HTTP.
+
+## Opportunity Queue and Action Center
+
+Everything the app suggests is one **opportunity** with one shape (`lib/opportunity.js`, tested in `tests/opportunity.test.mjs`): `sourceId`, `module`, `kind` (observed / AI analysis / AI estimate), `title`, `type`, `priority`, `confidence`, `evidence`, `recommendedAction`, `urls`, plus — once accepted — `status`, `country`, `crawlId` and timestamps.
+
+- **Opportunity Queue** (the landing view) lists every finding from the crawl and every analysis, ranked: priority first, then observed before AI-inferred, then indexability and technical problems, then how many pages it affects. Each item is *Open*, or in the workflow. You can add it to the Action Center, dismiss it, or restore a dismissed one.
+- **Action Center** is the workflow state of that same list: only what you accepted (or dismissed), by status (New → Pending Approval → Approved → Marked done → Verified). Deleting an action that is still detected sends it back to the Queue as Open.
+- Findings are recomputed from the current analyses; only your decisions are stored (still under `bundle.actions`). A stored item from an older crawl, a different target country, or a finding that is no longer detected is flagged rather than silently dropped.
+- Workspaces saved before this change are migrated on load: old `detail` records are flattened, the Dashboard's old duplicate ids (`uni_*`) map back to the module's own id so one finding can't be added twice, and unknown values (country, crawl) stay unknown instead of being guessed.
+
+## Target country in AI prompts
+
+`lib/country.js` holds the country list and the one prompt line every AI route uses. A country that isn't in the list (or is missing) becomes "Worldwide — do not assume any specific country or local market", which also means a client can't inject free text into a prompt through the country field. `tests/country.test.mjs` fails if any route that calls the model doesn't use it, or if a client call to an AI route doesn't send `country`.

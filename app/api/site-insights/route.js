@@ -1,5 +1,6 @@
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
+import { countryPromptLine } from "../../../lib/country";
 import { truncate } from "../../../lib/textIntelligence";
 
 // Site-wide AI Insights: reads the full-site crawl (every page's real
@@ -48,7 +49,9 @@ export async function POST(req) {
 
   const system = `You are VertexRank AI, a precise, detail-oriented SEO analyst reasoning about an ENTIRE crawled website, not one page. You never invent facts, page counts, traffic numbers, or search volumes beyond what's given. If a module below says it hasn't been run yet, don't pretend to know its results — you can note that running it would help, but don't guess its outcome. Your tone is direct and specific, like a consultant who actually read the crawl.`;
 
+  const countryLine = countryPromptLine(body?.country);
   const prompt = `Website: ${crawl.domain}
+${countryLine}
 Pages crawled: ${crawl.pagesCrawled} of ${crawl.pagesDiscovered} discovered (${crawl.truncated ? "crawl was truncated by the page/time limit" : "complete"})
 Site technical score: ${crawl.siteScores?.technical ?? "n/a"}/100 · Site content score: ${crawl.siteScores?.content ?? "n/a"}/100
 Homepage title: "${homepage.title || "(missing)"}"
