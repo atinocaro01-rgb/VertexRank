@@ -61,3 +61,27 @@ test("global daily cap returns 503 across different clients", async () => {
   const g = await guardJson(mkReq({ url: "a.com" }, "192.0.2.99"), "crawl");
   assert.equal(g.response.status, 503);
 });
+
+test("access control: the API guard enforces the password itself, throttles guessing, and fails closed in production", async () => {
+  const saved = { p: process.env.VR_ACCESS_PASSWORD, n: process.env.NODE_ENV };
+  const basic = (pw) => "Basic " + Buffer.from(`u:${pw}`).toString("base64");
+  try {
+    process.env.VR_ACCESS_PASSWORD = "a-long-random-password";
+    const ip = "203.0.113.200";
+    const noAuth = await guardJson(mkReq({ x: 1 }, ip), "aiLight");
+    assert.equal(noAuth.ok, false); assert.equal(noAuth.response.status, 401);
+    assert.match(noAuth.response.headers.get("www-authenticate"), /Basic/);
+    assert.equal((await guardJson(mkReq({ x: 1 }, ip, { authorization: basic("a-long-random-password") }), "aiLight")).ok, true);
+    // guessing: 10 wrong passwords are answered 401, the 11th is throttled
+    const statuses = [];
+    for (let i = 0; i < 12; i++) statuses.push((await guardJson(mkReq({ x: 1 }, "203.0.113.201", { authorization: basic("wrong" + i) }), "aiLight")).response.status);
+    assert.deepEqual(statuses.slice(0, 10), Array(10).fill(401)); assert.equal(statuses[10], 429);
+    // production with no password configured is locked, not open
+    delete process.env.VR_ACCESS_PASSWORD; process.env.NODE_ENV = "production";
+    const locked = await guardJson(mkReq({ x: 1 }, "203.0.113.202"), "aiLight");
+    assert.equal(locked.response.status, 503);
+  } finally {
+    if (saved.p === undefined) delete process.env.VR_ACCESS_PASSWORD; else process.env.VR_ACCESS_PASSWORD = saved.p;
+    if (saved.n === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = saved.n;
+  }
+});

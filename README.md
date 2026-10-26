@@ -118,3 +118,25 @@ Tests: `npm test` runs the unit tests plus `tests/e2e/crawler.e2e.mjs`, which ru
 3. **Re-running on change.** Changing a website's country clears the AI results written for the old market and re-runs AEO, GEO and keyword analysis for the new one.
 
 `lib/market.js` holds the country list and per-market reference data (languages, currency, English spelling, calling code). It is reference data for hints and consistency checks, not authority — review it for the markets you care about most.
+
+## Access control (password gate)
+
+The API routes spend your LLM credits and, in a later step, will be able to open pull requests on your repositories, so the whole app (pages and API) sits behind one shared password using HTTP Basic Auth (`middleware.js`, rules in `lib/accessControl.js`). The browser shows its own login prompt and then sends the credentials with every request, including the app's own calls, so there is no login screen to maintain.
+
+- Set `VR_ACCESS_PASSWORD` (a long random value; see `.env.example`). Optionally set `VR_ACCESS_USER` to require a username as well.
+- If it is **not** set: production is **locked** (503 with an explanation) rather than silently open; development is open so `npm run dev` needs no setup.
+- `VR_ACCESS_DISABLED=1` is an explicit opt-out for deployments protected another way (VPN, Vercel password protection, localhost only).
+- The API guard (`lib/apiGuard.js`) checks access again, so the routes stay protected even if the middleware is removed or its matcher changes. Repeated wrong passwords against the API are throttled.
+- Responses carry `X-Robots-Tag: noindex, nofollow`. Next's static build assets are excluded from the gate (they contain no data).
+- The gate cannot rate-limit guesses made at the middleware itself, so use a long random password.
+
+## Backups
+
+Your workspace (websites, crawls, analyses, Action Center, everything) lives only in this browser's localStorage. The sidebar has **Export backup** (downloads `vertexrank-backup-YYYY-MM-DD.json`) and **Import backup**, and shows when you last exported. Importing offers **Add missing websites** (nothing existing is overwritten; websites are matched by URL) or **Replace everything**. Backups contain crawled page text, so treat the file as private; they never contain API keys (those are server environment variables). An imported file goes through the same validation as data loaded from the browser. (`lib/workspaceBackup.js`)
+
+## Stack detection
+
+Each crawl fingerprints what the site is built with (`lib/stackDetector.js`): CMS/builder (WordPress, Shopify, Wix, Squarespace, Webflow, Ghost), framework (Next.js, Nuxt, SvelteKit, Remix, Angular, React, Vue), static site generator (Hugo, Jekyll, Eleventy, Astro, Gatsby, Docusaurus, MkDocs, Hexo), common libraries, and hosting (GitHub Pages, Netlify, Vercel, Cloudflare, AWS). Every detection lists its evidence and a confidence, and "unknown" is a valid answer. The result is shown on each website card:
+
+- **Rendering:** it flags sites whose pages are empty shells that fill in with JavaScript. VertexRank reads the HTML as served and does not run JavaScript, so findings for those pages may be incomplete or wrong. The card says so and lists the affected pages.
+- **GitHub fix suitability:** High for plain HTML (direct file edits), Medium for frameworks and static generators (edits live in templates or metadata config), Low for CMS and builders (content isn't in a repository).

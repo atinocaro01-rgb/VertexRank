@@ -10,14 +10,17 @@ register("./hooks.mjs", import.meta.url);
 const { crawlSite } = await import("../../lib/siteCrawler.js");
 const { analyzeMarket } = await import("../../lib/marketChecks.js");
 
-const page = ({ title = "A page", canonical, robots, links = [], body = "", lang, hreflangs = [], tel, jsonld } = {}) => ({
+const page = ({ title = "A page", canonical, robots, links = [], body = "", lang, hreflangs = [], tel, jsonld, generator, scripts = [], styles = [], root = false, headers } = {}) => ({
+  headers,
   type: "text/html; charset=utf-8",
   body: `<html${lang ? ` lang="${lang}"` : ""}><head><title>${title}</title><meta name="description" content="d ${title}">` +
     (canonical !== undefined ? `<link rel="canonical" href="${canonical}">` : "") +
     (robots ? `<meta name="robots" content="${robots}">` : "") +
+    (generator ? `<meta name="generator" content="${generator}">` : "") +
+    styles.map((h) => `<link rel="stylesheet" href="${h}">`).join("") +
     hreflangs.map(([l, h]) => `<link rel="alternate" hreflang="${l}" href="${h}">`).join("") +
     (jsonld ? `<script type="application/ld+json">${JSON.stringify(jsonld)}</script>` : "") +
-    `</head><body><h1>${title}</h1><p>${body || ("words about " + title + " ").repeat(80)}</p>${links.map((l) => `<a href="${l}">link</a>`).join("")}${tel ? `<a href="tel:${tel}">call</a>` : ""}</body></html>`,
+    `</head><body><h1>${title}</h1><p>${body || ("words about " + title + " ").repeat(80)}</p>${links.map((l) => `<a href="${l}">link</a>`).join("")}${tel ? `<a href="tel:${tel}">call</a>` : ""}${root ? '<div id="root"></div>' : ""}${scripts.map((src) => `<script src="${src}"></script>`).join("")}</body></html>`,
 });
 const sitemap = (urls) => ({ type: "application/xml", body: `<?xml version="1.0"?><urlset>${urls.map((u) => `<url><loc>${u}</loc></url>`).join("")}</urlset>` });
 const text = (body) => ({ type: "text/plain", body });
@@ -174,4 +177,32 @@ test("market signals are extracted from real crawl output and judged against the
   assert.ok(!de.includes("mkt_lang_mismatch")); assert.ok(de.includes("mkt_schema_country")); // German page is fine for Germany; a US address still isn't
   const us = ids("United States");
   assert.ok(!us.includes("mkt_schema_country") && !us.includes("mkt_schema_currency") && !us.includes("mkt_phone_country"));
+});
+
+test("stack: a client-rendered app is flagged (with the empty pages listed) and plain HTML on GitHub Pages is recognised", async () => {
+  const A = "https://spa.example";
+  const shell = (path) => page({ title: "App", canonical: `${A}${path}`, body: "x", root: true, scripts: ["/static/js/main.4f3a.js"], links: ["/", "/about"] });
+  setWeb({
+    [`${A}/`]: shell("/"), [`${A}/about`]: shell("/about"),
+    [`${A}/robots.txt`]: text("User-agent: *\nDisallow:\n"), [`${A}/sitemap.xml`]: { status: 404, body: "" },
+  });
+  const spa = await crawlSite(A);
+  assert.equal(spa.stack.rendering.type, "client-rendered"); assert.equal(spa.stack.jsRendering.needed, true);
+  assert.deepEqual(spa.stack.jsRendering.pages.sort(), [`${A}/`, `${A}/about`]);
+  assert.ok(spa.stack.technologies.some((t) => t.name === "React"));
+  assert.match(spa.stack.summary, /renders in the browser/);
+  // the saved crawl must not carry the bulky per-page asset lists (browser storage is limited)
+  for (const p of spa.pages) { assert.equal(p.scriptSrcs, undefined); assert.equal(p.stylesheetHrefs, undefined); assert.ok(Array.isArray(p.mounts)); }
+
+  const B = "https://static.example";
+  const gh = { server: "GitHub.com", "x-github-request-id": "ABCD" };
+  setWeb({
+    [`${B}/`]: page({ title: "Home", canonical: `${B}/`, links: ["/about"], scripts: ["/js/site.js"], styles: ["/css/bootstrap.min.css"], headers: gh }),
+    [`${B}/about`]: page({ title: "About", canonical: `${B}/about`, links: ["/"], headers: gh }),
+    [`${B}/robots.txt`]: text("User-agent: *\nDisallow:\n"), [`${B}/sitemap.xml`]: { status: 404, body: "" },
+  });
+  const html = await crawlSite(B);
+  assert.equal(html.stack.rendering.type, "static-html"); assert.equal(html.stack.github.suitability, "high");
+  assert.equal(html.stack.hosting[0].name, "GitHub Pages"); assert.equal(html.stack.jsRendering.needed, false);
+  assert.match(html.stack.summary, /Plain HTML · on GitHub Pages/);
 });

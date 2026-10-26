@@ -7,7 +7,7 @@ import {
   ChevronDown, ChevronLeft, ChevronRight, Loader2, AlertTriangle, CheckCircle2,
   RefreshCw, Wand2, Zap, Search,
   SlidersHorizontal, ArrowUpDown, Info, Sparkles, ChevronUp, Building2, Newspaper,
-  Podcast, Handshake, BookOpen, MapPin, Bot, Target, ShieldCheck, ListPlus, Copy
+  Podcast, Handshake, BookOpen, MapPin, Bot, Target, ShieldCheck, ListPlus, Copy, Download, Upload
 } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
 import {
@@ -20,6 +20,7 @@ import {
 } from "../lib/crawlState";
 import { COUNTRIES, normalizeCountry } from "../lib/market";
 import { computeAuditIssuesForMarket } from "../lib/auditIssues";
+import { normalizeWorkspace, createBackup, backupFilename, parseBackupText, mergeWorkspaces, timeAgo } from "../lib/workspaceBackup";
 import {
   buildOpportunityQueue, filterQueue, summarizeQueue, isOpportunityAdded, findAction, issueOpportunityId, issueLegacyIds, OPPORTUNITY_TYPES,
 } from "../lib/opportunityQueue";
@@ -321,6 +322,7 @@ const STORAGE_KEY = "vertexrank:v1";
 // The app used to be called RankPilot and saved under this key. We still read
 // it (once) so nobody loses their workspace in the rename, then move it over.
 const LEGACY_STORAGE_KEY = "rankpilot:v1";
+const LAST_BACKUP_KEY = "vertexrank:lastBackupAt";
 
 function loadPersistedState() {
   if (typeof window === "undefined") return null;
@@ -333,34 +335,10 @@ function loadPersistedState() {
     const parsed = JSON.parse(raw.replace(/RankPilot AI/g, "VertexRank AI"));
     if (!parsed || typeof parsed !== "object") return null;
 
-    const websites = Array.isArray(parsed.websites) ? parsed.websites.filter((w) => w && w.id) : [];
-
-    // Merge every saved bundle over a fresh emptyBundle() so a field added
-    // to the app after some data was saved (or missing/malformed for any
-    // other reason) falls back to a safe default instead of `undefined` —
-    // that mismatch is a common cause of a render crashing after reload.
-    const rawBundles = parsed.bundles && typeof parsed.bundles === "object" ? parsed.bundles : {};
-    const bundles = {};
-    for (const site of websites) {
-      const b = rawBundles[site.id];
-      const base = emptyBundle();
-      bundles[site.id] = migrateLegacyBundle({
-        ...base,
-        ...(b && typeof b === "object" ? b : {}),
-        scores: { ...base.scores, ...(b && typeof b.scores === "object" ? b.scores : {}) },
-        keywords: Array.isArray(b?.keywords) ? b.keywords : [],
-        aeoQuestions: Array.isArray(b?.aeoQuestions) ? b.aeoQuestions : [],
-        competitors: Array.isArray(b?.competitors) ? b.competitors : [],
-        contentIdeas: Array.isArray(b?.contentIdeas) ? b.contentIdeas : [],
-        internalLinks: Array.isArray(b?.internalLinks) ? b.internalLinks : [],
-        backlinks: Array.isArray(b?.backlinks) ? b.backlinks : [],
-        actions: Array.isArray(b?.actions) ? b.actions : [],
-        contentRoadmap: Array.isArray(b?.contentRoadmap) ? b.contentRoadmap : null,
-      });
-    }
-
-    const currentWebsiteId = websites.some((w) => w.id === parsed.currentWebsiteId) ? parsed.currentWebsiteId : (websites[0]?.id ?? null);
-    return { websites, bundles, currentWebsiteId };
+    // Merges every saved bundle over a fresh emptyBundle() so a field added to the app after some data was saved
+    // falls back to a safe default instead of `undefined` (a common cause of a render crashing after reload).
+    // Imported backup files go through the very same function (lib/workspaceBackup.js).
+    return normalizeWorkspace(parsed, { emptyBundle });
   } catch {
     return null; // corrupted or inaccessible (e.g. private browsing) — fall back to empty
   }
@@ -431,7 +409,7 @@ function IconButton({ icon: Icon, onClick, title, danger }) {
   );
 }
 
-function Button({ children, onClick, variant = "primary", icon: Icon, size = "md", disabled, type = "button" }) {
+function Button({ children, onClick, variant = "primary", icon: Icon, size = "md", disabled, type = "button", title }) {
   const base = "vr-focus inline-flex items-center justify-center gap-1.5 rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed";
   const sizes = { sm: "px-2.5 py-1.5 text-xs", md: "px-3.5 py-2 text-sm", lg: "px-5 py-2.5 text-sm" };
   const styles = {
@@ -442,7 +420,7 @@ function Button({ children, onClick, variant = "primary", icon: Icon, size = "md
     danger: { background: BRAND.redSoft, color: BRAND.red },
   };
   return (
-    <button type={type} disabled={disabled} onClick={onClick} className={cx(base, sizes[size])} style={styles[variant]}>
+    <button type={type} disabled={disabled} onClick={onClick} title={title} className={cx(base, sizes[size])} style={styles[variant]}>
       {Icon && <Icon size={size === "sm" ? 14 : 16} />}
       {children}
     </button>
@@ -731,8 +709,19 @@ function SiteCrawlGate({ body }) {
 /* ============================== layout ============================== */
 
 function Sidebar({ view, setView }) {
-  const { clearAllData } = useApp();
+  const { clearAllData, exportWorkspace, importWorkspace, lastBackupAt, websites, toast } = useApp();
   const [confirmClear, setConfirmClear] = useState(false);
+  const [importPlan, setImportPlan] = useState(null); // { state, meta } once a valid backup file has been chosen
+  const fileRef = useRef(null);
+  async function onPickFile(e) {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow choosing the same file again
+    if (!file) return;
+    const parsed = parseBackupText(await file.text(), { emptyBundle });
+    if (!parsed.ok) { toast(parsed.error, "error"); return; }
+    setImportPlan({ state: parsed.state, meta: parsed.meta });
+  }
+  const backupAge = timeAgo(lastBackupAt);
   return (
     <aside className="hidden md:flex md:w-60 shrink-0 flex-col" style={{ background: BRAND.surface, borderRight: `1px solid ${BRAND.line}` }}>
       <div className="px-5 py-5 flex items-center gap-2">
@@ -756,8 +745,35 @@ function Sidebar({ view, setView }) {
       </nav>
       <div className="px-5 py-4 text-xs space-y-1.5" style={{ color: BRAND.inkSoft, borderTop: `1px solid ${BRAND.line}` }}>
         <p className="flex items-center gap-1.5"><Check size={12} style={{ color: BRAND.visibility }} /> Saved in this browser</p>
+        <p style={{ color: !backupAge && websites.length > 0 ? BRAND.amber : BRAND.inkSoft }}>
+          {backupAge ? `Last backup: ${backupAge}` : websites.length > 0 ? "No backup yet — export one so clearing browser data can't lose your work." : "No backup yet"}
+        </p>
+        <div className="flex flex-wrap gap-x-3 gap-y-1">
+          <button onClick={exportWorkspace} className="vr-focus inline-flex items-center gap-1 underline decoration-dotted underline-offset-2"><Download size={11} /> Export backup</button>
+          <button onClick={() => fileRef.current?.click()} className="vr-focus inline-flex items-center gap-1 underline decoration-dotted underline-offset-2"><Upload size={11} /> Import backup</button>
+        </div>
+        <input ref={fileRef} type="file" accept="application/json,.json" className="hidden" onChange={onPickFile} />
         <button onClick={() => setConfirmClear(true)} className="vr-focus underline decoration-dotted underline-offset-2">Clear all data</button>
       </div>
+      <Modal open={!!importPlan} onClose={() => setImportPlan(null)} title="Import a backup" width={480}
+        footer={<>
+          <Button variant="outline" onClick={() => setImportPlan(null)}>Cancel</Button>
+          <Button variant="soft" onClick={() => { importWorkspace(importPlan.state, "merge"); setImportPlan(null); }}>Add missing websites</Button>
+          <Button variant="danger" onClick={() => { importWorkspace(importPlan.state, "replace"); setImportPlan(null); }}>Replace everything</Button>
+        </>}>
+        {importPlan && (
+          <div className="text-sm space-y-2" style={{ color: BRAND.inkSoft }}>
+            <p>
+              This backup has <b style={{ color: BRAND.ink }}>{importPlan.meta.websites} website{importPlan.meta.websites === 1 ? "" : "s"}</b>,{" "}
+              {importPlan.meta.pagesCrawled} crawled pages and {importPlan.meta.actions} Action Center item{importPlan.meta.actions === 1 ? "" : "s"}
+              {importPlan.meta.exportedAt ? <>, exported {timeAgo(importPlan.meta.exportedAt) || fmtDate(importPlan.meta.exportedAt)}</> : null}.
+            </p>
+            {importPlan.meta.droppedWebsites > 0 && <p style={{ color: BRAND.amber }}>{importPlan.meta.droppedWebsites} unreadable website entr{importPlan.meta.droppedWebsites === 1 ? "y was" : "ies were"} ignored.</p>}
+            <p><b style={{ color: BRAND.ink }}>Add missing websites</b> keeps everything you have and only adds websites that aren't here yet (matched by URL).</p>
+            <p><b style={{ color: BRAND.ink }}>Replace everything</b> swaps your current workspace for the backup. This can't be undone, so export a backup first if you aren't sure.</p>
+          </div>
+        )}
+      </Modal>
       <ConfirmDialog open={confirmClear} onClose={() => setConfirmClear(false)} title="Clear all data"
         body="This removes every website, scan result, and saved item from this browser. This can't be undone."
         onConfirm={clearAllData} />
@@ -1424,6 +1440,19 @@ function ScannerView() {
                 ) : (
                   <Button size="sm" variant="soft" icon={RadarIcon} onClick={() => startSiteCrawl(w)}>Full-site crawl</Button>
                 )}
+                {bundles[w.id]?.siteCrawl?.stack && crawlingId !== w.id && (() => {
+                  const st = bundles[w.id].siteCrawl.stack;
+                  const suit = { high: "High", medium: "Medium", low: "Low", unknown: "Unknown" }[st.github.suitability];
+                  return (
+                    <div className="mt-2 text-[11px] space-y-1" style={{ color: BRAND.inkSoft }}>
+                      <p title={st.basis}><b style={{ color: BRAND.ink }}>Built with:</b> {st.summary}</p>
+                      <p title={st.github.why}><b style={{ color: BRAND.ink }}>GitHub fixes:</b> {suit} suitability — {st.github.why}</p>
+                      {st.jsRendering.needed && (
+                        <p className="flex items-start gap-1" style={{ color: BRAND.amber }}><AlertTriangle size={12} className="mt-0.5 shrink-0" /> {st.jsRendering.note}</p>
+                      )}
+                    </div>
+                  );
+                })()}
                 {!bundles[w.id]?.siteCrawl && crawlingId !== w.id && (
                   <p className="text-[11px] mt-1.5" style={{ color: BRAND.inkSoft }}>Crawls the whole site — unlocks the Dashboard, Site-wide Audit, Competitor comparison, AEO, GEO, keyword clustering, internal-link recs, and backlink discovery.</p>
                 )}
@@ -3713,6 +3742,7 @@ function VertexRankApp() {
   const [toasts, setToasts] = useState([]);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [hydrated, setHydrated] = useState(false);
+  const [lastBackupAt, setLastBackupAt] = useState(null);
 
   // Load any saved workspace from this browser once, after mount. Doing this
   // in an effect (rather than in useState's initializer) keeps the very
@@ -3726,6 +3756,7 @@ function VertexRankApp() {
       setBundles(saved.bundles);
       setCurrentWebsiteId(saved.currentWebsiteId);
     }
+    try { setLastBackupAt(window.localStorage.getItem(LAST_BACKUP_KEY)); } catch { /* storage unavailable */ }
     setHydrated(true);
   }, []);
 
@@ -3736,6 +3767,35 @@ function VertexRankApp() {
     if (!hydrated) return;
     savePersistedState({ websites, bundles, currentWebsiteId });
   }, [websites, bundles, currentWebsiteId, hydrated]);
+
+  /** Downloads the whole workspace as one JSON file (the safety net: everything otherwise lives only in this browser). */
+  function exportWorkspace() {
+    const file = createBackup({ websites, bundles: bundleStore.current, currentWebsiteId });
+    const url = URL.createObjectURL(new Blob([JSON.stringify(file)], { type: "application/json" }));
+    const a = document.createElement("a");
+    a.href = url; a.download = backupFilename();
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    try { window.localStorage.setItem(LAST_BACKUP_KEY, file.exportedAt); } catch { /* storage unavailable */ }
+    setLastBackupAt(file.exportedAt);
+    toast("Backup downloaded — keep the file somewhere safe (it contains your crawled page text).");
+  }
+  /** mode "replace": the backup becomes the workspace. mode "merge": add websites that aren't here yet; nothing existing is overwritten. */
+  function importWorkspace(incoming, mode) {
+    tracker.reset(); // anything still running belongs to the workspace being replaced
+    if (mode === "replace") {
+      setWebsites(incoming.websites);
+      setBundles(incoming.bundles);
+      setCurrentWebsiteId(incoming.currentWebsiteId);
+      toast(`Restored ${incoming.websites.length} website${incoming.websites.length === 1 ? "" : "s"} from the backup.`);
+      return;
+    }
+    const merged = mergeWorkspaces({ websites, bundles: bundleStore.current, currentWebsiteId }, incoming);
+    setWebsites(merged.websites);
+    setBundles(merged.bundles);
+    setCurrentWebsiteId(merged.currentWebsiteId);
+    toast(`Added ${merged.added.length} website${merged.added.length === 1 ? "" : "s"}${merged.skipped.length ? `; skipped ${merged.skipped.length} that already exist` : ""}.`);
+  }
 
   function toast(message, type = "success") {
     const id = uid("toast");
@@ -3773,7 +3833,7 @@ function VertexRankApp() {
     toast("All saved data cleared");
   }
 
-  const ctx = { websites, setWebsites, bundles, setBundles, bundle, currentWebsiteId, setCurrentWebsiteId, toast, toasts, addAction, setScore, clearAllData, view, setView };
+  const ctx = { websites, setWebsites, bundles, setBundles, bundle, currentWebsiteId, setCurrentWebsiteId, toast, toasts, addAction, setScore, clearAllData, exportWorkspace, importWorkspace, lastBackupAt, view, setView };
 
   const views = {
     dashboard: Dashboard, opportunities: OpportunitiesView, scanner: ScannerView, audit: AuditView, actions: ActionCenter, keywords: KeywordsView,
