@@ -7,7 +7,7 @@ import {
   ChevronDown, ChevronLeft, ChevronRight, Loader2, AlertTriangle, CheckCircle2,
   RefreshCw, Wand2, Zap, Search,
   SlidersHorizontal, ArrowUpDown, Info, Sparkles, ChevronUp, Building2, Newspaper,
-  Podcast, Handshake, BookOpen, MapPin, Bot, Target, ShieldCheck, ListPlus, Copy, Download, Upload
+  Podcast, Handshake, BookOpen, MapPin, Bot, Target, ShieldCheck, ListPlus, Copy, Download, Upload, GitPullRequest, Eye
 } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
 import {
@@ -20,6 +20,7 @@ import {
 } from "../lib/crawlState";
 import { COUNTRIES, normalizeCountry } from "../lib/market";
 import { computeAuditIssuesForMarket } from "../lib/auditIssues";
+import { proposeFixes, rowReady, rowToFix, fixTypeOf } from "../lib/fixPlanner";
 import { normalizeWorkspace, createBackup, backupFilename, parseBackupText, mergeWorkspaces, timeAgo } from "../lib/workspaceBackup";
 import {
   buildOpportunityQueue, filterQueue, summarizeQueue, isOpportunityAdded, findAction, issueOpportunityId, issueLegacyIds, OPPORTUNITY_TYPES,
@@ -176,7 +177,7 @@ const DEFAULT_COUNTRY = "United States";
 const INTENTS = ["Informational", "Commercial", "Transactional", "Navigational"];
 const ISSUE_CATEGORIES = ["Technical", "Content", "On-Page", "Schema", "Internal Linking", "Indexing"];
 const SEVERITIES = ["Critical", "High", "Medium", "Low"];
-const ISSUE_STATUSES = ["New", "Pending Approval", "Approved", "Rejected", "Applied", "Verified"];
+const ISSUE_STATUSES = ["New", "Pending Approval", "Approved", "PR Open", "Rejected", "Applied", "Verified"];
 // VertexRank does not change anyone's website, so "Applied" can only mean "the user says they did it".
 // The stored value stays "Applied" (existing saved data uses it); only the label shown changes.
 const STATUS_LABEL = { Applied: "Marked done" };
@@ -210,6 +211,7 @@ const STATUS_COLOR = {
   New: { fg: "#4C5468", bg: "#EEEFF3" },
   "Pending Approval": { fg: BRAND.amber, bg: BRAND.amberSoft },
   Approved: { fg: "#2B60C9", bg: "#E7EFFC" },
+  "PR Open": { fg: "#6B3FD1", bg: "#EFE9FB" }, // a pull request exists but isn't merged yet
   Rejected: { fg: BRAND.red, bg: BRAND.redSoft },
   Applied: { fg: BRAND.visibility, bg: BRAND.visibilitySoft },
   Verified: { fg: "#1F7A46", bg: "#E4F5EA" },
@@ -523,7 +525,7 @@ function Field({ label, children }) {
 const inputCls = "vr-focus w-full rounded-md px-3 py-2 text-sm bg-white";
 const inputStyle = { border: `1px solid ${BRAND.line}` };
 function TextInput(props) { return <input {...props} className={inputCls} style={inputStyle} />; }
-function TextArea(props) { return <textarea {...props} className={inputCls} style={{ ...inputStyle, minHeight: 84 }} />; }
+function TextArea(props) { return <textarea {...props} className={inputCls} style={{ ...inputStyle, minHeight: 84, ...(props.style || {}) }} />; }
 function Select({ children, ...props }) { return <select {...props} className={inputCls} style={inputStyle}>{children}</select>; }
 
 function SearchInput({ value, onChange, placeholder = "Search..." }) {
@@ -1210,6 +1212,7 @@ function Dashboard() {
 function ScannerView() {
   const { websites, setWebsites, bundles, setBundles, currentWebsiteId, setCurrentWebsiteId, toast } = useApp();
   const [modal, setModal] = useState(null); // {mode:'add'|'edit', website}
+  const [githubFor, setGithubFor] = useState(null); // the website whose GitHub repository is being connected
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [form, setForm] = useState({ url: "", country: DEFAULT_COUNTRY });
   const [crawlingId, setCrawlingId] = useState(null);
@@ -1453,6 +1456,13 @@ function ScannerView() {
                     </div>
                   );
                 })()}
+                {crawlingId !== w.id && (
+                  <div className="mt-2 flex items-center gap-2 flex-wrap text-[11px]" style={{ color: BRAND.inkSoft }}>
+                    <GitPullRequest size={12} />
+                    <span>{w.github ? `${w.github.owner}/${w.github.repo} · ${w.github.branch}${w.github.siteRoot ? ` · /${w.github.siteRoot}` : ""}` : "GitHub not connected"}</span>
+                    <button className="vr-focus underline font-medium" style={{ color: BRAND.primary }} onClick={() => setGithubFor(w)}>{w.github ? "Settings" : "Connect"}</button>
+                  </div>
+                )}
                 {!bundles[w.id]?.siteCrawl && crawlingId !== w.id && (
                   <p className="text-[11px] mt-1.5" style={{ color: BRAND.inkSoft }}>Crawls the whole site — unlocks the Dashboard, Site-wide Audit, Competitor comparison, AEO, GEO, keyword clustering, internal-link recs, and backlink discovery.</p>
                 )}
@@ -1480,6 +1490,18 @@ function ScannerView() {
         </Field>
       </Modal>
 
+      {githubFor && (
+        <GithubConnectModal website={githubFor} onClose={() => setGithubFor(null)}
+          onSave={(github) => {
+            setWebsites((ws) => ws.map((x) => {
+              if (x.id !== githubFor.id) return x;
+              const { github: _old, ...rest } = x;
+              return github ? { ...rest, github } : rest;
+            }));
+            toast(github ? `Connected to ${github.owner}/${github.repo}` : "GitHub disconnected");
+            setGithubFor(null);
+          }} />
+      )}
       <ConfirmDialog open={!!confirmDelete} onClose={() => setConfirmDelete(null)} title="Delete website"
         body={`This removes ${confirmDelete?.url} and all of its crawled audit data.`}
         onConfirm={() => deleteWebsite(confirmDelete.id)} />
@@ -1615,6 +1637,192 @@ function AuditView() {
  *  near-duplicate content...). "Generate AI Fix" still calls VertexRank AI,
  *  but only to word one concrete fix for one real affected page — the
  *  finding itself is never invented. */
+/** Connects a website to its GitHub repository: inspects it (is it really plain HTML? where is the web root?) before saving. */
+function GithubConnectModal({ website, onClose, onSave }) {
+  const existing = website.github || null;
+  const [repoUrl, setRepoUrl] = useState(existing ? `${existing.owner}/${existing.repo}` : "");
+  const [branch, setBranch] = useState(existing?.branch || "");
+  const [siteRoot, setSiteRoot] = useState(existing?.siteRoot ?? "");
+  const [info, setInfo] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function inspect() {
+    setBusy(true); setError(""); setInfo(null);
+    try {
+      const data = await postJson("/api/github/inspect", { repoUrl: repoUrl.trim(), branch: branch.trim() || undefined });
+      setInfo(data);
+      setBranch(data.repo.branch);
+      const roots = data.analysis.siteRoots;
+      setSiteRoot(existing && roots.some((r) => r.path === existing.siteRoot) ? existing.siteRoot : roots[0]?.path ?? "");
+    } catch (e) { setError(e.message || "Couldn't inspect that repository."); } finally { setBusy(false); }
+  }
+  const allowed = !!info && info.analysis.allowed && info.repo.canPush !== false && !info.repo.archived;
+  const verdictLabel = { "plain-html": "Plain HTML", "html-with-tooling": "HTML with build tooling", framework: "JavaScript framework", "static-generator": "Static-site generator", wordpress: "WordPress", php: "PHP", empty: "No HTML files" };
+
+  return (
+    <Modal open onClose={onClose} title={`GitHub repository for ${website.url}`} width={600}
+      footer={<>
+        {existing && <Button variant="outline" onClick={() => onSave(null)}>Disconnect</Button>}
+        <Button variant="outline" onClick={onClose}>Cancel</Button>
+        <Button disabled={!allowed} onClick={() => onSave({ owner: info.repo.owner, repo: info.repo.name, branch: info.repo.branch, siteRoot })}>Save</Button>
+      </>}>
+      <div className="space-y-3 text-sm">
+        <p style={{ color: BRAND.inkSoft }}>
+          VertexRank can open a <b>pull request</b> with SEO fixes for this site. It never changes your main branch, and it first checks that the repository really is a plain-HTML site.
+          Requires a <code>GITHUB_TOKEN</code> environment variable on the server (fine-grained token: Contents and Pull requests, read &amp; write).
+        </p>
+        <Field label="Repository (owner/repo or GitHub URL)"><TextInput value={repoUrl} onChange={(e) => setRepoUrl(e.target.value)} placeholder="acme/website" /></Field>
+        <Field label="Branch (leave empty for the default branch)"><TextInput value={branch} onChange={(e) => setBranch(e.target.value)} placeholder="main" /></Field>
+        <Button variant="soft" icon={busy ? Loader2 : Search} disabled={busy || !repoUrl.trim()} onClick={inspect}>{busy ? "Inspecting…" : "Inspect repository"}</Button>
+        {error && <p className="flex items-start gap-1.5" style={{ color: BRAND.red }}><AlertTriangle size={14} className="mt-0.5 shrink-0" /> {error}</p>}
+
+        {info && (
+          <div className="rounded-lg p-3 space-y-2" style={{ background: BRAND.canvas }}>
+            <div className="flex items-center gap-2 flex-wrap">
+              <Badge color={info.analysis.allowed ? { fg: BRAND.visibility, bg: BRAND.visibilitySoft } : { fg: BRAND.red, bg: BRAND.redSoft }}>{verdictLabel[info.analysis.verdict] || info.analysis.verdict}</Badge>
+              <span className="text-xs" style={{ color: BRAND.inkSoft }}>{info.repo.owner}/{info.repo.name} · branch {info.repo.branch} · {info.analysis.htmlCount} HTML file{info.analysis.htmlCount === 1 ? "" : "s"}</span>
+            </div>
+            <ul className="text-xs list-disc pl-4 space-y-0.5" style={{ color: BRAND.inkSoft }}>{info.analysis.reasons.map((r, i) => <li key={i}>{r}</li>)}</ul>
+            {!info.analysis.allowed && info.analysis.advice && <p className="text-xs" style={{ color: BRAND.red }}>{info.analysis.advice}</p>}
+            {info.analysis.warnings.map((w, i) => <p key={i} className="text-xs flex items-start gap-1.5" style={{ color: BRAND.amber }}><AlertTriangle size={12} className="mt-0.5 shrink-0" /> {w}</p>)}
+            {info.analysis.allowed && (
+              <Field label="Folder that is your website's root">
+                <Select value={siteRoot} onChange={(e) => setSiteRoot(e.target.value)}>
+                  {info.analysis.siteRoots.length === 0 && <option value="">(repository root)</option>}
+                  {info.analysis.siteRoots.map((r) => <option key={r.path} value={r.path}>{r.path || "(repository root)"} — {r.htmlCount} HTML file{r.htmlCount === 1 ? "" : "s"}{r.generated ? " — looks like build output" : ""}</option>)}
+                </Select>
+              </Field>
+            )}
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+/** Previews and opens a pull request for one audit finding. Every row is verified server-side against the repository file
+ *  before anything is changed; blocked rows say why. Nothing is written until "Create pull request". */
+function CreatePrModal({ issue, website, crawl, country, onClose }) {
+  const { setBundles, currentWebsiteId, toast } = useApp();
+  const gh = website.github;
+  const planned = useMemo(() => proposeFixes(issue, crawl, { country }), [issue, crawl, country]);
+  const [values, setValues] = useState(() => Object.fromEntries(planned.rows.map((r) => [r.id, r.value])));
+  const [selected, setSelected] = useState(() => new Set(planned.rows.map((r) => r.id)));
+  const [preview, setPreview] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState(null);
+
+  const chosen = planned.rows.filter((r) => selected.has(r.id));
+  const ready = chosen.length > 0 && chosen.every((r) => rowReady(r, values[r.id]));
+  const request = () => ({ owner: gh.owner, repo: gh.repo, branch: gh.branch, siteRoot: gh.siteRoot || "", siteUrl: website.url, fixes: chosen.map((r) => rowToFix(r, values[r.id])) });
+  const edited = () => { setPreview(null); setError(""); };
+
+  async function runPreview() {
+    setBusy(true); setError("");
+    try { setPreview(await postJson("/api/github/preview", request())); } catch (e) { setError(e.message || "Couldn't prepare the preview."); setPreview(null); } finally { setBusy(false); }
+  }
+  async function create() {
+    setBusy(true); setError("");
+    try {
+      const data = await postJson("/api/github/create-pr", { ...request(), confirm: true, findingTitle: issue.title });
+      setResult(data);
+      const pr = { number: data.pr.number, url: data.pr.url, owner: gh.owner, repo: gh.repo, branch: data.branch, state: "open", changes: data.results.filter((r) => r.ok).length, files: [...data.edits, ...data.creates].map((f) => f.path), createdAt: new Date().toISOString() };
+      const ids = [issueOpportunityId(issue), ...issueLegacyIds(issue)];
+      setBundles((prev) => {
+        const site = prev[currentWebsiteId];
+        if (!site) return prev;
+        const i = site.actions.findIndex((a) => ids.includes(a.detail?.sourceId));
+        const actions = i >= 0
+          ? site.actions.map((a, k) => (k === i ? { ...a, status: "PR Open", detail: { ...a.detail, pr } } : a))
+          : [{ id: uid("act"), websiteId: currentWebsiteId, createdAt: new Date().toISOString(), title: issue.title, type: issue.category === "Content" ? "Content Update" : issue.category === "Schema" ? "Schema Markup" : "Technical Fix", status: "PR Open",
+              detail: { sourceId: ids[0], module: "Site-wide Audit", evidence: issue.urls?.length ? `Affects ${issue.urls.length} URL${issue.urls.length === 1 ? "" : "s"}` : issue.why, recommendedAction: issue.fix, priority: issue.severity, confidence: "High", source: "Crawled Data", pr } }, ...site.actions];
+        return { ...prev, [currentWebsiteId]: { ...site, actions } };
+      });
+      toast("Pull request created");
+    } catch (e) { setError(e.message || "Couldn't create the pull request."); } finally { setBusy(false); }
+  }
+
+  const statusOf = (id) => (preview || result)?.results?.find((r) => r.id === id);
+  const files = [...(preview || result)?.edits || [], ...(preview || result)?.creates || []];
+  const okCount = ((preview || result)?.results || []).filter((r) => r.ok).length;
+
+  return (
+    <Modal open onClose={onClose} title={`Pull request: ${issue.title}`} width={820}
+      footer={result ? <Button onClick={onClose}>Done</Button> : <>
+        <Button variant="outline" onClick={onClose}>Cancel</Button>
+        <Button variant="soft" icon={busy ? Loader2 : Eye} disabled={busy || !ready || !planned.supported} onClick={runPreview}>Preview changes</Button>
+        <Button icon={GitPullRequest} disabled={busy || !preview?.canCreate} onClick={create}>Create pull request{preview?.canCreate ? ` (${okCount} change${okCount === 1 ? "" : "s"}, ${files.length} file${files.length === 1 ? "" : "s"})` : ""}</Button>
+      </>}>
+      {!planned.supported ? (
+        <p className="text-sm" style={{ color: BRAND.inkSoft }}>{planned.note}</p>
+      ) : (
+        <div className="space-y-3 text-sm">
+          <p style={{ color: BRAND.inkSoft }}>
+            Repository <b style={{ color: BRAND.ink }}>{gh.owner}/{gh.repo}</b>, branch <b style={{ color: BRAND.ink }}>{gh.branch}</b>{gh.siteRoot ? <>, folder <b style={{ color: BRAND.ink }}>/{gh.siteRoot}</b></> : null}.
+            This opens a pull request on a new branch; your {gh.branch} branch is never changed.
+          </p>
+          {planned.note && <p className="text-xs" style={{ color: BRAND.amber }}>{planned.note}</p>}
+
+          {result ? (
+            <div className="rounded-lg p-4 space-y-2" style={{ background: BRAND.visibilitySoft }}>
+              <p className="font-semibold flex items-center gap-2" style={{ color: BRAND.visibility }}><CheckCircle2 size={16} /> Pull request #{result.pr.number} opened</p>
+              <p><a href={result.pr.url} target="_blank" rel="noreferrer" className="underline font-medium" style={{ color: BRAND.primary }}>{result.pr.url}</a></p>
+              <p className="text-xs" style={{ color: BRAND.inkSoft }}>{okCount} change{okCount === 1 ? "" : "s"} in {files.length} file{files.length === 1 ? "" : "s"}, on branch {result.branch}. The Action Center item now shows "PR Open"; check its status there after you merge, then re-crawl to verify.</p>
+              {result.results.some((r) => !r.ok) && <p className="text-xs" style={{ color: BRAND.amber }}>{result.results.filter((r) => !r.ok).length} change(s) were skipped; the reasons are in the pull request description.</p>}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {planned.rows.map((r) => {
+                const st = statusOf(r.id);
+                return (
+                  <div key={r.id} className="rounded-lg p-3" style={{ background: BRAND.canvas, opacity: selected.has(r.id) ? 1 : 0.55 }}>
+                    <label className="flex items-start gap-2 cursor-pointer">
+                      <input type="checkbox" className="mt-1" checked={selected.has(r.id)} onChange={() => { setSelected((cur) => { const n = new Set(cur); n.has(r.id) ? n.delete(r.id) : n.add(r.id); return n; }); edited(); }} />
+                      <span className="min-w-0 flex-1">
+                        <span className="font-medium break-words">{r.label}</span>
+                        <span className="block text-xs break-words" style={{ color: BRAND.inkSoft }}>{r.detail}</span>
+                      </span>
+                      {st && <span className="text-xs font-semibold shrink-0" style={{ color: st.ok ? BRAND.visibility : BRAND.red }}>{st.ok ? "✓ will change" : "✗ blocked"}</span>}
+                    </label>
+                    {r.input && selected.has(r.id) && (
+                      <div className="mt-2 pl-6">
+                        {r.input.multiline
+                          ? <TextArea value={values[r.id] ?? ""} placeholder={r.input.placeholder} onChange={(e) => { setValues((v) => ({ ...v, [r.id]: e.target.value })); edited(); }} style={{ minHeight: 120, fontFamily: "monospace", fontSize: 12 }} />
+                          : <TextInput value={values[r.id] ?? ""} placeholder={r.input.placeholder} onChange={(e) => { setValues((v) => ({ ...v, [r.id]: e.target.value })); edited(); }} />}
+                      </div>
+                    )}
+                    {st && <p className="text-xs mt-1.5 pl-6 break-words" style={{ color: st.ok ? BRAND.inkSoft : BRAND.red }}>{st.ok ? `${st.file}${st.note ? ` — ${st.note}` : ""}` : st.message}</p>}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {error && <p className="flex items-start gap-1.5" style={{ color: BRAND.red }}><AlertTriangle size={14} className="mt-0.5 shrink-0" /> {error}</p>}
+          {preview && preview.analysis?.warnings?.map((w, i) => <p key={i} className="text-xs flex items-start gap-1.5" style={{ color: BRAND.amber }}><AlertTriangle size={12} className="mt-0.5 shrink-0" /> {w}</p>)}
+          {preview && !preview.canCreate && <p className="text-xs" style={{ color: BRAND.red }}>None of the selected changes can be applied; see the reasons above.</p>}
+
+          {preview && files.length > 0 && !result && (
+            <div className="space-y-2">
+              <p className="text-xs font-semibold" style={{ color: BRAND.inkSoft }}>Exactly what will change</p>
+              {files.map((f) => (
+                <div key={f.path} className="rounded-lg overflow-hidden" style={{ border: `1px solid ${BRAND.line}` }}>
+                  <div className="px-3 py-1.5 text-xs font-semibold flex justify-between" style={{ background: BRAND.canvas }}><span className="vr-mono">{f.path}</span><span><span style={{ color: BRAND.visibility }}>+{f.stats.added}</span> <span style={{ color: BRAND.red }}>−{f.stats.removed}</span></span></div>
+                  <pre className="text-[11px] leading-snug p-3 overflow-auto max-h-64 vr-mono" style={{ background: BRAND.surface }}>
+                    {f.diff.split("\n").map((l, i) => <div key={i} style={{ color: l.startsWith("+") && !l.startsWith("+++") ? BRAND.visibility : l.startsWith("-") && !l.startsWith("---") ? BRAND.red : l.startsWith("@@") ? BRAND.primary : BRAND.inkSoft, whiteSpace: "pre-wrap", wordBreak: "break-all" }}>{l || " "}</div>)}
+                  </pre>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
 function SiteAuditPanel() {
   const { websites, bundle, currentWebsiteId, toast, addAction } = useApp();
   const b = bundle();
@@ -1626,6 +1834,8 @@ function SiteAuditPanel() {
   // The audit also shows the deterministic market (country) checks for the website's selected target market.
   const country = normalizeCountry(websites.find((w) => w.id === currentWebsiteId)?.country);
   const allIssues = useMemo(() => computeAuditIssuesForMarket(crawl, country), [crawl, country]);
+  const website = websites.find((w) => w.id === currentWebsiteId);
+  const [prIssue, setPrIssue] = useState(null);
 
   const worstPages = useMemo(() => {
     if (!crawl) return [];
@@ -1748,6 +1958,11 @@ function SiteAuditPanel() {
                   )}
                   <div className="flex items-center gap-2 flex-wrap">
                     <Button size="sm" icon={Wand2} onClick={() => openAiFix(issue)}>Generate AI Fix</Button>
+                    {fixTypeOf(issue) && (
+                      website?.github
+                        ? <Button size="sm" variant="soft" icon={GitPullRequest} onClick={() => setPrIssue(issue)} title="Prepare a GitHub pull request for this finding">Create pull request</Button>
+                        : <span className="text-[11px]" style={{ color: BRAND.inkSoft }}>Connect GitHub on the Websites page to fix this with a pull request.</span>
+                    )}
                     <Button size="sm" variant={isAdded(issue) ? "outline" : "soft"} icon={isAdded(issue) ? Check : ListPlus} disabled={isAdded(issue)} onClick={() => addIssueToActions(issue)}>
                       {isAdded(issue.id) ? "Added" : "Add to Action Center"}
                     </Button>
@@ -1760,6 +1975,7 @@ function SiteAuditPanel() {
       )}
 
       {fixIssue && <AiFixModal issue={fixIssue.issue} meta={fixIssue.meta} onClose={() => setFixIssue(null)} onApply={() => toast("Fix noted — apply it on the affected page(s) above.")} />}
+      {prIssue && website?.github && <CreatePrModal issue={prIssue} website={website} crawl={crawl} country={country} onClose={() => setPrIssue(null)} />}
     </div>
   );
 }
@@ -1800,6 +2016,21 @@ function ActionCenter() {
   }
   function setStatus(id, status) { mutate((arr) => arr.map((a) => (a.id === id ? { ...a, status } : a))); toast(`Status set to ${status}`); }
   function del(id) { mutate((arr) => arr.filter((a) => a.id !== id)); toast("Action deleted"); }
+  /** Asks GitHub whether this action's pull request has been merged, and keeps the status honest: only a merged PR counts as applied. */
+  async function checkPr(a) {
+    const pr = a.detail?.pr;
+    if (!pr) return;
+    try {
+      const d = await postJson("/api/github/pr-status", { owner: pr.owner, repo: pr.repo, number: pr.number });
+      const state = d.merged ? "merged" : d.state === "closed" ? "closed" : "open";
+      mutate((arr) => arr.map((x) => (x.id !== a.id ? x : {
+        ...x,
+        status: d.merged ? "Applied" : state === "closed" ? "Approved" : x.status,
+        detail: { ...x.detail, pr: { ...x.detail.pr, state, mergedAt: d.mergedAt, closedAt: d.closedAt } },
+      })));
+      toast(d.merged ? "Merged. Once the site is deployed, re-crawl to verify the fix." : state === "closed" ? "The pull request was closed without merging." : "The pull request is still open.");
+    } catch (e) { toast(e.message || "Couldn't check the pull request.", "error"); }
+  }
 
   return (
     <div className="space-y-4">
@@ -1862,6 +2093,14 @@ function ActionCenter() {
                           <div className="rounded-lg p-3.5 space-y-2" style={{ background: BRAND.canvas }}>
                             {a.detail.evidence && <div><p className="text-xs font-semibold mb-0.5" style={{ color: BRAND.inkSoft }}>Evidence from crawl</p><p className="text-sm">{a.detail.evidence}</p></div>}
                             {a.detail.recommendedAction && <div><p className="text-xs font-semibold mb-0.5" style={{ color: BRAND.inkSoft }}>Recommended action</p><p className="text-sm">{a.detail.recommendedAction}</p></div>}
+                            {a.detail.pr && (
+                              <div className="flex items-center gap-2 flex-wrap text-sm">
+                                <GitPullRequest size={14} style={{ color: BRAND.primary }} />
+                                <a href={a.detail.pr.url} target="_blank" rel="noreferrer" className="underline font-medium" style={{ color: BRAND.primary }}>Pull request #{a.detail.pr.number} · {a.detail.pr.owner}/{a.detail.pr.repo}</a>
+                                <span className="text-xs" style={{ color: BRAND.inkSoft }}>({a.detail.pr.state === "merged" ? "merged" : a.detail.pr.state === "closed" ? "closed without merging" : "open"}; {a.detail.pr.changes} change{a.detail.pr.changes === 1 ? "" : "s"} in {a.detail.pr.files?.length || 0} file{(a.detail.pr.files?.length || 0) === 1 ? "" : "s"})</span>
+                                {a.detail.pr.state !== "merged" && <Button size="sm" variant="soft" icon={RefreshCw} onClick={() => checkPr(a)}>Check status</Button>}
+                              </div>
+                            )}
                             <div className="flex items-center gap-3 flex-wrap pt-1">
                               {a.detail.confidence && <span className="text-xs" style={{ color: BRAND.inkSoft }}>Confidence: {a.detail.confidence}</span>}
                               {a.detail.source && <span className="text-xs rounded px-1.5 py-0.5" style={{ background: BRAND.primarySoft, color: BRAND.primary }}>{a.detail.source}</span>}

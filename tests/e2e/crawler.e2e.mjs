@@ -206,3 +206,16 @@ test("stack: a client-rendered app is flagged (with the empty pages listed) and 
   assert.equal(html.stack.hosting[0].name, "GitHub Pages"); assert.equal(html.stack.jsRendering.needed, false);
   assert.match(html.stack.summary, /Plain HTML · on GitHub Pages/);
 });
+
+test("images with no alt attribute are recorded by src (alt=\"\" is decorative and is not a fix target)", async () => {
+  const A = "https://img.example";
+  setWeb({
+    [`${A}/`]: page({ title: "Home", canonical: `${A}/`, links: ["/b"], body: '<img src="/cat.png"><img src="/cat.png"><img src="/dog.png" alt=""><img src="/ok.png" alt="fine"><img alt="x">' }),
+    [`${A}/b`]: page({ title: "B", canonical: `${A}/b`, links: ["/"] }),
+    [`${A}/robots.txt`]: text("User-agent: *\nDisallow:\n"), [`${A}/sitemap.xml`]: { status: 404, body: "" },
+  });
+  const r = await crawlSite(A);
+  const home = r.pages.find((p) => p.url === `${A}/`);
+  assert.deepEqual(home.missingAltSrcs, ["/cat.png"]); // de-duplicated; alt="" and alt="fine" excluded; no-src image ignored
+  assert.equal(home.imagesMissingAlt, 3); // the audit still counts empty alt as "missing" — different question
+});

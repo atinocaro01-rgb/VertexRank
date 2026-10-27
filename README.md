@@ -140,3 +140,24 @@ Each crawl fingerprints what the site is built with (`lib/stackDetector.js`): CM
 
 - **Rendering:** it flags sites whose pages are empty shells that fill in with JavaScript. VertexRank reads the HTML as served and does not run JavaScript, so findings for those pages may be incomplete or wrong. The card says so and lists the affected pages.
 - **GitHub fix suitability:** High for plain HTML (direct file edits), Medium for frameworks and static generators (edits live in templates or metadata config), Low for CMS and builders (content isn't in a repository).
+
+## GitHub pull requests (plain-HTML sites)
+
+VertexRank can turn certain audit findings into a **pull request** on your site's GitHub repository. It never pushes to your main branch: it commits to a new branch (`vertexrank/fixes-…`) and opens a PR for you to review and merge.
+
+**Setup**
+1. Create a fine-grained personal access token limited to your site repositories, with Contents (read & write), Pull requests (read & write) and Metadata (read). Set it as the `GITHUB_TOKEN` environment variable (see `.env.example`). It stays on the server and never reaches the browser.
+2. On the **Websites** page, click **Connect** under a website, enter `owner/repo` and the branch, and click **Inspect repository**. VertexRank checks whether the repo really is a plain-HTML site and suggests the folder that is the web root. Save.
+3. In the **SEO Audit**, findings that can be fixed show **Create pull request**. Edit any values (titles, descriptions, alt text), click **Preview changes** to see exactly what will change, then **Create pull request**. The Action Center item switches to **PR Open**; use **Check status** after you merge (a merged PR becomes Applied), then re-crawl to verify.
+
+**What it can fix:** missing page titles, meta descriptions and canonical tags; the `<html lang>` attribute; image alt text (only images with no alt attribute; `alt=""` marks an image decorative and is left alone); schema.org JSON-LD; removing `noindex` from the HTML; pointing internal links at their final URLs or at a replacement you supply; creating `robots.txt` and `sitemap.xml` when missing.
+
+**Safety, because a site may not be 100% plain HTML**
+- **The repo is inspected first.** Frameworks (React, Vue, Next, Astro…), static-site generators (Jekyll, Hugo, Eleventy…), WordPress and PHP projects are refused with an explanation: in those, the HTML visitors see is generated output, so editing it would be overwritten or wrong. HTML with build tooling is allowed with a warning.
+- **Every fix is verified against the file before editing.** Each fix carries what the crawler saw on the live page. If the file disagrees (for example the crawler saw a title but the file has none), the page is being changed by JavaScript or a build step and the fix is **blocked with the reason**, never forced. The same applies to ambiguous cases: several `<title>` tags, a URL that could map to two files, links that are relative.
+- **Minimal edits.** Changes are exact text splices, so formatting, indentation and line endings elsewhere are untouched and the PR diff shows only the real change.
+- **Nothing is overwritten.** New files are only created when they don't exist.
+- **The server recomputes everything.** The browser sends only the intent (kind, page, values); file contents and diffs are produced on the server from the repository, so the browser can't inject an edit. Creating a PR requires explicit confirmation, a read-only preview is available first, and all of it sits behind the password gate and rate limits.
+- Reading is pinned to one commit, so the preview and the PR come from a consistent snapshot. Fixes that can't be applied are listed in the PR description.
+
+Not yet supported: frameworks and generators, AI-suggested text inside the PR dialog (type or paste values for now), and fixing external-link problems. Code: `lib/htmlScan.js`, `lib/htmlFixes.js`, `lib/repoInspect.js`, `lib/github.js`, `lib/prBuilder.js`, `lib/fixPlanner.js`, `app/api/github/*`.
