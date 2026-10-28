@@ -160,4 +160,14 @@ VertexRank can turn certain audit findings into a **pull request** on your site'
 - **The server recomputes everything.** The browser sends only the intent (kind, page, values); file contents and diffs are produced on the server from the repository, so the browser can't inject an edit. Creating a PR requires explicit confirmation, a read-only preview is available first, and all of it sits behind the password gate and rate limits.
 - Reading is pinned to one commit, so the preview and the PR come from a consistent snapshot. Fixes that can't be applied are listed in the PR description.
 
-Not yet supported: frameworks and generators, AI-suggested text inside the PR dialog (type or paste values for now), and fixing external-link problems. Code: `lib/htmlScan.js`, `lib/htmlFixes.js`, `lib/repoInspect.js`, `lib/github.js`, `lib/prBuilder.js`, `lib/fixPlanner.js`, `app/api/github/*`.
+Not yet supported: frameworks and generators, and fixing external-link problems. Code: `lib/htmlScan.js`, `lib/htmlFixes.js`, `lib/repoInspect.js`, `lib/github.js`, `lib/prBuilder.js`, `lib/fixPlanner.js`, `app/api/github/*`.
+
+### AI-suggested titles and descriptions
+
+In the pull-request dialog, title and meta-description rows have a **Suggest with AI** button, and **Suggest for N unedited rows** drafts them in batches. It covers missing, too-long and duplicate titles and descriptions. Suggestions are drafted from each page's own crawled content (`lib/seoSuggestions.js`, route `app/api/seo-suggest`) and land in the editable box; nothing is applied until you preview and create the pull request.
+
+- **Grounded.** The model is told to use only facts present in the page content and never to invent products, prices, places, awards or claims. Afterwards every suggestion is checked for words that appear nowhere on the page and flagged ("contains words that don't appear on the page") so you can verify it.
+- **Untrusted input and output.** Page text is fenced as data and the model is told never to follow instructions inside it. Its answer is parsed strictly, stripped of HTML, markdown and "Title:" labels, and length-capped.
+- **Honest quality checks, live as you type:** character count (titles about 50-60, descriptions about 130-160), too long or short, ALL CAPS, unchanged from the current value, and duplicates of other pages' titles or descriptions on the site (including the other suggestions in the same pull request).
+- **Market-aware.** The website's selected country is applied (language, spelling, currency) the same way as the other AI analyses.
+- It uses the same rate limits as the other AI features.

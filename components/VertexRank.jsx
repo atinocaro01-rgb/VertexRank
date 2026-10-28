@@ -20,7 +20,8 @@ import {
 } from "../lib/crawlState";
 import { COUNTRIES, normalizeCountry } from "../lib/market";
 import { computeAuditIssuesForMarket } from "../lib/auditIssues";
-import { proposeFixes, rowReady, rowToFix, fixTypeOf } from "../lib/fixPlanner";
+import { proposeFixes, rowReady, rowToFix, fixTypeOf, suggestionItem, avoidList, pagePlainText } from "../lib/fixPlanner";
+import { checkSuggestion } from "../lib/seoSuggestions";
 import { normalizeWorkspace, createBackup, backupFilename, parseBackupText, mergeWorkspaces, timeAgo } from "../lib/workspaceBackup";
 import {
   buildOpportunityQueue, filterQueue, summarizeQueue, isOpportunityAdded, findAction, issueOpportunityId, issueLegacyIds, OPPORTUNITY_TYPES,
@@ -1714,10 +1715,35 @@ function CreatePrModal({ issue, website, crawl, country, onClose }) {
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
 
+  const [suggestState, setSuggestState] = useState({}); // row id -> { loading } | { ai: true } | { error }
+  const avoid = useMemo(() => avoidList(crawl), [crawl]);
+
   const chosen = planned.rows.filter((r) => selected.has(r.id));
   const ready = chosen.length > 0 && chosen.every((r) => rowReady(r, values[r.id]));
   const request = () => ({ owner: gh.owner, repo: gh.repo, branch: gh.branch, siteRoot: gh.siteRoot || "", siteUrl: website.url, fixes: chosen.map((r) => rowToFix(r, values[r.id])) });
   const edited = () => { setPreview(null); setError(""); };
+
+  /** Asks the AI for titles/descriptions for these rows (in batches). The text goes into the editable box; nothing is applied. */
+  async function suggestFor(rowsToDo) {
+    if (rowsToDo.length === 0) return;
+    setSuggestState((st) => ({ ...st, ...Object.fromEntries(rowsToDo.map((r) => [r.id, { loading: true }])) }));
+    for (let i = 0; i < rowsToDo.length; i += 8) {
+      const chunk = rowsToDo.slice(i, i + 8);
+      try {
+        const data = await postJson("/api/seo-suggest", { country, domain: website.url, avoid, items: chunk.map((r) => suggestionItem(r, crawl)) });
+        const byId = new Map(data.suggestions.map((x) => [x.id, x]));
+        setValues((v) => { const n = { ...v }; for (const r of chunk) if (byId.has(r.id)) n[r.id] = byId.get(r.id).text; return n; });
+        setSuggestState((st) => { const n = { ...st }; for (const r of chunk) n[r.id] = byId.has(r.id) ? { ai: true } : { error: "The AI didn't return a suggestion for this one. Try again." }; return n; });
+      } catch (e) {
+        const message = e.message || "Couldn't generate suggestions.";
+        setSuggestState((st) => ({ ...st, ...Object.fromEntries(rowsToDo.slice(i).map((r) => [r.id, { error: message }])) }));
+        break; // a failed batch (rate limit, provider down) means later batches would fail the same way
+      }
+    }
+    setPreview(null);
+  }
+  const aiRows = chosen.filter((r) => r.ai);
+  const untouchedAiRows = aiRows.filter((r) => (values[r.id] ?? "") === (r.value ?? "") && !suggestState[r.id]?.ai);
 
   async function runPreview() {
     setBusy(true); setError("");
@@ -1774,8 +1800,24 @@ function CreatePrModal({ issue, website, crawl, country, onClose }) {
             </div>
           ) : (
             <div className="space-y-2">
+              {aiRows.length > 0 && (
+                <div className="flex items-center justify-between gap-2 flex-wrap rounded-lg px-3 py-2" style={{ background: BRAND.primarySoft }}>
+                  <span className="text-xs" style={{ color: BRAND.inkSoft }}>AI can draft these from each page's own content. Review every suggestion — nothing is applied until you create the pull request.</span>
+                  <Button size="sm" variant="soft" icon={Wand2} disabled={untouchedAiRows.length === 0 || aiRows.some((r) => suggestState[r.id]?.loading)} onClick={() => suggestFor(untouchedAiRows)}>
+                    Suggest for {untouchedAiRows.length} unedited row{untouchedAiRows.length === 1 ? "" : "s"}
+                  </Button>
+                </div>
+              )}
               {planned.rows.map((r) => {
                 const st = statusOf(r.id);
+                const sg = suggestState[r.id] || {};
+                const value = values[r.id] ?? "";
+                const check = r.ai && selected.has(r.id)
+                  ? checkSuggestion(r.ai, value, {
+                      pageText: pagePlainText(r, crawl), domain: website.url, current: r.current,
+                      existing: [...avoid.filter((a) => a !== r.current), ...planned.rows.filter((o) => o.id !== r.id && o.ai === r.ai && selected.has(o.id)).map((o) => values[o.id] ?? "")],
+                    })
+                  : null;
                 return (
                   <div key={r.id} className="rounded-lg p-3" style={{ background: BRAND.canvas, opacity: selected.has(r.id) ? 1 : 0.55 }}>
                     <label className="flex items-start gap-2 cursor-pointer">
@@ -1787,10 +1829,19 @@ function CreatePrModal({ issue, website, crawl, country, onClose }) {
                       {st && <span className="text-xs font-semibold shrink-0" style={{ color: st.ok ? BRAND.visibility : BRAND.red }}>{st.ok ? "✓ will change" : "✗ blocked"}</span>}
                     </label>
                     {r.input && selected.has(r.id) && (
-                      <div className="mt-2 pl-6">
+                      <div className="mt-2 pl-6 space-y-1.5">
                         {r.input.multiline
-                          ? <TextArea value={values[r.id] ?? ""} placeholder={r.input.placeholder} onChange={(e) => { setValues((v) => ({ ...v, [r.id]: e.target.value })); edited(); }} style={{ minHeight: 120, fontFamily: "monospace", fontSize: 12 }} />
-                          : <TextInput value={values[r.id] ?? ""} placeholder={r.input.placeholder} onChange={(e) => { setValues((v) => ({ ...v, [r.id]: e.target.value })); edited(); }} />}
+                          ? <TextArea value={value} placeholder={r.input.placeholder} onChange={(e) => { setValues((v) => ({ ...v, [r.id]: e.target.value })); setSuggestState((x) => ({ ...x, [r.id]: {} })); edited(); }} style={r.ai ? { minHeight: 72 } : { minHeight: 120, fontFamily: "monospace", fontSize: 12 }} />
+                          : <TextInput value={value} placeholder={r.input.placeholder} onChange={(e) => { setValues((v) => ({ ...v, [r.id]: e.target.value })); setSuggestState((x) => ({ ...x, [r.id]: {} })); edited(); }} />}
+                        {r.ai && (
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <Button size="sm" variant="outline" icon={sg.loading ? Loader2 : Wand2} disabled={sg.loading} onClick={() => suggestFor([r])}>{sg.loading ? "Writing…" : value ? "Suggest another" : "Suggest with AI"}</Button>
+                            {sg.ai && <Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>AI suggestion — review before use</Badge>}
+                            <span className="text-[11px] vr-mono" style={{ color: check?.warnings.some((w) => ["TOO_LONG", "TOO_SHORT"].includes(w.code)) ? BRAND.amber : BRAND.inkSoft }}>{check?.length ?? 0} characters</span>
+                          </div>
+                        )}
+                        {sg.error && <p className="text-xs" style={{ color: BRAND.red }}>{sg.error}</p>}
+                        {check?.warnings.filter((w) => w.code !== "EMPTY").map((w) => <p key={w.code} className="text-xs flex items-start gap-1.5" style={{ color: BRAND.amber }}><AlertTriangle size={12} className="mt-0.5 shrink-0" /> {w.message}</p>)}
                       </div>
                     )}
                     {st && <p className="text-xs mt-1.5 pl-6 break-words" style={{ color: st.ok ? BRAND.inkSoft : BRAND.red }}>{st.ok ? `${st.file}${st.note ? ` — ${st.note}` : ""}` : st.message}</p>}

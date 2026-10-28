@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { proposeFixes, fixTypeOf, rowReady, rowToFix, MAX_ROWS } from "../lib/fixPlanner.js";
+import { proposeFixes, fixTypeOf, rowReady, rowToFix, MAX_ROWS, suggestionItem, avoidList, pagePlainText } from "../lib/fixPlanner.js";
 import { validateFix } from "../lib/htmlFixes.js";
 
 const A = "https://a.com";
@@ -88,4 +88,38 @@ test("rows are capped and row ids stay unique", () => {
   const urls = Array.from({ length: 55 }, (_, i) => `${A}/p${i}`);
   const p = proposeFixes(issue({ title: "Missing meta description", urls }), { pages: [] });
   assert.equal(p.rows.length, MAX_ROWS); assert.equal(p.truncated, true); assert.equal(new Set(p.rows.map((r) => r.id)).size, MAX_ROWS); assert.match(p.note, /first 40 of 55/);
+});
+
+test("too-long and duplicate titles/descriptions are fixable; expected is the current value so the file is verified against the live page", () => {
+  const c = { pages: [
+    { url: `${A}/a`, title: "A very long title that keeps going well past the sixty character limit for search", metaDescription: "Shared description", h1Text: "A", h2Texts: ["Sub"], fullText: "alpha beta gamma" },
+    { url: `${A}/b`, title: "Shared title", metaDescription: "Shared description", h1Text: "B" }, { url: `${A}/c`, title: "Shared title", metaDescription: "x".repeat(200) },
+  ] };
+  assert.equal(fixTypeOf(issue({ title: "Title tag is 81 characters (recommended under 60)" })), "title_long");
+  assert.equal(fixTypeOf(issue({ title: "Meta description is 200 characters (recommended under 160)" })), "description_long");
+  assert.equal(fixTypeOf(issue({ id: "site_duptitle_0", title: 'Duplicate page title used on 2 pages: "Shared title"' })), "dup_titles");
+  assert.equal(fixTypeOf(issue({ id: "site_dupmeta_3", title: "Duplicate meta description used on 2 pages" })), "dup_descriptions");
+
+  const long = proposeFixes(issue({ title: "Title tag is 81 characters (recommended under 60)", urls: [`${A}/a`] }), c);
+  assert.equal(long.rows[0].params.expected, c.pages[0].title); assert.equal(long.rows[0].value, c.pages[0].title); assert.equal(long.rows[0].ai, "title"); assert.match(long.rows[0].detail, /81|characters/);
+  const dup = proposeFixes(issue({ id: "site_duptitle_0", title: 'Duplicate page title used on 2 pages: "Shared title"', urls: [`${A}/b`, `${A}/c`] }), c);
+  assert.deepEqual(dup.rows.map((r) => r.value), ["", ""]); assert.deepEqual(dup.rows.map((r) => r.params.expected), ["Shared title", "Shared title"]); assert.equal(new Set(dup.rows.map((r) => r.id)).size, 2);
+  const dd = proposeFixes(issue({ id: "site_dupmeta_0", title: "Duplicate meta description used on 2 pages", urls: [`${A}/a`, `${A}/b`] }), c);
+  assert.equal(dd.rows[0].kind, "set_meta_description"); assert.equal(dd.rows[0].ai, "description"); assert.equal(dd.rows[0].params.expected, "Shared description");
+  const fix = rowToFix(dup.rows[0], "A unique title for B");
+  assert.equal(validateFix(fix, site).ok, true); assert.equal(fix.expected, "Shared title");
+  // missing ones are AI-capable too
+  assert.equal(proposeFixes(issue({ title: "Missing meta description", urls: [`${A}/b`] }), c).rows[0].ai, "description");
+  assert.equal(proposeFixes(issue({ title: "Missing page title", urls: [`${A}/b`] }), c).rows[0].ai, "title");
+  assert.equal(proposeFixes(issue({ title: "Missing canonical tag", urls: [`${A}/b`] }), c).rows[0].ai, undefined);
+});
+
+test("suggestion helpers: model input, avoid list and page text", () => {
+  const c = { pages: [{ url: `${A}/a`, title: "T", metaDescription: "D", h1Text: "H", h2Texts: ["1", "2", "3", "4", "5", "6", "7"], fullText: "z".repeat(5000) }, { url: `${A}/b`, title: "T", metaDescription: "" }] };
+  const r = proposeFixes(issue({ title: "Missing page title", urls: [`${A}/a`] }), { pages: [{ ...c.pages[0], title: "" }] }).rows[0];
+  const it = suggestionItem(r, c);
+  assert.equal(it.kind, "title"); assert.equal(it.url, `${A}/a`); assert.equal(it.h2Texts.length, 6); assert.equal(it.snippet.length, 1200); assert.equal(it.id, r.id);
+  assert.deepEqual(avoidList(c), ["T", "D"]); assert.equal(avoidList({ pages: Array.from({ length: 100 }, (_, i) => ({ title: `t${i}` })) }, 80).length, 80);
+  assert.ok(pagePlainText(r, c).length <= 3000 + 200); assert.match(pagePlainText(r, c), /^T D H 1 2/);
+  assert.equal(suggestionItem(r, { pages: [] }).title, ""); // unknown page -> empty, never throws
 });
