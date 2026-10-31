@@ -190,3 +190,36 @@ test("hostile or malformed data never throws", () => {
   assert.doesNotThrow(() => buildOpportunityQueue(b, { country: "Kenya" }));
   assert.equal(buildOpportunityQueue(b).find((o) => o.title === "ok").priority, "Medium"); // unknown priority -> Medium
 });
+
+const gscReport = (o = {}) => ({
+  fetchedAt: "2026-10-28T10:00:00.000Z", days: 28, range: { startDate: "2026-09-28", endDate: "2026-10-25" }, previousRange: { startDate: "2026-08-31", endDate: "2026-09-27" },
+  totals: { clicks: 500, impressions: 10000, ctr: 0.05, position: 8 }, previousTotals: { clicks: 500, impressions: 10000, ctr: 0.05, position: 8 },
+  queries: [], previousPages: [], truncated: { queries: false, pages: false, queryPages: false },
+  pages: [{ page: `${A}/shoes`, clicks: 20, impressions: 2000, ctr: 0.01, position: 4.2 }],
+  queryPages: [{ query: "red shoes", page: `${A}/shoes`, clicks: 10, impressions: 900, ctr: 0.011, position: 4 }], ...o,
+});
+const NOW = Date.parse("2026-10-30T00:00:00Z");
+
+test("search data joins the queue with an estimate-labelled bonus and a pull-request hook", () => {
+  const q = buildOpportunityQueue(bundle({ gscReport: gscReport() }), { nowMs: NOW });
+  const o = q.find((x) => x.id === "gsc:lowctr:a-com-shoes");
+  assert.equal(o.type, "search"); assert.equal(o.state, "new"); assert.ok(o.score > 50 && o.score <= 100);
+  assert.match(o.explanation, /Medium confidence/); assert.match(o.explanation, /\+ \d+ for ~\d+ extra clicks per 28 days \(estimate\)/);
+  assert.equal(o.prIssue.id, "gsc_lowctr"); assert.deepEqual(o.prIssue.urls, [`${A}/shoes`]);
+  assert.equal(summarizeQueue(q).byType.search, 1);
+});
+
+test("search data older than two weeks is kept but demoted and labelled; fresh data isn't", () => {
+  const fresh = buildOpportunityQueue(bundle({ gscReport: gscReport() }), { nowMs: NOW }).find((x) => x.type === "search");
+  const old = buildOpportunityQueue(bundle({ gscReport: gscReport({ fetchedAt: "2026-09-01T00:00:00.000Z" }) }), { nowMs: NOW }).find((x) => x.type === "search");
+  assert.equal(fresh.confidence, "Medium"); assert.equal(fresh.note, undefined);
+  assert.equal(old.confidence, "Low"); assert.match(old.note, /Search data is 59 days old/); assert.ok(old.score < fresh.score);
+  assert.deepEqual(buildOpportunityQueue(bundle({ gscReport: null }), { nowMs: NOW }), []);
+});
+
+test("search opportunities map onto the Action Center like every other source", () => {
+  const actions = [{ id: "a", status: "PR Open", detail: { sourceId: "gsc:lowctr:a-com-shoes" } }];
+  assert.equal(buildOpportunityQueue(bundle({ gscReport: gscReport(), actions }), { nowMs: NOW }).find((x) => x.type === "search").state, "in_actions");
+  actions[0].status = "Applied";
+  assert.equal(buildOpportunityQueue(bundle({ gscReport: gscReport(), actions }), { nowMs: NOW }).find((x) => x.type === "search").state, "done");
+});

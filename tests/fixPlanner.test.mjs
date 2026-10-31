@@ -123,3 +123,19 @@ test("suggestion helpers: model input, avoid list and page text", () => {
   assert.ok(pagePlainText(r, c).length <= 3000 + 200); assert.match(pagePlainText(r, c), /^T D H 1 2/);
   assert.equal(suggestionItem(r, { pages: [] }).title, ""); // unknown page -> empty, never throws
 });
+
+test("low CTR from Search Console: title and description rows for the page, carrying the queries it ranks for", () => {
+  const c = { pages: [{ url: `${A}/shoes`, title: "Shoes", metaDescription: "We sell shoes.", h1Text: "Red shoes", fullText: "red shoes for sale" }] };
+  const iss = { id: "gsc_lowctr", title: "Low click-through rate", urls: [`${A}/shoes`], queries: ["red shoes", "buy shoes", 42, null] };
+  assert.equal(fixTypeOf(iss), "low_ctr");
+  const p = proposeFixes(iss, c);
+  assert.deepEqual(p.rows.map((r) => r.kind), ["set_title", "set_meta_description"]); assert.deepEqual(p.rows.map((r) => r.ai), ["title", "description"]);
+  assert.deepEqual(p.rows[0].params, { expected: "Shoes" }); assert.deepEqual(p.rows[1].params, { expected: "We sell shoes." });
+  assert.deepEqual(p.rows[0].queries, ["red shoes", "buy shoes"]); assert.match(p.note, /red shoes, buy shoes/);
+  assert.equal(new Set(p.rows.map((r) => r.id)).size, 2);
+  const item = suggestionItem(p.rows[0], c);
+  assert.deepEqual(item.queries, ["red shoes", "buy shoes"]); assert.match(pagePlainText(p.rows[0], c), /buy shoes/);
+  assert.equal("queries" in suggestionItem({ ...p.rows[0], queries: [] }, c), false);
+  assert.equal(validateFix(rowToFix(p.rows[0], "Red Shoes for Sale"), site).ok, true); // queries never leak into the fix sent to the API
+  assert.equal("queries" in rowToFix(p.rows[0], "x"), false);
+});

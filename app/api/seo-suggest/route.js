@@ -26,6 +26,7 @@ export async function POST(req) {
     items.push({
       id: str(it.id, 80), kind: it.kind, url: str(it.url, 2048), title: str(it.title, 300), metaDescription: str(it.metaDescription, 600),
       h1Text: str(it.h1Text, 300), h2Texts: Array.isArray(it.h2Texts) ? it.h2Texts.slice(0, 6).map((h) => str(h, 150)) : [], snippet: str(it.snippet, 2000),
+      queries: Array.isArray(it.queries) ? it.queries.slice(0, 8).map((q) => str(q, 100)).filter(Boolean) : [],
     });
   }
   const avoid = Array.isArray(body.avoid) ? body.avoid.slice(0, 80).map((a) => str(a, 300)).filter(Boolean) : [];

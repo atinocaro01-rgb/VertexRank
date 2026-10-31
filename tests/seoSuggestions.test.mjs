@@ -86,3 +86,11 @@ test("the route validates input, uses the guard and the market validator, and ne
   assert.match(src, /guardJson\(req, "aiLight"\)/); assert.match(src, /normalizeCountry\(body\.country\)/); assert.match(src, /generateSuggestions\(/);
   assert.match(src, /MAX_ITEMS_PER_CALL/); assert.ok(!/Response\.json\(\{\s*(raw|content)/.test(src));
 });
+
+test("Search Console queries reach the prompt and count as grounded words", async () => {
+  const { prompt } = buildSuggestPrompt({ items: [item({ queries: ["emergency boiler repair", "boiler engineer nairobi"] })], country: "Kenya", domain: "acme.co.ke" });
+  assert.match(prompt, /Search queries this page already appears for \(from Search Console/); assert.match(prompt, /"emergency boiler repair", "boiler engineer nairobi"/);
+  assert.ok(!/Search queries this page/.test(buildSuggestPrompt({ items: [item()], country: "Kenya", domain: "a.com" }).prompt));
+  const r = await generateSuggestions({ items: [item({ id: "q", snippet: "We fix things.", queries: ["emergency boiler repair"] })], country: "Kenya", domain: "acme.co.ke", callModel: async () => ({ suggestions: [{ id: "q", text: "Emergency Boiler Repair in Nairobi" }] }) });
+  assert.ok(!r.suggestions[0].warnings.some((w) => w.code === "UNGROUNDED"), JSON.stringify(r.suggestions[0].warnings));
+});

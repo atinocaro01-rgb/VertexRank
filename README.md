@@ -171,3 +171,30 @@ In the pull-request dialog, title and meta-description rows have a **Suggest wit
 - **Honest quality checks, live as you type:** character count (titles about 50-60, descriptions about 130-160), too long or short, ALL CAPS, unchanged from the current value, and duplicates of other pages' titles or descriptions on the site (including the other suggestions in the same pull request).
 - **Market-aware.** The website's selected country is applied (language, spelling, currency) the same way as the other AI analyses.
 - It uses the same rate limits as the other AI features.
+
+## Search Console (real search data, free)
+
+VertexRank can read your real search performance from Google Search Console: clicks, impressions, click-through rate (CTR) and average position, by query and page. It uses a Google Cloud **service account** (read-only), so there is no OAuth screen, no tokens to store and nothing to encrypt. The Search Console API itself is free.
+
+**One-time setup (about 10 minutes)**
+1. In Google Cloud Console, create or pick a project and enable the **Google Search Console API**.
+2. Create a **service account** (IAM & Admin → Service Accounts) and add a **JSON key**. The key file downloads once, so keep it somewhere safe.
+3. Set the whole JSON as the `GOOGLE_SERVICE_ACCOUNT_JSON` environment variable on your host (raw JSON or its base64) and redeploy. Never commit it.
+4. In Search Console, open each property → **Settings → Users and permissions → Add user**, and add the service account's e-mail (it ends in `.iam.gserviceaccount.com`) with **Restricted** permission. Do this once per property.
+5. In VertexRank: **Websites** → **Search Console: Connect** under a website (or the **Search data** page), choose the property (a suggestion is highlighted), then **Load report**.
+
+**What you get**
+- **Search data page:** totals with change versus the previous equal period, daily clicks and impressions, top queries, top pages, devices and countries, a Markdown export, and a note of what the data can't tell you. Reports are cached for 10 minutes; "Refresh" fetches fresh numbers.
+- **New opportunities in the Opportunity Queue** (type "Search data"), computed from your own numbers, no AI involved:
+  - *Low click-through rate:* pages that rank (position 20 or better) with a CTR well below what your own queries typically get at that position. The estimate of extra clicks is labelled as an estimate. A **Create pull request** button opens the GitHub flow with AI title/description suggestions that already know which queries the page ranks for.
+  - *Striking distance:* queries stuck at positions 8-20 with real demand, with the page that ranks for them.
+  - *Competing pages:* several of your pages appearing for the same queries.
+  - *Declining pages:* pages that lost 30% or more of their clicks versus the previous period (with a seasonality caveat), and a site-wide trend alert.
+  - *Crawled pages with no impressions:* indexable pages Search Console has shown no impressions for (it can mean they aren't indexed).
+- Thresholds scale with the report length (7, 28, 90 or 180 days), and a report older than two weeks is kept but demoted and labelled.
+
+**Honesty and limits**
+- Position is Google's **average** position over the period, not a live rank; the last three days are skipped because that data is incomplete; Google omits anonymised and very rare queries, so rows won't add up to the totals; search volume and keyword difficulty are not part of Search Console.
+- A domain property (`sc-domain:`) includes all subdomains; opportunities only consider pages on the website's own host.
+- A report is stored in your browser with the website (roughly 100 KB) and included in backups. Google keeps about 16 months of history, so you can always reload past periods.
+- The routes sit behind the password gate and rate limits; the service account key is only read on the server and is never returned, logged or included in an error. Code: `lib/gscAuth.js`, `lib/gscClient.js`, `lib/gscReport.js`, `lib/gscAnalysis.js`, `app/api/gsc/*`.

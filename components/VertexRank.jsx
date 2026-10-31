@@ -9,7 +9,9 @@ import {
   SlidersHorizontal, ArrowUpDown, Info, Sparkles, ChevronUp, Building2, Newspaper,
   Podcast, Handshake, BookOpen, MapPin, Bot, Target, ShieldCheck, ListPlus, Copy, Download, Upload, GitPullRequest, Eye
 } from "lucide-react";
-import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
+import { ResponsiveContainer, BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
+import { DataLabel } from "./DataLabel";
+import { suggestProperty, ALLOWED_DAYS } from "../lib/gscReport";
 import {
   GEO_FACTORS, AEO_SIGNAL_LABELS, GEO_AUTHORITY_LABELS, PAGE_EXPORTERS, exportFullReport, buildUnifiedRecs,
   formatRecommendation, formatWeakPage, formatCompetitor, formatContentIdea, formatAction,
@@ -237,6 +239,7 @@ function actionFromOpportunity(o, country) {
 const NAV = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { id: "opportunities", label: "Opportunities", icon: Target },
+  { id: "search", label: "Search data", icon: Search },
   { id: "scanner", label: "Websites", icon: Globe2 },
   { id: "audit", label: "SEO Audit", icon: ListChecks },
   { id: "actions", label: "Action Center", icon: ClipboardCheck },
@@ -300,7 +303,9 @@ function emptyBundle() {
     actions: [],
     // Site-wide (full-crawl) intelligence — all null/empty until the automatic
     // full-site crawl completes, then as each AI module below is run.
-    siteCrawl: null, // raw multi-page crawl (lib/siteCrawler.js output) — the shared input every module below reads from
+    siteCrawl: null,
+    gscReport: null, // latest Search Console report for this website (lib/gscReport.js)
+     // raw multi-page crawl (lib/siteCrawler.js output) — the shared input every module below reads from
     siteKeywordClusters: null,
     siteAeoAnalysis: null,
     siteGeoAnalysis: null,
@@ -617,7 +622,7 @@ function SortHeader({ label, sortKey, sort, setSort }) {
  *  AEO, GEO, Simulator, or the unified engine) with a one-click path into
  *  the Action Center. Every recommendation carries a Source label so it's
  *  always clear whether it's real crawl data or VertexRank AI reasoning. */
-function RecommendationCard({ title, why, module, evidence, recommendedAction, priority, confidence, source, actionType, onAdd, added, addedLabel = "Added", meta, note }) {
+function RecommendationCard({ title, why, module, evidence, recommendedAction, priority, confidence, source, actionType, onAdd, added, addedLabel = "Added", meta, note, actions, evidenceLabel = "EVIDENCE FROM CRAWL" }) {
   return (
     <div className="rounded-lg p-3.5" style={{ background: BRAND.canvas }}>
       <div className="flex items-start justify-between gap-2 mb-1.5">
@@ -633,7 +638,7 @@ function RecommendationCard({ title, why, module, evidence, recommendedAction, p
       {note && <p className="text-[11px] mb-1.5" style={{ color: BRAND.amber }}>{note}</p>}
       {evidence && (
         <div className="rounded p-2 mb-1.5" style={{ background: BRAND.surface, border: `1px solid ${BRAND.line}` }}>
-          <p className="text-[10px] font-semibold mb-0.5" style={{ color: BRAND.inkSoft }}>EVIDENCE FROM CRAWL</p>
+          <p className="text-[10px] font-semibold mb-0.5" style={{ color: BRAND.inkSoft }}>{evidenceLabel}</p>
           <p className="text-xs">{evidence}</p>
         </div>
       )}
@@ -648,9 +653,12 @@ function RecommendationCard({ title, why, module, evidence, recommendedAction, p
           {confidence && <span className="text-[10px]" style={{ color: BRAND.inkSoft }}>Confidence: {confidence}</span>}
           {source && <span className="text-[10px] rounded px-1.5 py-0.5" style={{ background: BRAND.primarySoft, color: BRAND.primary }}>{source}</span>}
         </div>
-        <Button size="sm" variant={added ? "outline" : "soft"} icon={added ? Check : ListPlus} disabled={added} onClick={onAdd}>
-          {added ? addedLabel : "Add to Action Center"}
-        </Button>
+        <div className="flex items-center gap-2 flex-wrap">
+          {actions}
+          <Button size="sm" variant={added ? "outline" : "soft"} icon={added ? Check : ListPlus} disabled={added} onClick={onAdd}>
+            {added ? addedLabel : "Add to Action Center"}
+          </Button>
+        </div>
       </div>
     </div>
   );
@@ -962,7 +970,7 @@ function Dashboard() {
   // reload once a website is saved.
   const country = normalizeCountry(websites.find((w) => w.id === currentWebsiteId)?.country);
   const queue = useMemo(() => buildOpportunityQueue(b, { country }),
-    [b.siteCrawl, b.siteKeywordClusters, b.siteAeoAnalysis, b.siteGeoAnalysis, b.aiVisibility, b.internalLinkRecs, b.internalLinks, b.competitors, b.contentIdeas, b.actions, country]);
+    [b.siteCrawl, b.gscReport, b.siteKeywordClusters, b.siteAeoAnalysis, b.siteGeoAnalysis, b.aiVisibility, b.internalLinkRecs, b.internalLinks, b.competitors, b.contentIdeas, b.actions, country]);
   const unifiedRecs = useMemo(() => filterQueue(queue, { states: ["new", "in_actions"] }).slice(0, 8), [queue]);
 
   if (!currentWebsiteId) {
@@ -1120,6 +1128,7 @@ function Dashboard() {
                 title={rec.title} module={rec.module} evidence={rec.evidence}
                 recommendedAction={rec.recommendedAction} priority={rec.priority} confidence={rec.confidence}
                 source={rec.source} note={rec.note} added={isOpportunityAdded(b.actions, rec)} onAdd={() => addUnifiedToActions(rec)}
+                evidenceLabel={rec.type === "search" ? "OBSERVED IN SEARCH CONSOLE (ESTIMATES ARE LABELLED)" : undefined}
                 meta={<><Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{OPPORTUNITY_TYPES[rec.type].label}</Badge><span className="text-[10px] vr-mono" title={rec.explanation} style={{ color: BRAND.inkSoft }}>Score {rec.score}</span></>} />
             ))}
           </div>
@@ -1214,6 +1223,7 @@ function ScannerView() {
   const { websites, setWebsites, bundles, setBundles, currentWebsiteId, setCurrentWebsiteId, toast } = useApp();
   const [modal, setModal] = useState(null); // {mode:'add'|'edit', website}
   const [githubFor, setGithubFor] = useState(null); // the website whose GitHub repository is being connected
+  const [gscFor, setGscFor] = useState(null); // the website whose Search Console property is being connected
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [form, setForm] = useState({ url: "", country: DEFAULT_COUNTRY });
   const [crawlingId, setCrawlingId] = useState(null);
@@ -1237,7 +1247,12 @@ function ScannerView() {
       const newUrl = form.url.trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "");
       const urlChanged = normalizeSiteKey(newUrl) !== normalizeSiteKey(modal.website.url);
       const countryChanged = form.country !== modal.website.country;
-      setWebsites((ws) => ws.map((w) => (w.id === id ? { ...w, url: newUrl, country: form.country, ...(urlChanged ? { scores: null } : {}) } : w)));
+      setWebsites((ws) => ws.map((w) => {
+        if (w.id !== id) return w;
+        const updated = { ...w, url: newUrl, country: form.country, ...(urlChanged ? { scores: null } : {}) };
+        if (urlChanged) delete updated.gsc; // a Search Console property belongs to the old address; reconnect if it still applies
+        return updated;
+      }));
       if (urlChanged) {
         // Everything computed from the old URL describes a different site now. Cancel anything in flight,
         // clear the crawl and its analyses (the user's own keywords/actions/ideas are kept) and crawl again.
@@ -1464,6 +1479,13 @@ function ScannerView() {
                     <button className="vr-focus underline font-medium" style={{ color: BRAND.primary }} onClick={() => setGithubFor(w)}>{w.github ? "Settings" : "Connect"}</button>
                   </div>
                 )}
+                {crawlingId !== w.id && (
+                  <div className="mt-1 flex items-center gap-2 flex-wrap text-[11px]" style={{ color: BRAND.inkSoft }}>
+                    <Search size={12} />
+                    <span>{w.gsc ? `Search Console: ${w.gsc.siteUrl}` : "Search Console not connected"}</span>
+                    <button className="vr-focus underline font-medium" style={{ color: BRAND.primary }} onClick={() => setGscFor(w)}>{w.gsc ? "Settings" : "Connect"}</button>
+                  </div>
+                )}
                 {!bundles[w.id]?.siteCrawl && crawlingId !== w.id && (
                   <p className="text-[11px] mt-1.5" style={{ color: BRAND.inkSoft }}>Crawls the whole site — unlocks the Dashboard, Site-wide Audit, Competitor comparison, AEO, GEO, keyword clustering, internal-link recs, and backlink discovery.</p>
                 )}
@@ -1491,6 +1513,15 @@ function ScannerView() {
         </Field>
       </Modal>
 
+      {gscFor && (
+        <GscConnectModal website={gscFor} onClose={() => setGscFor(null)}
+          onSave={(gsc) => {
+            setWebsites((ws) => ws.map((x) => { if (x.id !== gscFor.id) return x; const { gsc: _old, ...rest } = x; return gsc ? { ...rest, gsc } : rest; }));
+            setBundles((prev) => (prev[gscFor.id]?.gscReport && prev[gscFor.id].gscReport.property !== gsc?.siteUrl ? { ...prev, [gscFor.id]: { ...prev[gscFor.id], gscReport: null } } : prev));
+            toast(gsc ? "Search Console connected" : "Search Console disconnected");
+            setGscFor(null);
+          }} />
+      )}
       {githubFor && (
         <GithubConnectModal website={githubFor} onClose={() => setGithubFor(null)}
           onSave={(github) => {
@@ -1525,9 +1556,11 @@ function OpportunitiesView() {
   const [status, setStatus] = useState("open");
   const [search, setSearch] = useState("");
   const [shown, setShown] = useState(30);
+  const [prIssue, setPrIssue] = useState(null);
+  const website = websites.find((w) => w.id === currentWebsiteId);
 
   const queue = useMemo(() => buildOpportunityQueue(b, { country }),
-    [b.siteCrawl, b.siteKeywordClusters, b.siteAeoAnalysis, b.siteGeoAnalysis, b.aiVisibility, b.internalLinkRecs, b.internalLinks, b.competitors, b.contentIdeas, b.actions, country]);
+    [b.siteCrawl, b.gscReport, b.siteKeywordClusters, b.siteAeoAnalysis, b.siteGeoAnalysis, b.aiVisibility, b.internalLinkRecs, b.internalLinks, b.competitors, b.contentIdeas, b.actions, country]);
   const summary = useMemo(() => summarizeQueue(queue), [queue]);
   const states = { open: ["new"], in_actions: ["in_actions"], done: ["done", "rejected"], all: ["new", "in_actions", "done", "rejected"] }[status];
   const filtered = useMemo(
@@ -1601,7 +1634,10 @@ function OpportunitiesView() {
               title={o.title} module={o.module} evidence={o.evidence} recommendedAction={o.recommendedAction}
               priority={o.priority} confidence={o.confidence} source={o.source} note={o.note}
               added={o.state !== "new"} addedLabel={o.state === "done" ? "Done" : o.state === "rejected" ? "Rejected" : "In Action Center"}
-              onAdd={() => add(o)}
+              onAdd={() => add(o)} evidenceLabel={o.type === "search" ? "OBSERVED IN SEARCH CONSOLE (ESTIMATES ARE LABELLED)" : undefined}
+              actions={o.prIssue && fixTypeOf(o.prIssue) ? (website?.github
+                ? <Button size="sm" variant="soft" icon={GitPullRequest} onClick={() => setPrIssue(o.prIssue)} title="Rewrite the title and description with AI suggestions, then open a GitHub pull request">Create pull request</Button>
+                : <span className="text-[11px]" style={{ color: BRAND.inkSoft }}>Connect GitHub to fix via pull request</span>) : null}
               meta={<>
                 <Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{OPPORTUNITY_TYPES[o.type].label}</Badge>
                 <span className="text-[10px] vr-mono" title={o.explanation} style={{ color: BRAND.inkSoft }}>Score {o.score}</span>
@@ -1616,6 +1652,7 @@ function OpportunitiesView() {
           )}
         </div>
       )}
+      {prIssue && website?.github && <CreatePrModal issue={prIssue} website={website} crawl={b.siteCrawl} country={country} onClose={() => setPrIssue(null)} />}
     </div>
   );
 }
@@ -1871,6 +1908,243 @@ function CreatePrModal({ issue, website, crawl, country, onClose }) {
         </div>
       )}
     </Modal>
+  );
+}
+
+/** Connects a website to its Google Search Console property (read-only, through the server's service account). */
+function GscConnectModal({ website, onClose, onSave }) {
+  const [state, setState] = useState({ loading: true });
+  const [choice, setChoice] = useState(website.gsc?.siteUrl || "");
+  async function load() {
+    setState({ loading: true });
+    try {
+      const d = await postJson("/api/gsc/properties", {});
+      setState({ loading: false, ...d });
+      setChoice((c) => c || suggestProperty(d.properties, website.url) || "");
+    } catch (e) { setState({ loading: false, error: e.message || "Couldn't reach Search Console." }); }
+  }
+  useEffect(() => { load(); }, []);
+  const suggested = state.properties ? suggestProperty(state.properties, website.url) : null;
+
+  return (
+    <Modal open onClose={onClose} title={`Search Console for ${website.url}`} width={560}
+      footer={<>
+        {website.gsc && <Button variant="outline" onClick={() => onSave(null)}>Disconnect</Button>}
+        <Button variant="outline" onClick={onClose}>Cancel</Button>
+        <Button disabled={!choice} onClick={() => onSave({ siteUrl: choice })}>Save</Button>
+      </>}>
+      <div className="space-y-3 text-sm">
+        <p style={{ color: BRAND.inkSoft }}>Shows real clicks, impressions, click-through rate and average position from Google Search Console. Read-only: VertexRank can't change anything in your Search Console.</p>
+        {state.loading && <p className="flex items-center gap-2" style={{ color: BRAND.inkSoft }}><Loader2 size={14} className="vr-spin" /> Loading your properties…</p>}
+        {state.error && <p className="flex items-start gap-1.5" style={{ color: BRAND.red }}><AlertTriangle size={14} className="mt-0.5 shrink-0" /> {state.error}</p>}
+        {state.configured === false && (
+          <div className="rounded-lg p-3 space-y-1.5 text-xs" style={{ background: BRAND.canvas, color: BRAND.inkSoft }}>
+            <p className="font-semibold" style={{ color: BRAND.ink }}>One-time setup</p>
+            <ol className="list-decimal pl-4 space-y-1">
+              <li>In Google Cloud Console, create a project and enable the <b>Google Search Console API</b>.</li>
+              <li>Create a <b>service account</b> and download its <b>JSON key</b>.</li>
+              <li>Add the whole JSON as the <code>GOOGLE_SERVICE_ACCOUNT_JSON</code> environment variable on the server, then redeploy.</li>
+              <li>In Search Console, open each property → Settings → Users and permissions → add the service account's e-mail with <b>Restricted</b> permission.</li>
+            </ol>
+            <Button size="sm" variant="soft" icon={RefreshCw} onClick={load}>Check again</Button>
+          </div>
+        )}
+        {state.configured && state.properties?.length === 0 && (
+          <div className="rounded-lg p-3 space-y-1.5 text-xs" style={{ background: BRAND.amberSoft, color: BRAND.ink }}>
+            <p>The service account can't see any properties yet. In Search Console, open each property → Settings → Users and permissions → add this e-mail with <b>Restricted</b> permission:</p>
+            <p className="vr-mono break-all font-semibold">{state.serviceAccountEmail}</p>
+            <Button size="sm" variant="soft" icon={RefreshCw} onClick={load}>Check again</Button>
+          </div>
+        )}
+        {state.properties?.length > 0 && (
+          <div className="space-y-1.5">
+            <p className="text-xs font-semibold" style={{ color: BRAND.inkSoft }}>Choose this website's property</p>
+            {state.properties.map((p) => (
+              <label key={p.siteUrl} className="flex items-center gap-2 rounded-lg px-3 py-2 cursor-pointer" style={{ background: choice === p.siteUrl ? BRAND.primarySoft : BRAND.canvas }}>
+                <input type="radio" name="gsc-property" checked={choice === p.siteUrl} onChange={() => setChoice(p.siteUrl)} />
+                <span className="vr-mono text-xs break-all flex-1">{p.siteUrl}</span>
+                {p.siteUrl === suggested && <Badge color={{ fg: BRAND.visibility, bg: BRAND.visibilitySoft }}>Suggested</Badge>}
+              </label>
+            ))}
+            {choice.startsWith("sc-domain:") && <p className="text-[11px]" style={{ color: BRAND.inkSoft }}>A domain property includes every subdomain. Opportunities only consider pages on {website.url}.</p>}
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+function Stat({ label, value, delta, lowerIsBetter = false }) {
+  const good = delta === null || delta === undefined || delta === 0 ? null : (delta > 0) !== lowerIsBetter;
+  return (
+    <Card className="p-4">
+      <p className="text-xs" style={{ color: BRAND.inkSoft }}>{label}</p>
+      <p className="text-2xl font-semibold vr-display mt-1">{value}</p>
+      {delta !== null && delta !== undefined && (
+        <p className="text-xs mt-1 font-medium" style={{ color: good === null ? BRAND.inkSoft : good ? BRAND.visibility : BRAND.red }}>
+          {delta > 0 ? "▲" : delta < 0 ? "▼" : "•"} {typeof delta === "number" ? (Math.abs(delta) < 10 && label === "Average position" ? Math.abs(delta).toFixed(1) : `${Math.abs(Math.round(delta))}${label === "Average position" ? "" : "%"}`) : delta} <span style={{ color: BRAND.inkSoft, fontWeight: 400 }}>vs previous period</span>
+        </p>
+      )}
+    </Card>
+  );
+}
+
+/** Real search performance from Google Search Console for the selected website, plus the opportunities mined from it. */
+function SearchDataView() {
+  const { websites, setWebsites, bundle, currentWebsiteId, setBundles, toast, setView } = useApp();
+  const website = websites.find((w) => w.id === currentWebsiteId);
+  const b = bundle();
+  const report = b.gscReport;
+  const country = normalizeCountry(website?.country);
+  const [days, setDays] = useState(report?.days || 28);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [connect, setConnect] = useState(false);
+  const [queryRows, setQueryRows] = useState(15);
+  const [pageRows, setPageRows] = useState(15);
+  const property = website?.gsc?.siteUrl;
+  const opps = useMemo(
+    () => (report ? buildOpportunityQueue(b, { country }).filter((o) => o.type === "search").slice(0, 5) : []),
+    [b.gscReport, b.siteCrawl, b.actions, country]
+  );
+
+  async function load(refresh = false) {
+    if (!property) return;
+    const id = currentWebsiteId;
+    const ticket = tracker.beginAnalysis(id, "gscReport");
+    setLoading(true); setError("");
+    try {
+      const data = await postJson("/api/gsc/report", { siteUrl: property, days, refresh });
+      if (websiteStore.current.find((w) => w.id === id)?.gsc?.siteUrl !== property) return; // the property was changed while this ran
+      if (!analysisUsable(ticket, toast)) return;
+      setBundles((prev) => { const site = prev[id]; return site ? { ...prev, [id]: { ...site, gscReport: data.report } } : prev; });
+    } catch (e) { setError(e.message || "Couldn't load Search Console data."); } finally { setLoading(false); }
+  }
+
+  if (!currentWebsiteId) return <EmptyState icon={Globe2} title="Select a website" body="Choose a website from the top bar to see its search data." />;
+
+  const pctChange = (cur, prev) => (prev ? ((cur - prev) / prev) * 100 : null);
+  const t = report?.totals, pt = report?.previousTotals;
+  const pctStr = (n) => `${(n * 100).toFixed(1)}%`;
+  const table = (rows, keyName, label, limit, setLimit) => (
+    <Card className="p-4">
+      <h4 className="font-semibold vr-display text-sm mb-2">{label}</h4>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead><tr style={{ color: BRAND.inkSoft }} className="text-left"><th className="py-1 pr-2">{keyName === "query" ? "Query" : "Page"}</th><th className="py-1 px-2 text-right">Clicks</th><th className="py-1 px-2 text-right">Impr.</th><th className="py-1 px-2 text-right">CTR</th><th className="py-1 pl-2 text-right">Position</th></tr></thead>
+          <tbody>
+            {rows.slice(0, limit).map((r) => (
+              <tr key={r[keyName]} style={{ borderTop: `1px solid ${BRAND.line}` }}>
+                <td className="py-1.5 pr-2 break-all max-w-[320px]">{keyName === "page" ? (() => { try { const u = new URL(r.page); return (u.pathname + u.search) || "/"; } catch { return r.page; } })() : r[keyName]}</td>
+                <td className="py-1.5 px-2 text-right vr-mono">{r.clicks.toLocaleString("en-US")}</td><td className="py-1.5 px-2 text-right vr-mono">{r.impressions.toLocaleString("en-US")}</td>
+                <td className="py-1.5 px-2 text-right vr-mono">{pctStr(r.ctr)}</td><td className="py-1.5 pl-2 text-right vr-mono">{r.position.toFixed(1)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {rows.length > limit && <div className="mt-2"><Button size="sm" variant="outline" onClick={() => setLimit((n) => n + 25)}>Show more ({rows.length - limit} left)</Button></div>}
+    </Card>
+  );
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3 flex-wrap">
+          <div>
+            <div className="flex items-center gap-2"><Search size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">Search data</h3>
+              {report && <DataLabel kind="observed" title="Straight from Google Search Console, not estimated by AI">Google Search Console</DataLabel>}</div>
+            <p className="text-sm mt-1" style={{ color: BRAND.inkSoft }}>
+              {property ? <>Property <span className="vr-mono">{property}</span>{report ? <> · {report.range.startDate} to {report.range.endDate} · loaded {timeAgo(report.fetchedAt) || "recently"}</> : null}</> : "Real clicks, impressions, click-through rate and average position for this website."}
+            </p>
+          </div>
+          <div className="flex gap-2 flex-wrap items-center">
+            {property && (<>
+              <div className="w-36"><Select value={days} onChange={(e) => setDays(Number(e.target.value))}>{ALLOWED_DAYS.map((d) => <option key={d} value={d}>Last {d} days</option>)}</Select></div>
+              <Button size="sm" icon={loading ? Loader2 : RefreshCw} disabled={loading} onClick={() => load(true)}>{report ? "Refresh" : "Load report"}</Button>
+              {report && <CopyButton label="Copy" title="Copy this report as Markdown" getText={() => PAGE_EXPORTERS.search(website, b)} />}
+            </>)}
+            <Button size="sm" variant="outline" onClick={() => setConnect(true)}>{property ? "Change property" : "Connect Search Console"}</Button>
+          </div>
+        </div>
+        {error && <p className="flex items-start gap-1.5 text-sm mt-3" style={{ color: BRAND.red }}><AlertTriangle size={14} className="mt-0.5 shrink-0" /> {error}</p>}
+      </Card>
+
+      {!property && <Card><EmptyState icon={Search} title="Connect Search Console" body="Link this website to its Search Console property to see what people search for, which pages get clicks, and where the biggest opportunities are. It's free and read-only." /></Card>}
+      {property && !report && !loading && <Card><EmptyState icon={Search} title="No report loaded yet" body="Click “Load report” to fetch the latest data from Google." /></Card>}
+
+      {report && (
+        <>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <Stat label="Clicks" value={t.clicks.toLocaleString("en-US")} delta={pctChange(t.clicks, pt.clicks)} />
+            <Stat label="Impressions" value={t.impressions.toLocaleString("en-US")} delta={pctChange(t.impressions, pt.impressions)} />
+            <Stat label="CTR" value={pctStr(t.ctr)} delta={pctChange(t.ctr, pt.ctr)} />
+            <Stat label="Average position" value={t.position.toFixed(1)} delta={pt.position ? t.position - pt.position : null} lowerIsBetter />
+          </div>
+
+          {report.daily.length > 1 && (
+            <div className="grid md:grid-cols-2 gap-3">
+              {[["clicks", "Clicks per day", BRAND.primary], ["impressions", "Impressions per day", BRAND.visibility]].map(([key, label, color]) => (
+                <Card key={key} className="p-4">
+                  <h4 className="font-semibold vr-display text-sm mb-2">{label}</h4>
+                  <ResponsiveContainer width="100%" height={170}>
+                    <LineChart data={report.daily}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={BRAND.line} />
+                      <XAxis dataKey="date" tick={{ fontSize: 10 }} tickFormatter={(d) => d.slice(5)} minTickGap={24} />
+                      <YAxis tick={{ fontSize: 10 }} width={40} />
+                      <Tooltip />
+                      <Line type="monotone" dataKey={key} stroke={color} dot={false} strokeWidth={2} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </Card>
+              ))}
+            </div>
+          )}
+
+          {opps.length > 0 && (
+            <Card className="p-4">
+              <div className="flex items-center justify-between gap-2 flex-wrap mb-2">
+                <h4 className="font-semibold vr-display text-sm">Opportunities found in this data</h4>
+                <Button size="sm" variant="outline" onClick={() => setView("opportunities")}>Open the Opportunity Queue</Button>
+              </div>
+              <ul className="space-y-1.5 text-sm">
+                {opps.map((o) => <li key={o.id} className="flex items-start gap-2"><PriorityBadge priority={o.priority} /><span>{o.title}</span></li>)}
+              </ul>
+              <p className="text-[11px] mt-2" style={{ color: BRAND.inkSoft }}>Extra-click figures are estimates based on typical CTR at each position; the metrics themselves are observed.</p>
+            </Card>
+          )}
+
+          <div className="grid lg:grid-cols-2 gap-3">
+            {table(report.queries, "query", `Top queries${report.truncated?.queries ? " (top " + report.queries.length + ")" : ""}`, queryRows, setQueryRows)}
+            {table(report.pages, "page", `Top pages${report.truncated?.pages ? " (top " + report.pages.length + ")" : ""}`, pageRows, setPageRows)}
+          </div>
+
+          {(report.devices?.length > 0 || report.countries?.length > 0) && (
+            <div className="grid md:grid-cols-2 gap-3">
+              {[["Devices", report.devices, "device"], ["Countries", report.countries, "country"]].map(([label, rows, key]) => rows?.length > 0 && (
+                <Card key={label} className="p-4"><h4 className="font-semibold vr-display text-sm mb-2">{label}</h4>
+                  <ul className="text-xs space-y-1">{rows.map((r) => <li key={r[key]} className="flex justify-between"><span className="uppercase">{r[key]}</span><span className="vr-mono">{r.clicks.toLocaleString("en-US")} clicks · {r.impressions.toLocaleString("en-US")} impr.</span></li>)}</ul></Card>
+              ))}
+            </div>
+          )}
+
+          <Card className="p-4">
+            <p className="text-xs font-semibold mb-1" style={{ color: BRAND.inkSoft }}>What this data can and can't tell you</p>
+            <ul className="list-disc pl-4 text-xs space-y-0.5" style={{ color: BRAND.inkSoft }}>{report.limitations.map((l, i) => <li key={i}>{l}</li>)}</ul>
+          </Card>
+        </>
+      )}
+
+      {connect && (
+        <GscConnectModal website={website} onClose={() => setConnect(false)}
+          onSave={(gsc) => {
+            setWebsites((ws) => ws.map((x) => { if (x.id !== website.id) return x; const { gsc: _old, ...rest } = x; return gsc ? { ...rest, gsc } : rest; }));
+            if (!gsc || gsc.siteUrl !== report?.property) setBundles((prev) => (prev[website.id]?.gscReport ? { ...prev, [website.id]: { ...prev[website.id], gscReport: null } } : prev));
+            toast(gsc ? "Search Console connected" : "Search Console disconnected");
+            setConnect(false);
+          }} />
+      )}
+    </div>
   );
 }
 
@@ -4126,7 +4400,7 @@ function VertexRankApp() {
   const ctx = { websites, setWebsites, bundles, setBundles, bundle, currentWebsiteId, setCurrentWebsiteId, toast, toasts, addAction, setScore, clearAllData, exportWorkspace, importWorkspace, lastBackupAt, view, setView };
 
   const views = {
-    dashboard: Dashboard, opportunities: OpportunitiesView, scanner: ScannerView, audit: AuditView, actions: ActionCenter, keywords: KeywordsView,
+    dashboard: Dashboard, opportunities: OpportunitiesView, search: SearchDataView, scanner: ScannerView, audit: AuditView, actions: ActionCenter, keywords: KeywordsView,
     aeo: AeoView, geo: GeoView, competitors: CompetitorsView, content: ContentPlannerView, links: InternalLinksView, backlinks: BacklinksView,
   };
   const ViewComp = views[view] || Dashboard;
