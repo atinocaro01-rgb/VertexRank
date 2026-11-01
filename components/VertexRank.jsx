@@ -1708,7 +1708,7 @@ function GithubConnectModal({ website, onClose, onSave }) {
       <div className="space-y-3 text-sm">
         <p style={{ color: BRAND.inkSoft }}>
           VertexRank can open a <b>pull request</b> with SEO fixes for this site. It never changes your main branch, and it first checks that the repository really is a plain-HTML site.
-          Requires a <code>GITHUB_TOKEN</code> environment variable on the server (fine-grained token: Contents and Pull requests, read &amp; write).
+          Needs a fine-grained token (Contents and Pull requests, read &amp; write) for this repository's owner, stored as <code>GITHUB_TOKEN_&lt;OWNER&gt;</code> on the server (or <code>GITHUB_TOKEN</code> as a default).
         </p>
         <Field label="Repository (owner/repo or GitHub URL)"><TextInput value={repoUrl} onChange={(e) => setRepoUrl(e.target.value)} placeholder="acme/website" /></Field>
         <Field label="Branch (leave empty for the default branch)"><TextInput value={branch} onChange={(e) => setBranch(e.target.value)} placeholder="main" /></Field>
@@ -1721,6 +1721,7 @@ function GithubConnectModal({ website, onClose, onSave }) {
               <Badge color={info.analysis.allowed ? { fg: BRAND.visibility, bg: BRAND.visibilitySoft } : { fg: BRAND.red, bg: BRAND.redSoft }}>{verdictLabel[info.analysis.verdict] || info.analysis.verdict}</Badge>
               <span className="text-xs" style={{ color: BRAND.inkSoft }}>{info.repo.owner}/{info.repo.name} · branch {info.repo.branch} · {info.analysis.htmlCount} HTML file{info.analysis.htmlCount === 1 ? "" : "s"}</span>
             </div>
+            {info.tokenVariable && <p className="text-[11px]" style={{ color: BRAND.inkSoft }}>Using the token from <code>{info.tokenVariable}</code>.</p>}
             <ul className="text-xs list-disc pl-4 space-y-0.5" style={{ color: BRAND.inkSoft }}>{info.analysis.reasons.map((r, i) => <li key={i}>{r}</li>)}</ul>
             {!info.analysis.allowed && info.analysis.advice && <p className="text-xs" style={{ color: BRAND.red }}>{info.analysis.advice}</p>}
             {info.analysis.warnings.map((w, i) => <p key={i} className="text-xs flex items-start gap-1.5" style={{ color: BRAND.amber }}><AlertTriangle size={12} className="mt-0.5 shrink-0" /> {w}</p>)}

@@ -13,7 +13,7 @@ export async function POST(req) {
   const number = guard.body.number;
   if (!Number.isInteger(number) || number < 1) return Response.json({ error: "A pull request number is required." }, { status: 400 });
   try {
-    const pr = await clientFromEnv().getPull(target.owner, target.repo, number);
+    const pr = await clientFromEnv(target.owner).getPull(target.owner, target.repo, number);
     return Response.json({ number: pr.number, state: pr.state, merged: pr.merged, mergedAt: pr.mergedAt, closedAt: pr.closedAt, url: pr.url });
   } catch (err) {
     return errorResponse(err);

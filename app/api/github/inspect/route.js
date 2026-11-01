@@ -1,6 +1,6 @@
 import { guardJson } from "../../../../lib/apiGuard";
 import { analyzeTree, unsupportedAdvice } from "../../../../lib/repoInspect";
-import { clientFromEnv, parseTarget, errorResponse } from "../../../../lib/githubApi";
+import { clientForOwner, parseTarget, errorResponse } from "../../../../lib/githubApi";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -12,7 +12,7 @@ export async function POST(req) {
   const target = parseTarget(guard.body);
   if (!target.ok) return Response.json({ error: target.error }, { status: 400 });
   try {
-    const client = clientFromEnv();
+    const { client, tokenVariable } = clientForOwner(target.owner);
     const repo = await client.getRepo(target.owner, target.repo);
     const branch = target.branch || repo.defaultBranch;
     const head = await client.getBranchHead(target.owner, target.repo, branch);
@@ -24,6 +24,7 @@ export async function POST(req) {
     if (repo.canPush === false) warnings.push("The token can't push to this repository, so a pull request can't be opened until it has write access.");
     return Response.json({
       repo: { owner: target.owner, name: target.repo, defaultBranch: repo.defaultBranch, branch, private: repo.private, archived: repo.archived, canPush: repo.canPush },
+      tokenVariable, // which environment variable supplied the token (its name only, never its value)
       analysis: { ...analysis, warnings, advice: analysis.allowed ? "" : unsupportedAdvice(analysis.verdict) },
     });
   } catch (err) {

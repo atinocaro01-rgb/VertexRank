@@ -16,7 +16,7 @@ export async function POST(req) {
   if (!siteUrl) return Response.json({ error: "The website address isn't valid." }, { status: 400 });
   if (!target.branch) return Response.json({ error: "A branch is required." }, { status: 400 });
   try {
-    const plan = await planChanges({ client: clientFromEnv(), ...target, siteRoot: body.siteRoot, siteUrl, fixes: body.fixes });
+    const plan = await planChanges({ client: clientFromEnv(target.owner), ...target, siteRoot: body.siteRoot, siteUrl, fixes: body.fixes });
     if (!plan.ok) return Response.json({ error: plan.error.message, code: plan.error.code, analysis: plan.error.analysis ? { verdict: plan.error.analysis.verdict, reasons: plan.error.analysis.reasons } : undefined }, { status: 422 });
     return Response.json(summarizePlan(plan));
   } catch (err) {

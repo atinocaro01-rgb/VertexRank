@@ -19,7 +19,7 @@ export async function POST(req) {
   if (body.confirm !== true) return Response.json({ error: "Confirmation is required to create a pull request." }, { status: 400 });
   try {
     const res = await createPullRequest({
-      client: clientFromEnv(), ...target, siteRoot: body.siteRoot, siteUrl, fixes: body.fixes, draft: body.draft === true,
+      client: clientFromEnv(target.owner), ...target, siteRoot: body.siteRoot, siteUrl, fixes: body.fixes, draft: body.draft === true,
       context: { findingTitle: typeof body.findingTitle === "string" ? body.findingTitle.slice(0, 200) : undefined },
     });
     if (!res.ok) return Response.json({ error: res.error.message, code: res.error.code, results: res.error.results }, { status: 422 });
