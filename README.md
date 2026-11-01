@@ -74,6 +74,28 @@ Optional environment variables:
 - `VR_RATE_LIMIT_MULTIPLIER`: scale every per-client limit (e.g. `2` for twice as generous).
 - `VR_GLOBAL_DAILY_AI_CALLS`: total LLM-spending calls per day across all visitors; over it, AI features return a "daily capacity" message.
 - `VR_GLOBAL_DAILY_CRAWLS`: total site crawls per day across all visitors.
+- `VR_GLOBAL_DAILY_SERP`: total live-search requests per day across all visitors (see Live search results below). Set this below your SerpApi allowance divided by 30.
+
+## Live search results (SerpApi)
+
+The **Keyword Intelligence → Live Results** tab shows the top organic Google results for one query, in your website's target country, on desktop or mobile, and where your website appears in them. It is observed data from a search provider, labeled with its source, country, device and time. It is not a search volume and not a guaranteed rank (results vary by person and location). For your own site's averaged positions use Search Data (Search Console).
+
+Setup:
+
+1. Create a SerpApi account (the free plan includes 250 searches per month) and copy your API key from its dashboard.
+2. Set `SERPAPI_KEY` as an environment variable on your host (Vercel: Project → Settings → Environment Variables), then redeploy. Never commit it.
+3. Recommended: set `VR_GLOBAL_DAILY_SERP` (for example `8`) so the whole app can never spend more than your plan allows. Without `SERPAPI_KEY` the tab explains that live results aren't set up and nothing else is affected.
+
+Notes:
+
+- Each fresh search spends one search from your plan. Repeating the same query, country and device is reused for six hours (per server instance); the Refresh button forces a new search. Searches only run when you click.
+- Only the first page of organic results (up to 10) is fetched.
+- The provider sits behind `lib/serpProvider.js`. `SERP_PROVIDER` defaults to `serpapi`; another provider means adding one module there. The API key is only read on the server and is never returned, logged or included in an error. Code: `lib/serpProvider.js`, `lib/serpApi.js`, `lib/serpMatch.js`, `app/api/serp/search/route.js`.
+
+**Using live results elsewhere in the app.** Every search you run in Live Results is saved with the website (the latest 40, in your browser, included in backups; each one can be removed). Two things use them:
+
+- **Competitors → "Found in live search results"** lists sites that keep appearing in your saved searches (most frequent first), with a one-click Add. Big general platforms such as Wikipedia, YouTube, social networks and marketplaces are left out. You can also click "Track as competitor" on any result.
+- **Opportunity Queue**: for each saved search where your site isn't in the top 3, one item is added, either "ranks #N, with room to climb" or "not in the top 10". The evidence is observed (who ranks above you, and your crawl's check of whether any page already has every word of the query in its title or H1). Priority is raised when Search Console shows real impressions for the query or it's one of your tracked keywords. Confidence is never above Medium (one snapshot from one provider), and searches older than two weeks are demoted and labelled. They map onto the Action Center like every other source. Code: `lib/serpInsights.js`.
 
 ## Crawl identity and stale-data protection
 

@@ -21,6 +21,8 @@ import {
   createTracker, resetDerived, stampResult, migrateLegacyBundle, discardMessage, isStaleForCrawl, isStaleForMarket, normalizeSiteKey,
 } from "../lib/crawlState";
 import { COUNTRIES, normalizeCountry } from "../lib/market";
+import { findSiteRank, sameSite, hostOf } from "../lib/serpMatch";
+import { slimCheck, upsertCheck, competitorProspects } from "../lib/serpInsights";
 import { computeAuditIssuesForMarket } from "../lib/auditIssues";
 import { proposeFixes, rowReady, rowToFix, fixTypeOf, suggestionItem, avoidList, pagePlainText } from "../lib/fixPlanner";
 import { checkSuggestion } from "../lib/seoSuggestions";
@@ -305,6 +307,7 @@ function emptyBundle() {
     // full-site crawl completes, then as each AI module below is run.
     siteCrawl: null,
     gscReport: null, // latest Search Console report for this website (lib/gscReport.js)
+    serpChecks: [], // saved live-search snapshots (lib/serpInsights.js) — feed competitor prospects and the Opportunity Queue
      // raw multi-page crawl (lib/siteCrawler.js output) — the shared input every module below reads from
     siteKeywordClusters: null,
     siteAeoAnalysis: null,
@@ -970,7 +973,7 @@ function Dashboard() {
   // reload once a website is saved.
   const country = normalizeCountry(websites.find((w) => w.id === currentWebsiteId)?.country);
   const queue = useMemo(() => buildOpportunityQueue(b, { country }),
-    [b.siteCrawl, b.gscReport, b.siteKeywordClusters, b.siteAeoAnalysis, b.siteGeoAnalysis, b.aiVisibility, b.internalLinkRecs, b.internalLinks, b.competitors, b.contentIdeas, b.actions, country]);
+    [b.siteCrawl, b.gscReport, b.serpChecks, b.keywords, b.siteKeywordClusters, b.siteAeoAnalysis, b.siteGeoAnalysis, b.aiVisibility, b.internalLinkRecs, b.internalLinks, b.competitors, b.contentIdeas, b.actions, country]);
   const unifiedRecs = useMemo(() => filterQueue(queue, { states: ["new", "in_actions"] }).slice(0, 8), [queue]);
 
   if (!currentWebsiteId) {
@@ -1560,7 +1563,7 @@ function OpportunitiesView() {
   const website = websites.find((w) => w.id === currentWebsiteId);
 
   const queue = useMemo(() => buildOpportunityQueue(b, { country }),
-    [b.siteCrawl, b.gscReport, b.siteKeywordClusters, b.siteAeoAnalysis, b.siteGeoAnalysis, b.aiVisibility, b.internalLinkRecs, b.internalLinks, b.competitors, b.contentIdeas, b.actions, country]);
+    [b.siteCrawl, b.gscReport, b.serpChecks, b.keywords, b.siteKeywordClusters, b.siteAeoAnalysis, b.siteGeoAnalysis, b.aiVisibility, b.internalLinkRecs, b.internalLinks, b.competitors, b.contentIdeas, b.actions, country]);
   const summary = useMemo(() => summarizeQueue(queue), [queue]);
   const states = { open: ["new"], in_actions: ["in_actions"], done: ["done", "rejected"], all: ["new", "in_actions", "done", "rejected"] }[status];
   const filtered = useMemo(
@@ -2005,7 +2008,7 @@ function SearchDataView() {
   const [pageRows, setPageRows] = useState(15);
   const property = website?.gsc?.siteUrl;
   const opps = useMemo(
-    () => (report ? buildOpportunityQueue(b, { country }).filter((o) => o.type === "search").slice(0, 5) : []),
+    () => (report ? buildOpportunityQueue(b, { country }).filter((o) => o.type === "search" && o.module === "Search Console").slice(0, 5) : []),
     [b.gscReport, b.siteCrawl, b.actions, country]
   );
 
@@ -2467,14 +2470,14 @@ function KeywordsView() {
   return (
     <div className="space-y-4">
       <div className="flex gap-1 rounded-lg p-1 w-fit" style={{ background: BRAND.canvas }}>
-        {[["clusters", "AI Keyword Intelligence"], ["manual", "Manual Tracking"]].map(([id, label]) => (
+        {[["clusters", "AI Keyword Intelligence"], ["manual", "Manual Tracking"], ["serp", "Live Results"]].map(([id, label]) => (
           <button key={id} onClick={() => setTab(id)} className="vr-focus text-sm font-medium rounded-md px-3 py-1.5"
             style={{ background: tab === id ? BRAND.surface : "transparent", color: tab === id ? BRAND.primary : BRAND.inkSoft, boxShadow: tab === id ? `0 1px 2px rgba(0,0,0,0.06)` : "none" }}>
             {label}
           </button>
         ))}
       </div>
-      {tab === "clusters" ? <SiteKeywordClusteringPanel /> : <ManualKeywordTracker />}
+      {tab === "clusters" ? <SiteKeywordClusteringPanel /> : tab === "serp" ? <SerpPanel /> : <ManualKeywordTracker />}
     </div>
   );
 }
@@ -2842,6 +2845,162 @@ function ManualKeywordTracker() {
         </Field>
       </Modal>
       <ConfirmDialog open={!!confirmDelete} onClose={() => setConfirmDelete(null)} title="Delete keyword" body="This keyword will be permanently removed." onConfirm={() => del(confirmDelete.id)} />
+    </div>
+  );
+}
+
+/** Live search results (Feature: SERP). One query at a time, on demand — each fresh search spends a small monthly
+ *  allowance at the SERP provider, so nothing here runs automatically. Everything shown is OBSERVED data: what the
+ *  provider returned for that query, country and device at that moment. Not a search volume, not a guaranteed rank.
+ *  See app/api/serp/search/route.js and lib/serpProvider.js. */
+function SerpPanel() {
+  const { websites, bundle, currentWebsiteId, setBundles, toast } = useApp();
+  const website = websites.find((w) => w.id === currentWebsiteId);
+  const b = bundle();
+  const country = normalizeCountry(website?.country);
+  const [query, setQuery] = useState("");
+  const [device, setDevice] = useState("desktop");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState(null); // { siteId, ...response }
+  const tracked = (b.keywords || []).map((k) => k.keyword).filter(Boolean).slice(0, 6);
+
+  async function run(refresh = false, override) {
+    const q = (override ?? query).trim();
+    if (!q) { setError("Enter a search query."); return; }
+    const id = currentWebsiteId;
+    setLoading(true); setError("");
+    try {
+      const data = await postJson("/api/serp/search", { query: q, country, device, refresh });
+      if (websiteStore.current.find((w) => w.id === id) === undefined) return;
+      setResult({ siteId: id, ...data });
+      const snap = slimCheck(data);
+      if (snap) setBundles((prev) => { const site = prev[id]; return site ? { ...prev, [id]: { ...site, serpChecks: upsertCheck(site.serpChecks, snap) } } : prev; });
+    } catch (e) {
+      setError(e.message || "Couldn't fetch search results.");
+    } finally { setLoading(false); }
+  }
+
+  function trackCompetitor(host) {
+    setBundles((prev) => {
+      const site = prev[currentWebsiteId]; if (!site) return prev;
+      if ((site.competitors || []).some((c) => hostOf(c.url || c.name) === host)) return prev;
+      return { ...prev, [currentWebsiteId]: { ...site, competitors: [...site.competitors, { id: uid("comp"), websiteId: currentWebsiteId, siteAnalysis: null, name: host, url: host }] } };
+    });
+    toast(`${host} added to Competitors`);
+  }
+  function removeCheck(id) {
+    setBundles((prev) => { const site = prev[currentWebsiteId]; return site ? { ...prev, [currentWebsiteId]: { ...site, serpChecks: (site.serpChecks || []).filter((c) => c.id !== id) } } : prev; });
+    if (result?.id === id) setResult(null);
+  }
+  const trackedHosts = new Set((b.competitors || []).map((c) => hostOf(c.url || c.name)));
+  const saved = b.serpChecks || [];
+  const shown = result && result.siteId === currentWebsiteId ? result : null; // never show one website's results under another
+  const site = website?.url || "";
+  const mine = shown ? findSiteRank(shown.results, site) : null;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-2 rounded-lg px-4 py-2.5 text-xs" style={{ background: BRAND.amberSoft, color: BRAND.amber }}>
+        <Info size={14} />
+        Each fresh search uses a small monthly allowance at the search provider, so results load only when you ask. Repeated searches are reused for a few hours; use "Refresh" for new results.
+      </div>
+      <Card className="p-4">
+        <div className="grid gap-3 sm:grid-cols-[1fr_auto_auto] sm:items-end">
+          <Field label="Search query">
+            <TextInput list="serp-keywords" value={query} placeholder="e.g. best running shoes" maxLength={150}
+              onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !loading) run(false); }} />
+            <datalist id="serp-keywords">{tracked.map((k) => <option key={k} value={k} />)}</datalist>
+          </Field>
+          <Field label="Device"><Select value={device} onChange={(e) => setDevice(e.target.value)}><option value="desktop">Desktop</option><option value="mobile">Mobile</option></Select></Field>
+          <div className="mb-3.5"><Button icon={loading ? Loader2 : Search} disabled={loading} onClick={() => run(false)}>{loading ? "Searching…" : "Search"}</Button></div>
+        </div>
+        <p className="text-xs" style={{ color: BRAND.inkSoft }}>Searching Google as seen from <strong>{country === "Worldwide" ? "no specific country" : country}</strong> (your website's target market).</p>
+        {tracked.length > 0 && (
+          <div className="flex flex-wrap gap-2 mt-3">
+            {tracked.map((k) => (
+              <button key={k} type="button" disabled={loading} onClick={() => { setQuery(k); run(false, k); }} className="vr-focus text-xs rounded-full px-2.5 py-1 font-medium"
+                style={{ background: BRAND.canvas, color: BRAND.inkSoft, border: `1px solid ${BRAND.line}` }}>{k}</button>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      {error && (
+        <div className="flex items-start gap-2 rounded-lg px-4 py-3 text-sm" style={{ background: BRAND.redSoft, color: BRAND.red }}>
+          <AlertTriangle size={16} className="mt-0.5 shrink-0" /><span>{error}</span>
+        </div>
+      )}
+
+      {!shown && !error && !loading && (
+        <Card><EmptyState icon={Search} title="Check a live search" body="Enter a query to see the top organic results Google returns for it, and where your website appears." /></Card>
+      )}
+
+      {shown && (
+        <Card className="overflow-hidden">
+          <div className="p-4 space-y-2" style={{ borderBottom: `1px solid ${BRAND.line}` }}>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-semibold">“{shown.query}”</span>
+              <DataLabel kind="observed" title="Returned by the search provider for this query, country and device — not generated or estimated.">{shown.source}</DataLabel>
+              <Button variant="outline" size="sm" icon={RefreshCw} disabled={loading} onClick={() => run(true, shown.query)}>Refresh</Button>
+            </div>
+            <p className="text-xs" style={{ color: BRAND.inkSoft }}>
+              {shown.country === "Worldwide" ? "No specific country" : shown.country} · {shown.device} · checked {new Date(shown.observedAt).toLocaleString()}{shown.cached ? " · reused from a recent search" : ""}
+            </p>
+            <div className="text-sm font-medium" style={{ color: mine ? BRAND.visibility : BRAND.inkSoft }}>
+              {mine
+                ? `${hostOf(site)} appears at position #${mine.rank} in these results.`
+                : shown.results.length === 0
+                  ? "The provider returned no organic results for this query."
+                  : `${hostOf(site) || "Your website"} isn't in the top ${shown.results.length} results.`}
+            </div>
+          </div>
+          <ol>
+            {shown.results.map((r) => {
+              const own = sameSite(r.url, site);
+              return (
+                <li key={`${r.rank}-${r.url}`} className="px-4 py-3 flex gap-3" style={{ borderBottom: `1px solid ${BRAND.line}`, background: own ? BRAND.visibilitySoft : "transparent" }}>
+                  <span className="vr-mono text-sm w-7 shrink-0" style={{ color: BRAND.inkSoft }}>#{r.rank}</span>
+                  <div className="min-w-0">
+                    <a href={r.url} target="_blank" rel="noopener noreferrer" className="vr-focus text-sm font-medium break-words underline-offset-2 hover:underline" style={{ color: BRAND.primary }}>{r.title || r.url}</a>
+                    <div className="text-xs break-all flex flex-wrap items-center gap-2" style={{ color: BRAND.inkSoft }}>
+                      <span>{hostOf(r.url)}{own ? " · your website" : ""}</span>
+                      {!own && (trackedHosts.has(hostOf(r.url))
+                        ? <span className="text-[11px]">Tracked competitor</span>
+                        : <button type="button" className="vr-focus text-[11px] underline" style={{ color: BRAND.primary }} onClick={() => trackCompetitor(hostOf(r.url))}>Track as competitor</button>)}
+                    </div>
+                    {r.snippet && <p className="text-xs mt-1" style={{ color: BRAND.ink }}>{r.snippet}</p>}
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+          <p className="px-4 py-3 text-[11px]" style={{ color: BRAND.inkSoft }}>
+            Saved with this website: it feeds the Opportunity Queue and the competitor suggestions. This is a snapshot of the first page of organic results for one query, country, device and moment. Results vary by person and location, so treat the position as a guide, not a guaranteed rank. For your own site's averaged positions, use Search Data (Search Console). Search volume and difficulty are not part of these results.
+          </p>
+        </Card>
+      )}
+
+      {saved.length > 0 && (
+        <Card className="p-4">
+          <h3 className="font-semibold vr-display mb-1">Saved checks</h3>
+          <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>The latest {saved.length} search{saved.length === 1 ? "" : "es"} for this website (up to 40). They stay in this browser with the website and are included in backups.</p>
+          <div className="space-y-1">
+            {saved.map((c) => {
+              const r = findSiteRank(c.results, site);
+              return (
+                <div key={c.id} className="flex items-center justify-between gap-3 rounded-lg px-3 py-2 text-sm" style={{ background: BRAND.canvas }}>
+                  <button type="button" className="vr-focus text-left min-w-0" onClick={() => { setQuery(c.query); setDevice(c.device); setResult({ siteId: currentWebsiteId, ...c, cached: false }); }}>
+                    <span className="font-medium break-words">{c.query}</span>
+                    <span className="block text-xs" style={{ color: BRAND.inkSoft }}>{c.country === "Worldwide" ? "No country" : c.country} · {c.device} · {new Date(c.observedAt).toLocaleDateString()} · {r ? `you: #${r.rank}` : "not in the top 10"}</span>
+                  </button>
+                  <IconButton icon={Trash2} danger onClick={() => removeCheck(c.id)} title="Remove this saved check" />
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
     </div>
   );
 }
@@ -3487,8 +3646,10 @@ function AiVisibilitySimulatorPanel() {
 /* ============================== Competitors ============================== */
 
 function CompetitorsView() {
-  const { bundle, setBundles, currentWebsiteId, toast, addAction } = useApp();
+  const { websites, bundle, setBundles, currentWebsiteId, toast, addAction } = useApp();
   const b = bundle();
+  const ownSite = websites.find((w) => w.id === currentWebsiteId)?.url || b.siteCrawl?.domain || "";
+  const prospects = competitorProspects(b.serpChecks, { site: ownSite, tracked: b.competitors });
   const [modal, setModal] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [form, setForm] = useState({ name: "", url: "" });
@@ -3620,6 +3781,10 @@ function CompetitorsView() {
     toast(`${s.name} added — verify the URL before analyzing`);
   }
   function dismissSuggestion(id) { setSuggestions((arr) => arr.filter((x) => x.id !== id)); }
+  function addProspect(p) {
+    mutate((arr) => (arr.some((c) => hostOf(c.url || c.name) === p.host) ? arr : [...arr, { id: uid("comp"), websiteId: currentWebsiteId, siteAnalysis: null, name: p.host, url: p.host }]));
+    toast(`${p.host} added to competitors`);
+  }
 
   return (
     <div className="space-y-4">
@@ -3632,6 +3797,24 @@ function CompetitorsView() {
       <div className="flex justify-end gap-2">
         <Button variant="soft" icon={suggesting ? Loader2 : Sparkles} disabled={suggesting} onClick={suggestCompetitors}>{suggesting ? "Suggesting…" : "Suggest with AI"}</Button>
       </div>
+
+      {prospects.length > 0 && (
+        <Card className="p-4">
+          <div className="flex flex-wrap items-center gap-2 mb-1"><Search size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">Found in live search results</h3><DataLabel kind="observed">Seen in your saved searches</DataLabel></div>
+          <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Sites that actually ranked for your saved Live Results searches, most frequent first. Big general platforms (Wikipedia, YouTube, social networks, marketplaces) are left out. Ranking for the same searches doesn't always mean the same business, so check each one before adding it.</p>
+          <div className="space-y-2">
+            {prospects.map((p) => (
+              <div key={p.host} className="flex items-start justify-between gap-3 rounded-lg px-4 py-3" style={{ background: BRAND.canvas }}>
+                <div className="min-w-0">
+                  <p className="text-sm font-medium break-all">{p.host}</p>
+                  <p className="text-xs" style={{ color: BRAND.inkSoft }}>In {p.appearances} saved search{p.appearances === 1 ? "" : "es"} · best position #{p.bestRank} · e.g. {p.queries.slice(0, 3).map((q) => `“${q}”`).join(", ")}</p>
+                </div>
+                <Button size="sm" variant="soft" icon={Plus} onClick={() => addProspect(p)}>Add</Button>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
 
       {(b.competitorSuggestions || []).length > 0 && (
         <Card className="p-4">
