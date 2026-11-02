@@ -97,6 +97,28 @@ Notes:
 - **Competitors → "Found in live search results"** lists sites that keep appearing in your saved searches (most frequent first), with a one-click Add. Big general platforms such as Wikipedia, YouTube, social networks and marketplaces are left out. You can also click "Track as competitor" on any result.
 - **Opportunity Queue**: for each saved search where your site isn't in the top 3, one item is added, either "ranks #N, with room to climb" or "not in the top 10". The evidence is observed (who ranks above you, and your crawl's check of whether any page already has every word of the query in its title or H1). Priority is raised when Search Console shows real impressions for the query or it's one of your tracked keywords. Confidence is never above Medium (one snapshot from one provider), and searches older than two weeks are demoted and labelled. They map onto the Action Center like every other source. Code: `lib/serpInsights.js`.
 
+## Rank history and daily checks (Supabase + Vercel Cron)
+
+The **Keyword Intelligence → Rank History** tab keeps the positions of the keywords you track, so you can see movement over weeks. It needs a small Postgres database (positions must survive refreshes and redeploys), and a daily job re-checks keywords for you. Without these variables the tab just explains the setup and nothing else changes.
+
+Setup:
+
+1. Create a free Supabase project. In its SQL editor, paste and run `db/serp_history.sql`. It creates three tables and turns on Row Level Security with no policies, so the public key can access nothing.
+2. In Supabase → Project Settings → API, copy the project URL and the **service_role** key. Set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` on your host. The service_role key is a server secret: never commit it and never expose it to the browser.
+3. For the daily job, set `CRON_SECRET` to a random string of 16+ characters (Vercel → Settings → Environment Variables). `vercel.json` already schedules `/api/cron/serp` once a day (05:00 UTC); Vercel sends the secret as a Bearer header. Cron runs only on production deployments.
+4. Redeploy, open Rank History, and track a keyword (type it, or use "Track this query" in Live Results).
+
+How it behaves:
+
+- **Manual first.** "Check rankings" checks up to 3 tracked keywords now (the ones you pick, or the least recently checked). Adding a keyword never searches by itself. A Live Results search for a keyword you already track is saved as a snapshot too, since it was paid for anyway.
+- **Daily job.** Each run checks the active keywords that are due, oldest first. Defaults: a keyword is re-checked about every 7 days, up to 5 per run, with a monthly budget of 200 tracked-keyword searches (manual and scheduled together) of which 50 are kept for manual checks. Tune them with `SERP_CHECK_INTERVAL_DAYS`, `SERP_CRON_MAX_PER_RUN`, `SERP_MONTHLY_BUDGET` and `SERP_MANUAL_RESERVE`. Keep the budget below your SerpApi plan (250/month on the free plan); the count is per calendar month and approximate, and untracked Live Results searches aren't in it (`VR_GLOBAL_DAILY_SERP` covers those).
+- **Safe by design.** The job claims the day first, so a duplicated cron delivery can't spend twice. It stops on errors that would repeat (rejected key, used-up allowance, rate limit), leaves failed keywords due for the next run, and records what happened in the `job_runs` table, shown at the top of the tab. It always touches the database, which also keeps a free Supabase project from pausing (free projects pause after 7 days without activity; if that happens, resume it in the Supabase dashboard).
+- **Vercel Hobby limits.** Cron runs at most once a day and can fire anywhere within its hour; Vercel doesn't retry a failed run. The route is exempt from the password gate only for a request carrying the exact `CRON_SECRET` bearer token.
+- **Who sees what.** The app has one shared password, so history is stored per website host, not per user. If you ever make it multi-user, add an owner column in `lib/serpStore.js` first.
+- **What the numbers are.** Each point is an observed snapshot of the first page of results for one query, country, device and moment. It will differ from Search Console's averaged position and from what a particular person sees. At most 25 keywords per website, and the chart shows up to the latest 1,000 snapshots per request.
+
+Code: `lib/rankHistory.js`, `lib/serpStore.js`, `lib/serpJob.js`, `lib/cronAuth.js`, `app/api/serp/{tracked,history,check}/route.js`, `app/api/cron/serp/route.js`.
+
 ## Crawl identity and stale-data protection
 
 Every crawl gets a `crawlId` (minted in `lib/siteCrawler.js`). Analyses (AEO, GEO, keyword clusters, internal links, AI insights, competitor comparison, AI visibility) are stamped with the `crawlId` they were computed from, and an async result is only applied if that crawl is still the current one. The logic lives in `lib/crawlState.js` (unit-tested in `tests/crawlState.test.mjs`):

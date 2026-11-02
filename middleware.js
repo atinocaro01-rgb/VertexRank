@@ -1,10 +1,14 @@
 // Password gate for the whole app (pages and API). See lib/accessControl.js for the rules.
 import { NextResponse } from "next/server";
 import { accessConfig, checkAccess, LOCKED_MESSAGE } from "./lib/accessControl.js";
+import { isCronRequest, CRON_PATHS } from "./lib/cronAuth.js";
 
 const PRIVATE_HEADERS = { "X-Robots-Tag": "noindex, nofollow", "Cache-Control": "no-store" };
 
 export function middleware(req) {
+  // Vercel Cron cannot send the password. Exactly these paths, and only with the cron secret, skip it (the route checks again).
+  if (CRON_PATHS.includes(req.nextUrl.pathname) && isCronRequest(req.headers.get("authorization"), process.env)) return NextResponse.next();
+
   const result = checkAccess(req.headers.get("authorization"), accessConfig(process.env));
 
   if (result.allowed) {

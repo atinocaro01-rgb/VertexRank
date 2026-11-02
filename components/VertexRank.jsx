@@ -3,7 +3,7 @@
 import React, { useState, useContext, createContext, useEffect, useMemo, useRef, useCallback } from "react";
 import {
   LayoutDashboard, Globe2, ListChecks, ClipboardCheck, KeyRound, MessageCircleQuestion,
-  Radar as RadarIcon, Users, FileText, Link2, Rss, Plus, Pencil, Trash2, X, Check,
+  Radar as RadarIcon, Users, FileText, Link2, Rss, Plus, Pencil, Trash2, X, Check, TrendingUp,
   ChevronDown, ChevronLeft, ChevronRight, Loader2, AlertTriangle, CheckCircle2,
   RefreshCw, Wand2, Zap, Search,
   SlidersHorizontal, ArrowUpDown, Info, Sparkles, ChevronUp, Building2, Newspaper,
@@ -407,12 +407,13 @@ function Badge({ color, children, icon: Icon }) {
 function SeverityBadge({ severity }) { return <Badge color={SEVERITY_COLOR[severity]}>{severity}</Badge>; }
 function StatusBadge({ status }) { return <Badge color={STATUS_COLOR[status] || STATUS_COLOR.New}>{statusLabel(status)}</Badge>; }
 
-function IconButton({ icon: Icon, onClick, title, danger }) {
+function IconButton({ icon: Icon, onClick, title, danger, disabled }) {
   return (
     <button
       title={title}
       onClick={onClick}
-      className="vr-focus rounded-md p-1.5 hover:bg-gray-100 transition-colors"
+      disabled={disabled}
+      className="vr-focus rounded-md p-1.5 hover:bg-gray-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
       style={{ color: danger ? BRAND.red : BRAND.inkSoft }}
     >
       <Icon size={16} />
@@ -2470,14 +2471,14 @@ function KeywordsView() {
   return (
     <div className="space-y-4">
       <div className="flex gap-1 rounded-lg p-1 w-fit" style={{ background: BRAND.canvas }}>
-        {[["clusters", "AI Keyword Intelligence"], ["manual", "Manual Tracking"], ["serp", "Live Results"]].map(([id, label]) => (
+        {[["clusters", "AI Keyword Intelligence"], ["manual", "Manual Tracking"], ["serp", "Live Results"], ["history", "Rank History"]].map(([id, label]) => (
           <button key={id} onClick={() => setTab(id)} className="vr-focus text-sm font-medium rounded-md px-3 py-1.5"
             style={{ background: tab === id ? BRAND.surface : "transparent", color: tab === id ? BRAND.primary : BRAND.inkSoft, boxShadow: tab === id ? `0 1px 2px rgba(0,0,0,0.06)` : "none" }}>
             {label}
           </button>
         ))}
       </div>
-      {tab === "clusters" ? <SiteKeywordClusteringPanel /> : tab === "serp" ? <SerpPanel /> : <ManualKeywordTracker />}
+      {tab === "clusters" ? <SiteKeywordClusteringPanel /> : tab === "serp" ? <SerpPanel /> : tab === "history" ? <RankHistoryPanel /> : <ManualKeywordTracker />}
     </div>
   );
 }
@@ -2871,7 +2872,7 @@ function SerpPanel() {
     const id = currentWebsiteId;
     setLoading(true); setError("");
     try {
-      const data = await postJson("/api/serp/search", { query: q, country, device, refresh });
+      const data = await postJson("/api/serp/search", { query: q, country, device, refresh, siteHost: hostOf(website?.url || "") });
       if (websiteStore.current.find((w) => w.id === id) === undefined) return;
       setResult({ siteId: id, ...data });
       const snap = slimCheck(data);
@@ -2888,6 +2889,12 @@ function SerpPanel() {
       return { ...prev, [currentWebsiteId]: { ...site, competitors: [...site.competitors, { id: uid("comp"), websiteId: currentWebsiteId, siteAnalysis: null, name: host, url: host }] } };
     });
     toast(`${host} added to Competitors`);
+  }
+  async function trackKeyword(r) {
+    try {
+      const out = await postJson("/api/serp/tracked", { action: "add", siteHost: hostOf(website?.url || ""), query: r.query, country: r.country, device: r.device });
+      toast(out.created ? "Tracking started. See Rank History." : "Already tracked. See Rank History.");
+    } catch (e) { setError(e.message || "Couldn't start tracking."); }
   }
   function removeCheck(id) {
     setBundles((prev) => { const site = prev[currentWebsiteId]; return site ? { ...prev, [currentWebsiteId]: { ...site, serpChecks: (site.serpChecks || []).filter((c) => c.id !== id) } } : prev; });
@@ -2943,6 +2950,7 @@ function SerpPanel() {
               <span className="font-semibold">“{shown.query}”</span>
               <DataLabel kind="observed" title="Returned by the search provider for this query, country and device — not generated or estimated.">{shown.source}</DataLabel>
               <Button variant="outline" size="sm" icon={RefreshCw} disabled={loading} onClick={() => run(true, shown.query)}>Refresh</Button>
+              <Button variant="outline" size="sm" icon={TrendingUp} disabled={loading} onClick={() => trackKeyword(shown)}>Track this query</Button>
             </div>
             <p className="text-xs" style={{ color: BRAND.inkSoft }}>
               {shown.country === "Worldwide" ? "No specific country" : shown.country} · {shown.device} · checked {new Date(shown.observedAt).toLocaleString()}{shown.cached ? " · reused from a recent search" : ""}
@@ -3001,6 +3009,149 @@ function SerpPanel() {
           </div>
         </Card>
       )}
+    </div>
+  );
+}
+
+/** Rank History (Feature: SERP history). Tracked keywords for the current website, their saved positions over time, a manual
+ *  "Check rankings" button, and the status of the daily scheduled check. Needs the Supabase database (db/serp_history.sql);
+ *  without it this explains the setup instead of failing. Positions are OBSERVED snapshots from the search provider for one
+ *  query, country, device and moment — not a guaranteed rank, and not Search Console's averaged position. */
+function RankHistoryPanel() {
+  const { websites, currentWebsiteId, toast } = useApp();
+  const website = websites.find((w) => w.id === currentWebsiteId);
+  const siteHost = hostOf(website?.url || "");
+  const country = normalizeCountry(website?.country);
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [days, setDays] = useState(90);
+  const [query, setQuery] = useState("");
+  const [device, setDevice] = useState("desktop");
+  const [open, setOpen] = useState(null);
+
+  async function load() {
+    if (!siteHost) return;
+    setLoading(true); setError("");
+    try { setData(await postJson("/api/serp/history", { siteHost, days })); }
+    catch (e) { setError(e.message || "Couldn't load rank history."); }
+    finally { setLoading(false); }
+  }
+  useEffect(() => { setData(null); setOpen(null); load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [siteHost, days]);
+
+  async function act(body, done) {
+    setBusy(true); setError("");
+    try { const r = await postJson("/api/serp/tracked", { siteHost, ...body }); if (done) done(r); await load(); }
+    catch (e) { setError(e.message || "That didn't work."); }
+    finally { setBusy(false); }
+  }
+  async function checkNow(ids) {
+    setBusy(true); setError("");
+    try {
+      const r = await postJson("/api/serp/check", { siteHost, ...(ids ? { ids } : {}) });
+      const n = r.checked?.length || 0;
+      toast(n ? `Checked ${n} keyword${n === 1 ? "" : "s"}` : (r.note || "Nothing was checked"));
+      if (r.errors?.length) setError(r.errors[0].message);
+      await load();
+    } catch (e) { setError(e.message || "Couldn't check rankings."); }
+    finally { setBusy(false); }
+  }
+
+  if (!siteHost) return <Card><EmptyState icon={TrendingUp} title="Add a website first" body="Rank history is kept per website." /></Card>;
+  if (data && data.configured === false) {
+    return (
+      <Card className="p-5 space-y-2">
+        <h3 className="font-semibold vr-display">Set up rank history</h3>
+        <p className="text-sm" style={{ color: BRAND.inkSoft }}>Rank history needs a small Postgres database so positions survive refreshes and redeploys. Create a free Supabase project, run <code>db/serp_history.sql</code> in its SQL editor, then set <code>SUPABASE_URL</code> and <code>SUPABASE_SERVICE_ROLE_KEY</code> on your host and redeploy. For daily automatic checks also set <code>CRON_SECRET</code>. The README has the full steps.</p>
+      </Card>
+    );
+  }
+  const keywords = data?.keywords || [];
+  const budget = data?.budget;
+  const run = data?.lastRun;
+  const fmt = (iso) => (iso ? new Date(iso).toLocaleDateString() : "never");
+  const pos = (p) => (p === null || p === undefined ? "not in top 10" : `#${p}`);
+
+  return (
+    <div className="space-y-4">
+      {data?.missingTables && (
+        <div className="flex items-start gap-2 rounded-lg px-4 py-3 text-sm" style={{ background: BRAND.redSoft, color: BRAND.red }}><AlertTriangle size={16} className="mt-0.5 shrink-0" /><span>{data.error}</span></div>
+      )}
+      {error && <div className="flex items-start gap-2 rounded-lg px-4 py-3 text-sm" style={{ background: BRAND.redSoft, color: BRAND.red }}><AlertTriangle size={16} className="mt-0.5 shrink-0" /><span>{error}</span></div>}
+
+      {budget && (
+        <Card className="p-4 text-sm space-y-1">
+          <div className="flex flex-wrap items-center gap-2"><span className="font-semibold">Scheduled checks</span><DataLabel kind="observed" title="Recorded by the daily job, from the database.">Daily job</DataLabel></div>
+          <p style={{ color: BRAND.inkSoft }}>
+            {run ? `Last run ${fmt(run.startedAt)} — ${run.note || run.status}` : "No scheduled run yet. After you deploy with CRON_SECRET set, Vercel runs it once a day."}
+            {run && run.errors?.length > 0 ? ` Problem: ${run.errors[0].message}` : ""}
+          </p>
+          <p style={{ color: BRAND.inkSoft }}>Each keyword is re-checked about every {budget.intervalDays} days, up to {budget.perRun} per run. This month: {budget.used} of {budget.monthly} tracked-keyword searches used ({budget.reserve} are kept for manual checks).</p>
+        </Card>
+      )}
+
+      <Card className="p-4">
+        <div className="grid gap-3 sm:grid-cols-[1fr_auto_auto] sm:items-end">
+          <Field label="Track a keyword"><TextInput value={query} maxLength={150} placeholder="e.g. best running shoes" onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && query.trim() && !busy) act({ action: "add", query, country, device }, () => setQuery("")); }} /></Field>
+          <Field label="Device"><Select value={device} onChange={(e) => setDevice(e.target.value)}><option value="desktop">Desktop</option><option value="mobile">Mobile</option></Select></Field>
+          <div className="mb-3.5"><Button icon={Plus} disabled={busy || !query.trim()} onClick={() => act({ action: "add", query, country, device }, () => setQuery(""))}>Track</Button></div>
+        </div>
+        <p className="text-xs" style={{ color: BRAND.inkSoft }}>Tracked in {country === "Worldwide" ? "no specific country" : country} (this website's target market). Up to 25 keywords per website. Adding a keyword doesn't search yet.</p>
+      </Card>
+
+      <Card className="overflow-hidden">
+        <div className="flex flex-wrap items-center justify-between gap-2 p-4" style={{ borderBottom: `1px solid ${BRAND.line}` }}>
+          <div className="flex items-center gap-2"><h3 className="font-semibold vr-display">Tracked keywords</h3><DataLabel kind="observed" title="Positions returned by the search provider at the time of each check.">Observed</DataLabel></div>
+          <div className="flex items-center gap-2">
+            <Select value={days} onChange={(e) => setDays(Number(e.target.value))} aria-label="History range"><option value={30}>Last 30 days</option><option value={90}>Last 90 days</option><option value={180}>Last 180 days</option></Select>
+            <Button icon={busy ? Loader2 : RefreshCw} disabled={busy || keywords.filter((k) => k.active).length === 0} onClick={() => checkNow()}>Check rankings</Button>
+          </div>
+        </div>
+        {loading && !data ? <div className="p-6 text-sm" style={{ color: BRAND.inkSoft }}>Loading…</div> : keywords.length === 0 ? (
+          <EmptyState icon={TrendingUp} title="No tracked keywords yet" body="Track a keyword above, or use “Track this query” on a result in Live Results. Then use Check rankings, and the daily check keeps the history growing." />
+        ) : (
+          <ul>
+            {keywords.map((k) => {
+              const up = k.change !== null && k.change > 0, down = k.change !== null && k.change < 0;
+              return (
+                <li key={k.id} style={{ borderBottom: `1px solid ${BRAND.line}`, opacity: k.active ? 1 : 0.6 }}>
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-3">
+                    <button type="button" className="vr-focus text-left min-w-0 flex-1" onClick={() => setOpen(open === k.id ? null : k.id)} aria-expanded={open === k.id}>
+                      <span className="font-medium break-words">{k.query}</span>
+                      <span className="block text-xs" style={{ color: BRAND.inkSoft }}>{k.country === "Worldwide" ? "No country" : k.country} · {k.device}{k.active ? "" : " · paused"} · {k.checks} check{k.checks === 1 ? "" : "s"} · last {fmt(k.lastCheckedAt)}</span>
+                    </button>
+                    <div className="text-sm font-semibold w-28">{k.latest ? pos(k.latest.position) : "not checked"}</div>
+                    <div className="text-xs w-20" style={{ color: up ? BRAND.visibility : down ? BRAND.red : BRAND.inkSoft }}>{up ? `▲ ${k.change}` : down ? `▼ ${Math.abs(k.change)}` : k.checks > 1 && k.change === 0 ? "no change" : "—"}</div>
+                    <div className="text-xs w-16" style={{ color: BRAND.inkSoft }}>{k.best ? `best #${k.best}` : ""}</div>
+                    <div className="flex items-center gap-1">
+                      <IconButton icon={RefreshCw} onClick={() => checkNow([k.id])} title="Check this keyword now" disabled={busy || !k.active} />
+                      <Button size="sm" variant="outline" disabled={busy} onClick={() => act({ action: k.active ? "pause" : "resume", id: k.id })}>{k.active ? "Pause" : "Resume"}</Button>
+                      <IconButton icon={Trash2} danger onClick={() => act({ action: "remove", id: k.id })} title="Stop tracking and delete its history" disabled={busy} />
+                    </div>
+                  </div>
+                  {open === k.id && (
+                    <div className="px-4 pb-4">
+                      {k.series.length < 2 ? <p className="text-xs" style={{ color: BRAND.inkSoft }}>A trend needs at least two checks.</p> : (
+                        <ResponsiveContainer width="100%" height={180}>
+                          <LineChart data={k.series.map((p) => ({ date: p.date.slice(0, 10), rank: p.position ?? 11 }))}>
+                            <CartesianGrid strokeDasharray="3 3" stroke={BRAND.line} />
+                            <XAxis dataKey="date" tick={{ fontSize: 10 }} tickFormatter={(d) => d.slice(5)} minTickGap={24} />
+                            <YAxis reversed domain={[1, 11]} ticks={[1, 3, 5, 7, 9, 11]} tickFormatter={(v) => (v === 11 ? "10+" : `#${v}`)} tick={{ fontSize: 10 }} width={40} />
+                            <Tooltip formatter={(v) => [v === 11 ? "not in top 10" : `#${v}`, "Position"]} />
+                            <Line type="monotone" dataKey="rank" stroke={BRAND.primary} strokeWidth={2} dot={{ r: 3 }} />
+                          </LineChart>
+                        </ResponsiveContainer>
+                      )}
+                    </div>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        <p className="px-4 py-3 text-[11px]" style={{ color: BRAND.inkSoft }}>Each point is a snapshot of the first page of results for one query, country, device and moment, so small moves are normal. Your own site's averaged positions are in Search Data (Search Console) and will differ. Search volume and difficulty are not part of this data.</p>
+      </Card>
     </div>
   );
 }
