@@ -25,6 +25,7 @@ import { findSiteRank, sameSite, hostOf } from "../lib/serpMatch";
 import { slimCheck, upsertCheck, competitorProspects } from "../lib/serpInsights";
 import { buildFixInput, fixCacheKey } from "../lib/fixContext";
 import { buildCalendarInput } from "../lib/calendarContext";
+import { slimCompetitorCrawl, questionBank, outlineGaps, outlineHintsFor, competitorCitations, citationsForTopic } from "../lib/competitorIntel";
 import { checkArticle, buildArticleSchema } from "../lib/articleChecks";
 import { assembleArticle } from "../lib/articleWriter";
 import { computeAuditIssuesForMarket } from "../lib/auditIssues";
@@ -3960,7 +3961,7 @@ function CompetitorsView() {
     try {
       const data = await postJson("/api/site-competitor-analysis", { competitorUrl: c.url, ourCrawl: b.siteCrawl, country: market });
       if (!analysisUsable(ticket, toast)) return;
-      mutate((arr) => arr.map((x) => (x.id === c.id ? { ...x, siteAnalysis: stampResult(data.result, ticket.crawlId, market) } : x)));
+      mutate((arr) => arr.map((x) => (x.id === c.id ? { ...x, siteAnalysis: stampResult(data.result, ticket.crawlId, market), crawlSummary: data.competitorCrawl?.pages?.length ? slimCompetitorCrawl(data.competitorCrawl) : x.crawlSummary } : x)));
       setExpanded(c.id);
       toast(data.warning ? "Site-wide comparison ready (AI interpretation unavailable)" : "Site-wide competitor analysis ready");
 
@@ -4059,6 +4060,8 @@ function CompetitorsView() {
       <div className="flex justify-end gap-2">
         <Button variant="soft" icon={suggesting ? Loader2 : Sparkles} disabled={suggesting} onClick={suggestCompetitors}>{suggesting ? "Suggesting…" : "Suggest with AI"}</Button>
       </div>
+
+      <CompetitorIntelPanel />
 
       {prospects.length > 0 && (
         <Card className="p-4">
@@ -4414,7 +4417,7 @@ function ContentPlannerView() {
             </div>
             {drawer.grounding && (
               <div className="rounded-lg p-3" style={{ background: BRAND.canvas }}>
-                <div className="flex items-center gap-2 mb-1"><p className="text-xs font-semibold" style={{ color: BRAND.inkSoft }}>Why this topic</p><DataLabel kind={drawer.grounding.kind === "site" ? "ai_analysis" : "observed"} title="The data item this topic is based on.">{drawer.grounding.kind === "Q" ? "Search Console" : drawer.grounding.kind === "S" ? "Live search" : drawer.grounding.kind === "site" ? "From your site" : "From your analyses"}</DataLabel></div>
+                <div className="flex items-center gap-2 mb-1"><p className="text-xs font-semibold" style={{ color: BRAND.inkSoft }}>Why this topic</p><DataLabel kind={drawer.grounding.kind === "site" ? "ai_analysis" : "observed"} title="The data item this topic is based on.">{drawer.grounding.kind === "Q" ? "Search Console" : drawer.grounding.kind === "S" ? "Live search" : drawer.grounding.kind === "C" ? "Competitor crawl" : drawer.grounding.kind === "site" ? "From your site" : "From your analyses"}</DataLabel></div>
                 <p className="text-sm">{drawer.grounding.text}</p>
                 {drawer.grounding.note && <p className="text-xs" style={{ color: BRAND.inkSoft }}>{drawer.grounding.note}</p>}
                 {drawer.rationale && <p className="text-xs mt-1">{drawer.rationale}</p>}
@@ -4501,6 +4504,9 @@ function ArticleWriterModal({ idea, onClose, onSave }) {
   const crawl = b.siteCrawl;
   const country = countryOf(currentWebsiteId);
   const internal = (crawl?.pages || []).slice(0, 30).map((p) => ({ url: p.url, title: p.title }));
+  const topicText = `${idea.title} ${idea.primaryKeyword || ""}`;
+  const fromCompetitors = useMemo(() => citationsForTopic(competitorCitations((b.competitors || []).filter((c) => c.crawlSummary), { ownHost: crawl?.domain }), topicText), [b.competitors]); // eslint-disable-line react-hooks/exhaustive-deps
+  const outlineHints = useMemo(() => outlineHintsFor((b.competitors || []).filter((c) => c.crawlSummary), topicText), [b.competitors]); // eslint-disable-line react-hooks/exhaustive-deps
   const saved = idea.draft;
   const [stage, setStage] = useState(saved ? "done" : "setup"); // setup | working | done
   const [candidates, setCandidates] = useState([]);
@@ -4544,7 +4550,7 @@ function ArticleWriterModal({ idea, onClose, onSave }) {
       const common = {
         idea: { title: idea.title, primaryKeyword: idea.primaryKeyword, secondaryKeywords: idea.secondaryKeywords, intent: idea.intent, questions: idea.questions, outline: idea.outline, angle: idea.angle, format: idea.format, wordCountTarget: target },
         site: { domain: crawl?.domain || "", name: website?.name || "", summary: siteMetaFrom(b)?.fullText?.slice(0, 1000) || "" },
-        sources, internalLinks: internal, firstHand, country,
+        sources, internalLinks: internal, firstHand, outlineHints, country,
       };
       setProgress("Writing the first half…");
       const p1 = (await postJson("/api/content-write", { ...common, part: 1 })).draft;
@@ -4606,12 +4612,26 @@ function ArticleWriterModal({ idea, onClose, onSave }) {
                 ))}
               </div>
             )}
+            {fromCompetitors.length > 0 && (
+              <div className="mb-2">
+                <p className="text-xs font-semibold mb-1" style={{ color: BRAND.inkSoft }}>Cited by your competitors (from their crawled pages)</p>
+                <div className="space-y-1.5">
+                  {fromCompetitors.map((c) => (
+                    <label key={c.url} className="flex items-start gap-2 rounded-lg px-3 py-2 cursor-pointer text-sm" style={{ background: BRAND.canvas }}>
+                      <input type="checkbox" className="mt-1" checked={picked.includes(c.url)} onChange={(e) => setPicked((p) => (e.target.checked ? [...p, c.url].slice(0, 5) : p.filter((u) => u !== c.url)))} />
+                      <span className="min-w-0"><Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{c.authority}</Badge> <span className="text-xs" style={{ color: BRAND.inkSoft }}>cited by {c.competitors.join(", ")}</span><span className="block text-xs break-all">{c.url}</span></span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
             <Field label="Or paste source URLs (one per line, up to 5 in total)"><TextArea value={pasted} placeholder="https://…" onChange={(e) => setPasted(e.target.value)} style={{ minHeight: 64 }} /></Field>
           </div>
           <div>
             <div className="text-xs font-semibold uppercase tracking-wide mb-1.5" style={{ color: BRAND.inkSoft }}>2. Your first-hand input (strongly recommended)</div>
             <TextArea value={firstHand} onChange={(e) => setFirstHand(e.target.value)} placeholder="Real experience, numbers, examples, mistakes you've seen, what you actually do. The writer may use this as fact. Leave blank and the draft will mark where your experience belongs." style={{ minHeight: 96 }} />
           </div>
+          {outlineHints.length > 0 && <p className="text-xs" style={{ color: BRAND.inkSoft }}>{outlineHints.length} section topic{outlineHints.length === 1 ? "" : "s"} from competitors' pages on this subject will be used as research (never their wording).</p>}
           <div className="grid grid-cols-2 gap-3">
             <Field label="Target length"><Select value={target} onChange={(e) => setTarget(Number(e.target.value))}>{[800, 1200, 1600, 2000].map((n) => <option key={n} value={n}>about {n} words</option>)}</Select></Field>
           </div>
@@ -4647,6 +4667,131 @@ function ArticleWriterModal({ idea, onClose, onSave }) {
         </div>
       )}
     </Modal>
+  );
+}
+
+/* ============================== Competitor intelligence (from stored competitor crawls) ============================== */
+
+const Q_SRC = { faq: "FAQ schema", heading: "Heading", text: "Page text" };
+const ANSWERED = { no: { label: "You don't answer this", fg: "red", bg: "redSoft" }, partial: { label: "Partly covered", fg: "amber", bg: "amberSoft" }, yes: { label: "You answer this", fg: "visibility", bg: "visibilitySoft" } };
+
+/** What the competitor crawls show, put to work: the exact questions their pages ask (and whether you answer them), the sections their
+ *  pages cover that yours don't, and the outside sources they cite. Observed data only: questions are reused as asked, headings are
+ *  research, sources are pointers. Answers and page text are never copied. See lib/competitorIntel.js. */
+function CompetitorIntelPanel() {
+  const { bundle, addAction, toast } = useApp();
+  const b = bundle();
+  const [tab, setTab] = useState("questions");
+  const [filter, setFilter] = useState("no");
+  const [search, setSearch] = useState("");
+  const [shown, setShown] = useState(25);
+  const [open, setOpen] = useState(null);
+  const withData = (b.competitors || []).filter((c) => c.crawlSummary?.pages?.length);
+  const answeredAeo = (b.siteAeoAnalysis?.questions || []).filter((q) => q.coverage === "Answered").map((q) => q.question);
+  const bank = useMemo(() => questionBank(withData, b.siteCrawl, { answeredAeo }), [b.competitors, b.siteCrawl, b.siteAeoAnalysis]); // eslint-disable-line react-hooks/exhaustive-deps
+  const gaps = useMemo(() => outlineGaps(withData, b.siteCrawl), [b.competitors, b.siteCrawl]); // eslint-disable-line react-hooks/exhaustive-deps
+  const cites = useMemo(() => competitorCitations(withData, { ownHost: b.siteCrawl?.domain }), [b.competitors, b.siteCrawl]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if ((b.competitors || []).length === 0) return null;
+  if (withData.length === 0) {
+    return (
+      <Card className="p-4">
+        <div className="flex items-center gap-2 mb-1"><Search size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">Competitor intelligence</h3></div>
+        <p className="text-sm" style={{ color: BRAND.inkSoft }}>Run the site-wide analysis on a competitor below to capture the questions their pages ask, the sections they cover and the sources they cite. Competitors analysed before this update need to be run again once.</p>
+      </Card>
+    );
+  }
+  const isAdded = (id) => b.actions.some((a) => a.detail?.sourceId === id);
+  const q = search.trim().toLowerCase();
+  const visible = bank.items.filter((i) => (filter === "all" || i.answered === filter) && (!q || i.question.toLowerCase().includes(q)));
+  const counts = { no: bank.items.filter((i) => i.answered === "no").length, partial: bank.items.filter((i) => i.answered === "partial").length, yes: bank.items.filter((i) => i.answered === "yes").length };
+
+  const questionRec = (i) => ({ title: `Answer: "${i.question}"`, evidence: `${i.count} competitor${i.count === 1 ? "" : "s"} (${i.competitors.join(", ")}) ask this question on their pages. ${i.answered === "no" ? "Your site doesn't answer it." : i.answered === "partial" ? `Your site partly covers it${i.ourUrl ? ` (${i.ourUrl})` : ""}.` : "Your site already answers it."}`, recommendedAction: "Write an original answer from your own facts and experience: a direct 40-60 word answer first, then supporting detail. Do not reuse any competitor's wording.", module: "Competitor Analysis (question bank)", source: "Competitor crawl (observed)", actionType: "FAQ Addition", priority: i.count >= 2 ? "High" : "Medium", urls: i.ourUrl ? [i.ourUrl] : [] });
+  const gapRec = (g) => g.kind === "missing_sections"
+    ? { title: `Content gap: add missing sections to ${g.ourTitle || g.ourUrl}`, evidence: `${g.competitor}'s page "${g.theirTitle}" covers sections your page doesn't: ${g.sections.join("; ")}.`, recommendedAction: "Add the sections that are genuinely useful to your readers, in your own words and structure, with your own facts and examples. Skip any that don't fit your offer.", urls: [g.ourUrl] }
+    : { title: `Content gap: create a page on "${g.theirTitle}"`, evidence: `${g.competitors} competitor${g.competitors === 1 ? "" : "s"} (${g.competitor}) have a page on this topic and your site has none. Sections they cover: ${g.sections.join("; ")}.`, recommendedAction: "Create a page that serves this topic better: your own structure, your own facts and examples, and something they lack (first-hand data, local specifics, a tool).", urls: [] };
+
+  return (
+    <Card className="p-4 space-y-3">
+      <div className="flex flex-wrap items-center gap-2"><Search size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">Competitor intelligence</h3><DataLabel kind="observed" title="Read from competitors' crawled pages; nothing here is generated.">From {withData.length} competitor crawl{withData.length === 1 ? "" : "s"}</DataLabel></div>
+      <div className="flex gap-1 flex-wrap">
+        {[["questions", `Questions (${bank.total})`], ["outline", `Content gaps (${gaps.length})`], ["sources", `Sources they cite (${cites.length})`]].map(([id, label]) => (
+          <button key={id} type="button" onClick={() => setTab(id)} className="vr-focus text-sm font-medium rounded-lg px-3 py-1.5" style={{ background: tab === id ? BRAND.primarySoft : "transparent", color: tab === id ? BRAND.primary : BRAND.inkSoft }}>{label}</button>
+        ))}
+      </div>
+
+      {tab === "questions" && (
+        <div className="space-y-3">
+          <p className="text-xs" style={{ color: BRAND.inkSoft }}>Questions are shown exactly as competitors' pages ask them (FAQ markup, headings and page text). Write your own answers from your own facts: answers and page text are never copied from competitor pages, and copying them would hurt your site.{bank.skippedBrand > 0 ? ` ${bank.skippedBrand} that name a competitor's brand were left out.` : ""}</p>
+          <div className="flex flex-wrap items-end gap-2">
+            <Field label="Show"><Select value={filter} onChange={(e) => { setFilter(e.target.value); setShown(25); }}><option value="no">You don't answer ({counts.no})</option><option value="partial">Partly covered ({counts.partial})</option><option value="yes">Already answered ({counts.yes})</option><option value="all">All ({bank.total})</option></Select></Field>
+            <Field label="Search"><TextInput value={search} placeholder="Filter questions" onChange={(e) => { setSearch(e.target.value); setShown(25); }} /></Field>
+            <div className="mb-3.5"><CopyButton label={`Copy ${visible.length} question${visible.length === 1 ? "" : "s"}`} variant="soft" getText={() => visible.map((i) => i.question).join("\n")} /></div>
+          </div>
+          {visible.length === 0 ? <p className="text-sm" style={{ color: BRAND.inkSoft }}>No questions match. {bank.total === 0 ? "None of the crawled pages exposed question-style headings or FAQ markup." : ""}</p> : (
+            <ul className="space-y-2">
+              {visible.slice(0, shown).map((i) => { const st = ANSWERED[i.answered]; return (
+                <li key={i.id} className="rounded-lg p-3" style={{ background: BRAND.canvas }}>
+                  <p className="text-sm font-medium break-words">“{i.question}”</p>
+                  <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                    <Badge color={{ fg: BRAND[st.fg], bg: BRAND[st.bg] }}>{st.label}</Badge>
+                    <Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{i.count} competitor{i.count === 1 ? "" : "s"}</Badge>
+                    {i.sources.map((s) => <Badge key={s} color={{ fg: BRAND.inkSoft, bg: BRAND.surface }}>{Q_SRC[s]}</Badge>)}
+                    <button type="button" className="vr-focus text-[11px] underline ml-1" style={{ color: BRAND.primary }} onClick={() => setOpen(open === i.id ? null : i.id)}>{open === i.id ? "Hide" : "Where it's asked"}</button>
+                  </div>
+                  {open === i.id && (
+                    <ul className="mt-2 text-xs space-y-0.5" style={{ color: BRAND.inkSoft }}>
+                      {i.pages.map((p) => <li key={p.url} className="break-all">{p.competitor}: <a href={p.url} target="_blank" rel="noopener noreferrer" className="underline">{p.url}</a></li>)}
+                      {i.ourUrl && <li className="break-all">Your closest page: {i.ourUrl}</li>}
+                    </ul>
+                  )}
+                  <div className="flex justify-end gap-2 mt-2">
+                    <CopyButton iconOnly label="Copy question" getText={() => i.question} />
+                    <GenerateFixButton rec={questionRec(i)} />
+                    <Button size="sm" variant={isAdded(i.id) ? "outline" : "soft"} icon={isAdded(i.id) ? Check : ListPlus} disabled={isAdded(i.id)} onClick={() => { const r = questionRec(i); addAction({ title: r.title, type: "FAQ Addition", status: "New", detail: { sourceId: i.id, module: r.module, evidence: r.evidence, recommendedAction: r.recommendedAction, priority: r.priority, source: r.source } }); toast("Added to Action Center"); }}>{isAdded(i.id) ? "Added" : "Add to Action Center"}</Button>
+                  </div>
+                </li>); })}
+            </ul>
+          )}
+          {visible.length > shown && <div className="flex justify-center"><Button variant="outline" onClick={() => setShown((n) => n + 25)}>Show more ({visible.length - shown} left)</Button></div>}
+        </div>
+      )}
+
+      {tab === "outline" && (
+        <div className="space-y-2">
+          <p className="text-xs" style={{ color: BRAND.inkSoft }}>Where competitors' pages cover more than yours: a matching page of yours that lacks sections theirs has, or a topic several competitors cover that you have no page for. The sections listed are research on what readers get from them, not text to publish.</p>
+          {gaps.length === 0 ? <p className="text-sm" style={{ color: BRAND.inkSoft }}>No clear content gaps found in these crawls.</p> : gaps.map((g) => { const rec = gapRec(g); const id = `cg_${g.id}`; return (
+            <div key={g.id} className="rounded-lg p-3" style={{ background: BRAND.canvas }}>
+              <div className="flex flex-wrap items-center gap-2 mb-1"><Badge color={g.kind === "missing_page" ? { fg: BRAND.red, bg: BRAND.redSoft } : { fg: BRAND.amber, bg: BRAND.amberSoft }}>{g.kind === "missing_page" ? "No page on this topic" : "Missing sections"}</Badge><span className="text-xs" style={{ color: BRAND.inkSoft }}>{g.kind === "missing_page" ? `${g.competitors} competitor${g.competitors === 1 ? "" : "s"}: ${g.competitor}` : g.competitor}</span></div>
+              <p className="text-sm font-medium break-words">{g.kind === "missing_page" ? g.theirTitle : `Your page “${g.ourTitle || g.ourUrl}” vs. “${g.theirTitle}”`}</p>
+              <ul className="text-xs list-disc pl-5 mt-1.5 space-y-0.5">{g.sections.map((s) => <li key={s}>{s}</li>)}</ul>
+              <p className="text-[11px] mt-1.5 break-all" style={{ color: BRAND.inkSoft }}>Their page: <a href={g.theirUrl} target="_blank" rel="noopener noreferrer" className="underline">{g.theirUrl}</a>{g.ourUrl ? ` · Yours: ${g.ourUrl}` : ""}</p>
+              <div className="flex justify-end gap-2 mt-2">
+                <GenerateFixButton rec={{ ...rec, module: "Competitor Analysis (content gap)", source: "Competitor crawl (observed)", actionType: "Content Update", priority: g.kind === "missing_page" && g.competitors >= 2 ? "High" : "Medium" }} />
+                <Button size="sm" variant={isAdded(id) ? "outline" : "soft"} icon={isAdded(id) ? Check : ListPlus} disabled={isAdded(id)} onClick={() => { addAction({ title: rec.title, type: "Content Update", status: "New", detail: { sourceId: id, module: "Competitor Analysis (content gap)", evidence: rec.evidence, recommendedAction: rec.recommendedAction, priority: "Medium", source: "Competitor crawl (observed)" } }); toast("Added to Action Center"); }}>{isAdded(id) ? "Added" : "Add to Action Center"}</Button>
+              </div>
+            </div>); })}
+        </div>
+      )}
+
+      {tab === "sources" && (
+        <div className="space-y-2">
+          <p className="text-xs" style={{ color: BRAND.inkSoft }}>Outside pages your competitors link to (deep links only; social, ads and marketplaces are left out), authoritative sites first. Use them as a reading list and as source candidates in the article writer. Read each one yourself before citing it.</p>
+          {cites.length === 0 ? <p className="text-sm" style={{ color: BRAND.inkSoft }}>These crawls didn't link out to many outside pages.</p> : (
+            <>
+              <div className="flex justify-end"><CopyButton label="Copy URLs" variant="soft" getText={() => cites.slice(0, 40).map((c) => c.url).join("\n")} /></div>
+              {cites.slice(0, 40).map((c) => (
+                <div key={c.url} className="rounded-lg px-3 py-2" style={{ background: BRAND.canvas }}>
+                  <div className="flex flex-wrap items-center gap-2"><Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{c.authority}</Badge><span className="text-xs" style={{ color: BRAND.inkSoft }}>cited {c.count}× by {c.competitors.join(", ")}</span></div>
+                  <a href={c.url} target="_blank" rel="noopener noreferrer" className="vr-focus text-sm break-all underline" style={{ color: BRAND.primary }}>{c.url}</a>
+                  {c.anchors.length > 0 && <p className="text-[11px]" style={{ color: BRAND.inkSoft }}>Linked as: {c.anchors.map((a) => `“${a}”`).join(", ")}</p>}
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      )}
+    </Card>
   );
 }
 

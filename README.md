@@ -133,6 +133,18 @@ It produces the actual deliverable for that kind of finding, from your real craw
 
 Be clear-eyed about what this is. The checklist covers Google's published on-page basics and helpful-content guidance; it cannot judge accuracy or originality, and nothing can guarantee indexing or rankings. Google allows AI-assisted content that is helpful and made for people, but its spam policy targets many pages made mainly to rank without added value (scaled content abuse). Use drafts as a starting point: add real experience and data, verify every claim against its source, fill in the author and review date, and publish only what you'd stand behind. Writing runs as two ~60-second AI passes, so each article takes about a minute; sources found with "Find sources" use one search from your SerpApi allowance.
 
+## Competitor intelligence
+
+Competitor crawls are now stored (compactly: titles, outline, questions, schema types, size and outside links; **no page text**) and used in three ways. Competitors analysed before this update need their site-wide analysis run once more to capture it. The **Competitor intelligence** card at the top of the Competitors tab has three views:
+
+- **Questions**: every question the competitors' pages ask (from FAQPage markup, question-style headings and page text), kept exactly as written and counted across competitors, each marked *You don't answer this / Partly covered / You answer this* against your own crawl and AEO analysis. Filter, copy the list, **Generate fix** to write your own answer from your own facts, or add to the Action Center. Questions that name a competitor's brand are skipped.
+- **Content gaps**: a page of yours that lacks sections a competitor's matching page has, or a topic several competitors cover that you have no page for, with the section headings they use as research. Generate fix or add to the Action Center.
+- **Sources they cite**: outside pages competitors link to (deep links only, no social/ads/marketplaces, authoritative first). They also appear as source candidates in the article writer.
+
+They also feed the rest of the tool: unanswered competitor questions, competitor-only topics and missing-page topics become grounded items (ids `C…`, labelled "Competitor crawl") for the 30-day calendar, and the article writer receives the section topics competitors cover on the same subject as research.
+
+What is and isn't reused: questions are reused as asked (short, generic labels of reader intent); headings are shown as research, never as text to publish; source links are pointers you check yourself; competitor **answers and body text are never extracted or reused**. Copying or lightly rewording a competitor's copy is a copyright problem and the kind of scraped, stitched content Google's spam policies target, so every tool that follows tells the AI to answer from your facts in your own words. The crawler also now records every H2–H4, question-style headings and FAQ-schema questions on each page (additive: existing fields are unchanged); your own site needs a re-crawl to pick these up, though the tools work with older crawls. Code: `lib/faqSchema.js`, `lib/competitorIntel.js`.
+
 ## Crawl identity and stale-data protection
 
 Every crawl gets a `crawlId` (minted in `lib/siteCrawler.js`). Analyses (AEO, GEO, keyword clusters, internal links, AI insights, competitor comparison, AI visibility) are stamped with the `crawlId` they were computed from, and an async result is only applied if that crawl is still the current one. The logic lives in `lib/crawlState.js` (unit-tested in `tests/crawlState.test.mjs`):
