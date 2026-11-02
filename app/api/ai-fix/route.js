@@ -1,3 +1,4 @@
+import { normalizeCountry, marketPromptBlock } from "../../../lib/market";
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
 
@@ -8,6 +9,8 @@ export async function POST(req) {
   const guard = await guardJson(req, "aiLight");
   if (!guard.ok) return guard.response;
   const body = guard.body;
+  // Validated against the fixed country list, so it can never carry free text into a prompt.
+  const country = normalizeCountry(body?.country);
 
   const issue = body?.issue;
   const meta = body?.meta || {};
@@ -15,7 +18,7 @@ export async function POST(req) {
     return Response.json({ error: "An issue is required." }, { status: 400 });
   }
 
-  const system = `You are VertexRank AI, a precise SEO engineer fixing a real, specific issue on a real website. You use the real page content you're given — the actual current title, description, headings, and text — rather than inventing a generic fictional business. If the issue already includes the real current text as "before", reuse it exactly rather than making up a different one.`;
+  const system = `You are VertexRank AI, a precise SEO engineer fixing a real, specific issue on a real website. You use the real page content you're given — the actual current title, description, headings, and text — rather than inventing a generic fictional business. If the issue already includes the real current text as "before", reuse it exactly rather than making up a different one.` + marketPromptBlock(country);
 
   const prompt = `Website: ${meta.domain || "(unknown)"}
 Page title: "${meta.title || "(missing)"}"

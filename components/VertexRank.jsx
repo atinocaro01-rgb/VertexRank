@@ -23,6 +23,10 @@ import {
 import { COUNTRIES, normalizeCountry } from "../lib/market";
 import { findSiteRank, sameSite, hostOf } from "../lib/serpMatch";
 import { slimCheck, upsertCheck, competitorProspects } from "../lib/serpInsights";
+import { buildFixInput, fixCacheKey } from "../lib/fixContext";
+import { buildCalendarInput } from "../lib/calendarContext";
+import { checkArticle, buildArticleSchema } from "../lib/articleChecks";
+import { assembleArticle } from "../lib/articleWriter";
 import { computeAuditIssuesForMarket } from "../lib/auditIssues";
 import { proposeFixes, rowReady, rowToFix, fixTypeOf, suggestionItem, avoidList, pagePlainText } from "../lib/fixPlanner";
 import { checkSuggestion } from "../lib/seoSuggestions";
@@ -620,13 +624,110 @@ function SortHeader({ label, sortKey, sort, setSort }) {
   );
 }
 
+/* ============================== Generate fix (every recommendation) ============================== */
+
+const fixCache = new Map(); // reopening the same recommendation reuses its fix instead of spending another AI call
+
+/** The actual deliverable for a recommendation — text, markup, an email, a rewritten section — generated from the real crawled page
+ *  data. Anything only the owner can supply is marked [ADD: …]; nothing is invented. See app/api/recommendation-fix/route.js. */
+function FixModal({ rec, onClose }) {
+  const { bundle, currentWebsiteId } = useApp();
+  const [stage, setStage] = useState("loading"); // loading | ready | error
+  const [fix, setFix] = useState(null);
+  const [errorMsg, setErrorMsg] = useState("");
+  const key = fixCacheKey(rec, currentWebsiteId);
+
+  async function generate(force = false) {
+    if (!force && fixCache.has(key)) { setFix(fixCache.get(key)); setStage("ready"); return; }
+    setStage("loading"); setErrorMsg("");
+    try {
+      const crawl = bundle().siteCrawl;
+      const data = await postJson("/api/recommendation-fix", { ...buildFixInput(rec, crawl), country: countryOf(currentWebsiteId) });
+      fixCache.set(key, data.fix); setFix(data.fix); setStage("ready");
+    } catch (err) {
+      setErrorMsg(err.message || "Something went wrong. Try again."); setStage("error");
+    }
+  }
+  useEffect(() => { generate(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [key]);
+
+  const everything = () => fix ? [`# ${rec.title}`, fix.headline, ...fix.artifacts.map((a) => `\n## ${a.label}${a.where ? ` — ${a.where}` : ""}\n${a.content}`), fix.steps.length ? `\n## Steps\n${fix.steps.map((x, i) => `${i + 1}. ${x}`).join("\n")}` : "", fix.checks.length ? `\n## How to check it worked\n${fix.checks.map((x) => `- ${x}`).join("\n")}` : ""].filter(Boolean).join("\n") : "";
+
+  return (
+    <Modal open onClose={onClose} title="Generated fix" width={700}
+      footer={stage === "ready" ? <>
+        <Button variant="outline" icon={RefreshCw} onClick={() => generate(true)}>Regenerate</Button>
+        <CopyButton label="Copy everything" variant="soft" getText={everything} />
+        <Button onClick={onClose}>Done</Button>
+      </> : stage === "error" ? <><Button variant="outline" onClick={onClose}>Close</Button><Button icon={RefreshCw} onClick={() => generate(true)}>Try again</Button></> : null}>
+      <div className="mb-4">
+        <div className="text-xs font-semibold uppercase tracking-wide mb-1" style={{ color: BRAND.inkSoft }}>Recommendation</div>
+        <p className="text-sm">{rec.title}</p>
+      </div>
+      {stage === "loading" ? (
+        <div className="flex flex-col items-center py-10 gap-3">
+          <Loader2 className="vr-spin" size={26} style={{ color: BRAND.primary }} />
+          <p className="text-sm" style={{ color: BRAND.inkSoft }}>VertexRank AI is reading your pages and writing the fix…</p>
+        </div>
+      ) : stage === "error" ? (
+        <div className="flex flex-col items-center py-10 gap-3 text-center">
+          <AlertTriangle size={26} style={{ color: BRAND.red }} />
+          <p className="text-sm" style={{ color: BRAND.inkSoft }}>{errorMsg}</p>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {fix.headline && <p className="text-sm font-medium">{fix.headline}</p>}
+          {fix.placeholders > 0 && (
+            <div className="flex items-start gap-2 rounded-lg px-3 py-2 text-xs" style={{ background: BRAND.amberSoft, color: BRAND.amber }}>
+              <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+              <span>{fix.placeholders} spot{fix.placeholders === 1 ? "" : "s"} marked <strong>[ADD: …]</strong> need a real detail only you have. They're left blank on purpose so nothing is made up.</span>
+            </div>
+          )}
+          {fix.unknownLinks.length > 0 && (
+            <div className="flex items-start gap-2 rounded-lg px-3 py-2 text-xs" style={{ background: BRAND.redSoft, color: BRAND.red }}>
+              <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+              <span>This fix links to pages that aren't in your crawl ({fix.unknownLinks.join(", ")}). Check they exist before using them.</span>
+            </div>
+          )}
+          {fix.artifacts.map((a, i) => (
+            <div key={i} className="rounded-lg overflow-hidden" style={{ border: `1px solid ${BRAND.line}` }}>
+              <div className="flex items-center justify-between gap-2 px-3 py-2" style={{ background: BRAND.canvas }}>
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold">{a.label} <span className="text-[10px] font-normal uppercase" style={{ color: BRAND.inkSoft }}>{a.format}</span></p>
+                  {a.where && <p className="text-xs" style={{ color: BRAND.inkSoft }}>Where: {a.where}</p>}
+                </div>
+                <CopyButton iconOnly label="Copy this" getText={() => a.content} />
+              </div>
+              <pre className="vr-mono text-xs whitespace-pre-wrap break-words p-3" style={{ background: BRAND.surface }}>{a.content}</pre>
+            </div>
+          ))}
+          {fix.steps.length > 0 && <div><div className="text-xs font-semibold uppercase tracking-wide mb-1.5" style={{ color: BRAND.inkSoft }}>How to apply it</div><ol className="text-sm list-decimal pl-5 space-y-1">{fix.steps.map((x, i) => <li key={i}>{x}</li>)}</ol></div>}
+          {fix.checks.length > 0 && <div><div className="text-xs font-semibold uppercase tracking-wide mb-1.5" style={{ color: BRAND.inkSoft }}>How to check it worked</div><ul className="text-sm list-disc pl-5 space-y-1">{fix.checks.map((x, i) => <li key={i}>{x}</li>)}</ul></div>}
+          {fix.assumptions.length > 0 && <div><div className="text-xs font-semibold uppercase tracking-wide mb-1.5" style={{ color: BRAND.inkSoft }}>Assumptions</div><ul className="text-xs list-disc pl-5 space-y-1" style={{ color: BRAND.inkSoft }}>{fix.assumptions.map((x, i) => <li key={i}>{x}</li>)}</ul></div>}
+          <p className="text-[11px]" style={{ color: BRAND.inkSoft }}>Generated by VertexRank AI from your crawled pages. It is a draft: review it, fill in the [ADD: …] spots, and test it before publishing.</p>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+/** "Generate fix" button for any recommendation-shaped object: { title, why, evidence, recommendedAction, module, source, actionType, priority, urls }. */
+function GenerateFixButton({ rec, variant = "primary" }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <Button size="sm" variant={variant} icon={Wand2} onClick={(e) => { e?.stopPropagation?.(); setOpen(true); }}>Generate fix</Button>
+      {open && <FixModal rec={rec} onClose={() => setOpen(false)} />}
+    </>
+  );
+}
+
 /* ============================== recommendation → action center ============================== */
 
 /** Shared card for any grounded recommendation object (from Keyword,
  *  AEO, GEO, Simulator, or the unified engine) with a one-click path into
  *  the Action Center. Every recommendation carries a Source label so it's
  *  always clear whether it's real crawl data or VertexRank AI reasoning. */
-function RecommendationCard({ title, why, module, evidence, recommendedAction, priority, confidence, source, actionType, onAdd, added, addedLabel = "Added", meta, note, actions, evidenceLabel = "EVIDENCE FROM CRAWL" }) {
+function RecommendationCard({ title, why, module, evidence, recommendedAction, priority, confidence, source, actionType, urls, onAdd, added, addedLabel = "Added", meta, note, actions, evidenceLabel = "EVIDENCE FROM CRAWL", hideFix = false }) {
   return (
     <div className="rounded-lg p-3.5" style={{ background: BRAND.canvas }}>
       <div className="flex items-start justify-between gap-2 mb-1.5">
@@ -659,6 +760,7 @@ function RecommendationCard({ title, why, module, evidence, recommendedAction, p
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           {actions}
+          {!hideFix && <GenerateFixButton rec={{ title, why, evidence, recommendedAction, module, source, actionType, priority, urls }} />}
           <Button size="sm" variant={added ? "outline" : "soft"} icon={added ? Check : ListPlus} disabled={added} onClick={onAdd}>
             {added ? addedLabel : "Add to Action Center"}
           </Button>
@@ -835,6 +937,7 @@ function TopBar({ view }) {
 /* ============================== AI Fix Generator ============================== */
 
 function AiFixModal({ issue, meta, onClose, onApply }) {
+  const { currentWebsiteId } = useApp();
   const [stage, setStage] = useState("loading"); // loading | ready | error
   const [fix, setFix] = useState(null);
   const [errorMsg, setErrorMsg] = useState("");
@@ -846,6 +949,7 @@ function AiFixModal({ issue, meta, onClose, onApply }) {
       const data = await postJson("/api/ai-fix", {
         issue: { title: issue.title, category: issue.category, severity: issue.severity, why: issue.why, fix: issue.fix, before: issue.before },
         meta: meta || {},
+        country: countryOf(currentWebsiteId),
       });
       setFix(data.fix);
       setStage("ready");
@@ -1129,7 +1233,7 @@ function Dashboard() {
           <div className="space-y-3">
             {unifiedRecs.map((rec) => (
               <RecommendationCard key={rec.id}
-                title={rec.title} module={rec.module} evidence={rec.evidence}
+                title={rec.title} module={rec.module} evidence={rec.evidence} urls={rec.urls} actionType={rec.actionType}
                 recommendedAction={rec.recommendedAction} priority={rec.priority} confidence={rec.confidence}
                 source={rec.source} note={rec.note} added={isOpportunityAdded(b.actions, rec)} onAdd={() => addUnifiedToActions(rec)}
                 evidenceLabel={rec.type === "search" ? "OBSERVED IN SEARCH CONSOLE (ESTIMATES ARE LABELLED)" : undefined}
@@ -1635,7 +1739,7 @@ function OpportunitiesView() {
         <div className="space-y-3">
           {filtered.slice(0, shown).map((o) => (
             <RecommendationCard key={o.id}
-              title={o.title} module={o.module} evidence={o.evidence} recommendedAction={o.recommendedAction}
+              title={o.title} module={o.module} evidence={o.evidence} recommendedAction={o.recommendedAction} urls={o.urls} actionType={o.actionType}
               priority={o.priority} confidence={o.confidence} source={o.source} note={o.note}
               added={o.state !== "new"} addedLabel={o.state === "done" ? "Done" : o.state === "rejected" ? "Rejected" : "In Action Center"}
               onAdd={() => add(o)} evidenceLabel={o.type === "search" ? "OBSERVED IN SEARCH CONSOLE (ESTIMATES ARE LABELLED)" : undefined}
@@ -2410,7 +2514,8 @@ function ActionCenter() {
                         </select>
                       </td>
                       <td className="px-4 py-2.5">
-                        <div className="flex gap-0.5 justify-end">
+                        <div className="flex gap-1 items-center justify-end">
+                          <GenerateFixButton variant="soft" rec={{ title: a.title, evidence: a.detail?.evidence, recommendedAction: a.detail?.recommendedAction, module: a.detail?.module, source: a.detail?.source, actionType: a.type, priority: a.detail?.priority }} />
                           <CopyButton iconOnly label="Copy this action" getText={() => formatAction(a, "##")} />
                           <IconButton icon={Pencil} onClick={() => openEdit(a)} title="Edit" />
                           <IconButton icon={Trash2} danger onClick={() => setConfirmDelete(a)} title="Delete" />
@@ -2568,7 +2673,7 @@ function SiteKeywordClusteringPanel() {
           <h3 className="font-semibold vr-display mb-3">Keyword Opportunity Analysis</h3>
           <div className="space-y-3">
             {data.opportunities.map((o) => (
-              <RecommendationCard key={o.id} title={o.problem} evidence={o.evidence} recommendedAction={o.recommendedAction} priority={o.priority} confidence={o.confidence} source={o.source} onAdd={() => addOpportunity(o)} added={isAdded(o.id)} />
+              <RecommendationCard key={o.id} title={o.problem} module="Site-wide Keyword Intelligence" urls={o.urls} evidence={o.evidence} recommendedAction={o.recommendedAction} priority={o.priority} confidence={o.confidence} source={o.source} onAdd={() => addOpportunity(o)} added={isAdded(o.id)} />
             ))}
           </div>
         </Card>
@@ -2597,7 +2702,8 @@ function SiteKeywordClusteringPanel() {
                     </div>
                   )}
                   {g.reasoning && <p className="text-[11px] mb-2" style={{ color: BRAND.inkSoft }}>{g.reasoning}</p>}
-                  <div className="flex justify-end">
+                  <div className="flex justify-end gap-2">
+                    <GenerateFixButton rec={{ title: `${g.recommendedAction} competing pages`, evidence: g.explanation, recommendedAction: g.reasoning, module: "Site-wide Keyword Intelligence", source: g.source, priority: "High", urls: (c?.competingPages || []).map((p) => p.url) }} />
                     <Button size="sm" variant={isAdded(g.id) ? "outline" : "soft"} icon={isAdded(g.id) ? Check : ListPlus} disabled={isAdded(g.id)} onClick={() => addCannibalGuidance(g)}>{isAdded(g.id) ? "Added" : "Add to Action Center"}</Button>
                   </div>
                 </div>
@@ -3354,6 +3460,9 @@ function SiteAeoPanel() {
                             <div className="flex items-center justify-end gap-2 pt-1">
                               <CopyButton label="Copy fixes" getText={() => formatWeakPage(p, { heading: "##" })} />
                               {hasRecs && p.fixes.length > 0 && (
+                                <GenerateFixButton rec={{ title: `Improve AEO on: ${p.title}`, evidence: `Scores ${p.score}/100 on the AEO signal checklist (${p.url}).`, recommendedAction: (p.fixes || []).map((f) => `${f.label}: ${f.action}`).join("\n"), module: "Site-wide AEO", source: "VertexRank crawl signals", priority: p.priority, urls: [p.url] }} />
+                              )}
+                              {hasRecs && p.fixes.length > 0 && (
                                 <Button size="sm" variant={isAdded(`saeop_${p.url}`) ? "outline" : "soft"} icon={isAdded(`saeop_${p.url}`) ? Check : ListPlus} disabled={isAdded(`saeop_${p.url}`)} onClick={() => addPageToActions(p)}>
                                   {isAdded(`saeop_${p.url}`) ? "Added" : "Add to Action Center"}
                                 </Button>
@@ -3374,7 +3483,7 @@ function SiteAeoPanel() {
             {(aeo.contentRecommendations || []).length === 0 ? <p className="text-sm" style={{ color: BRAND.inkSoft }}>No site-level additions flagged this run.</p> : (
               <div className="space-y-3">
                 {sortByPriority(aeo.contentRecommendations).map((r) => (
-                  <RecommendationCard key={r.id} title={r.recommendation} evidence={r.why} priority={r.priority} source={r.source} added={isAdded(`saeor_${r.id}`)} onAdd={() => addRecToActions(r)} />
+                  <RecommendationCard key={r.id} title={r.recommendation} module="Site-wide AEO" evidence={r.why} priority={r.priority} source={r.source} added={isAdded(`saeor_${r.id}`)} onAdd={() => addRecToActions(r)} />
                 ))}
               </div>
             )}
@@ -3407,7 +3516,8 @@ function SiteAeoPanel() {
                         </div>
                         {q.missingInfo && <div><p className="text-xs font-semibold mb-0.5" style={{ color: BRAND.inkSoft }}>Missing information</p><p className="text-sm">{q.missingInfo}</p></div>}
                         {q.recommendedAnswer && <div><p className="text-xs font-semibold mb-0.5" style={{ color: BRAND.inkSoft }}>Recommended answer</p><p className="text-sm">{q.recommendedAnswer}</p></div>}
-                        <div className="flex justify-end pt-1">
+                        <div className="flex justify-end gap-2 pt-1">
+                          <GenerateFixButton rec={{ title: `Answer: "${q.question}"`, evidence: q.missingInfo, recommendedAction: q.recommendedAnswer, module: "Site-wide AEO", source: q.source, priority: q.priority, urls: q.answeringUrl ? [q.answeringUrl] : [] }} />
                           <Button size="sm" variant={isAdded(`saeoq_${q.id}`) ? "outline" : "soft"} icon={isAdded(`saeoq_${q.id}`) ? Check : ListPlus} disabled={isAdded(`saeoq_${q.id}`)} onClick={() => addQuestionToActions(q)}>
                             {isAdded(`saeoq_${q.id}`) ? "Added" : "Add to Action Center"}
                           </Button>
@@ -3694,7 +3804,7 @@ function SiteGeoPanel() {
             ) : (
               <div className="space-y-3">
                 {sortByPriority(geo.opportunities).map((o) => (
-                  <RecommendationCard key={o.id} title={o.title} evidence={o.why} priority={o.priority} source={o.source} added={isAdded(`sgeoo_${o.id}`)} onAdd={() => addOppToActions(o)} />
+                  <RecommendationCard key={o.id} title={o.title} module="Site-wide GEO" evidence={o.why} priority={o.priority} source={o.source} added={isAdded(`sgeoo_${o.id}`)} onAdd={() => addOppToActions(o)} />
                 ))}
               </div>
             )}
@@ -3781,7 +3891,8 @@ function AiVisibilitySimulatorPanel() {
               </div>
               {q.missingInfo && <div className="rounded p-2 mb-2" style={{ background: BRAND.canvas }}><p className="text-[10px] font-semibold mb-0.5" style={{ color: BRAND.inkSoft }}>MISSING INFORMATION</p><p className="text-xs">{q.missingInfo}</p></div>}
               {q.recommendedImprovement && <div className="rounded p-2 mb-2" style={{ background: BRAND.visibilitySoft }}><p className="text-[10px] font-semibold mb-0.5" style={{ color: BRAND.visibility }}>RECOMMENDED IMPROVEMENT</p><p className="text-xs">{q.recommendedImprovement}</p></div>}
-              <div className="flex justify-end">
+              <div className="flex justify-end gap-2">
+                <GenerateFixButton rec={{ title: `Improve AI visibility for: "${q.query}"`, evidence: q.missingInfo, recommendedAction: q.recommendedImprovement, module: "AI Visibility Simulator", source: "VertexRank AI Visibility Simulation", priority: q.answerReadiness === "Weak" ? "High" : "Medium" }} />
                 <Button size="sm" variant={isAdded(`sim_${q.id}`) ? "outline" : "soft"} icon={isAdded(`sim_${q.id}`) ? Check : ListPlus} disabled={isAdded(`sim_${q.id}`)} onClick={() => addToActions(q)}>
                   {isAdded(`sim_${q.id}`) ? "Added" : "Add to Action Center"}
                 </Button>
@@ -4048,7 +4159,8 @@ function CompetitorsView() {
                           <div key={g.id} className="rounded p-2" style={{ background: BRAND.surface }}>
                             <div className="flex items-center justify-between gap-2 mb-1"><p className="text-xs font-medium">{g.gap}</p><PriorityBadge priority={g.priority} /></div>
                             <p className="text-[11px] mb-1.5" style={{ color: BRAND.inkSoft }}>{g.evidence}</p>
-                            <div className="flex justify-end">
+                            <div className="flex justify-end gap-2">
+                              <GenerateFixButton rec={{ title: g.gap, evidence: g.evidence, recommendedAction: g.recommendedAction || g.evidence, module: "Competitor Analysis", source: "VertexRank AI interpretation", priority: g.priority }} />
                               <Button size="sm" variant={isAdded(`${c.id}_${g.id}`) ? "outline" : "soft"} icon={isAdded(`${c.id}_${g.id}`) ? Check : ListPlus} disabled={isAdded(`${c.id}_${g.id}`)} onClick={() => addGapToActions(c, g)}>
                                 {isAdded(`${c.id}_${g.id}`) ? "Added" : "Add to Action Center"}
                               </Button>
@@ -4063,7 +4175,8 @@ function CompetitorsView() {
                             <div key={d.id} className="rounded p-2" style={{ background: BRAND.surface }}>
                               <div className="flex items-center justify-between gap-2 mb-1"><p className="text-xs font-medium">{d.difference}</p><PriorityBadge priority={d.priority} /></div>
                               <p className="text-[11px] mb-1.5" style={{ color: BRAND.inkSoft }}>{d.recommendedAction}</p>
-                              <div className="flex justify-end">
+                              <div className="flex justify-end gap-2">
+                                <GenerateFixButton rec={{ title: d.difference, evidence: d.evidence || d.difference, recommendedAction: d.recommendedAction, module: "Competitor Analysis (AEO/GEO difference)", source: "VertexRank AI interpretation", priority: d.priority }} />
                                 <Button size="sm" variant={isAdded(`${c.id}_${d.id}`) ? "outline" : "soft"} icon={isAdded(`${c.id}_${d.id}`) ? Check : ListPlus} disabled={isAdded(`${c.id}_${d.id}`)} onClick={() => addAeoGeoDiffToActions(c, d)}>
                                   {isAdded(`${c.id}_${d.id}`) ? "Added" : "Add to Action Center"}
                                 </Button>
@@ -4090,7 +4203,8 @@ function CompetitorsView() {
                               </div>
                               <p className="text-[11px] mb-1" style={{ color: BRAND.inkSoft }}>{o.whyRelevant}</p>
                               {o.suggestedApproach && <p className="text-[11px] mb-1.5" style={{ color: BRAND.inkSoft }}>Next step: {o.suggestedApproach}</p>}
-                              <div className="flex justify-end">
+                              <div className="flex justify-end gap-2">
+                                <GenerateFixButton rec={{ title: `Backlink prospect: ${o.host}`, evidence: o.whyRelevant, recommendedAction: o.suggestedApproach || `Reach out to ${o.host} with a concrete reason to link.`, module: "Backlink Opportunities", source: "VertexRank competitor crawl", priority: o.priority }} />
                                 <Button size="sm" variant={isBacklinkTracked(o.host) ? "outline" : "soft"} icon={isBacklinkTracked(o.host) ? Check : ListPlus} disabled={isBacklinkTracked(o.host)} onClick={() => addBacklinkToTracker(o)}>
                                   {isBacklinkTracked(o.host) ? "In tracker" : "Add to Backlink Radar"}
                                 </Button>
@@ -4127,6 +4241,9 @@ function ContentPlannerView() {
   const [drawer, setDrawer] = useState(null);
   const [generating, setGenerating] = useState(false);
   const [generatingIdeas, setGeneratingIdeas] = useState(false);
+  const [startDate, setStartDate] = useState(() => todayPlus(1));
+  const [view, setView] = useState("calendar"); // calendar | list
+  const [writer, setWriter] = useState(null);
   const blankForm = { title: "", primaryKeyword: "", secondaryKeywords: "", intent: "Informational", status: "Idea", questions: "", outline: "", aeoRecs: "", geoRecs: "" };
   const [form, setForm] = useState(blankForm);
 
@@ -4186,51 +4303,64 @@ function ContentPlannerView() {
   }
   function del(id) { mutate((arr) => arr.filter((x) => x.id !== id)); toast("Content idea deleted"); }
 
-  // Generates complete content ideas end-to-end — title, keywords, outline,
-  // and all — grounded in the real crawl and the gaps already found by
-  // Keyword Intelligence, AEO, and GEO (site-wide versions preferred once
-  // they've been run). This is the only way new ideas enter the planner now.
+  // Builds a 30-day content calendar from the real crawl and everything already measured (Search Console queries, keyword gaps,
+  // unanswered questions, GEO gaps, live-search checks). The server proposes candidates and code keeps only topics that pass a
+  // quality gate, so it may return fewer than 30 rather than pad the month with weak ideas. See lib/contentCalendar.js.
   async function generateIdeasWithAi() {
     const siteMeta = siteMetaFrom(b);
     if (!siteMeta) { toast("Add a website first — a full-site crawl starts automatically and powers this.", "error"); return; }
+    if (!isoDay(startDate)) { toast("Pick a start date for the calendar.", "error"); return; }
     setGeneratingIdeas(true);
     const market = countryOf(currentWebsiteId);
     const ticket = tracker.beginAnalysis(currentWebsiteId, "contentIdeas");
     try {
-      const keywordOpportunities = (b.siteKeywordClusters?.opportunities || []).map((o) => ({ problem: o.problem, evidence: o.evidence }));
-      const aeoQuestions = b.siteAeoAnalysis?.questions || [];
-      const geoOpportunities = b.siteGeoAnalysis?.opportunities || [];
-      const data = await postJson("/api/content-ideas", { scanMeta: siteMeta, keywordOpportunities, aeoQuestions, geoOpportunities, count: 4, country: market });
-      // Ideas are grounded in the crawl and its analyses; if the crawl changed meanwhile they'd be off-target.
+      const input = buildCalendarInput(b, { startDate });
+      const data = await postJson("/api/content-calendar", { ...input, country: market });
+      // Topics are grounded in the crawl and its analyses; if the crawl changed meanwhile they'd be off-target.
       if (!analysisUsable(ticket, toast)) return;
-      const existing = new Set(b.contentIdeas.map((c) => c.title.toLowerCase()));
-      const fresh = (data.result.ideas || []).filter((idea) => idea.title && !existing.has(idea.title.toLowerCase()));
-      if (fresh.length === 0) { toast("No new AI-generated ideas this time — try again for different suggestions."); return; }
+      const cal = data.calendar;
+      if (!cal.topics.length) { toast("No topics met the quality bar this time. Try again, or run Keyword Intelligence and AEO first for richer data.", "error"); return; }
       mutate((arr) => [
         ...arr,
-        ...fresh.map((idea) => ({
+        ...cal.topics.map((t) => ({
           id: uid("ci"), websiteId: currentWebsiteId, internalLinks: 0, status: "Idea",
-          title: idea.title, primaryKeyword: idea.primaryKeyword, secondaryKeywords: idea.secondaryKeywords,
-          intent: idea.intent, questions: idea.questions, outline: idea.outline, aeoRecs: idea.aeoRecs, geoRecs: idea.geoRecs,
-          rationale: idea.rationale, source: idea.source,
+          title: t.title, primaryKeyword: t.primaryKeyword, secondaryKeywords: t.secondaryKeywords, intent: t.intent, funnel: t.funnel, pillar: t.pillar, format: t.format,
+          angle: t.angle, grounding: t.grounding, wordCountTarget: t.wordCountTarget, internalLinkTargets: t.internalLinkTargets, scheduledFor: t.scheduledFor,
+          questions: [], outline: [], aeoRecs: "", geoRecs: "", rationale: t.rationale, source: "VertexRank AI Calendar",
         })),
       ]);
-      toast(`Added ${fresh.length} AI-generated content idea${fresh.length === 1 ? "" : "s"}`);
+      setView("calendar");
+      toast(`Added ${cal.topics.length} topic${cal.topics.length === 1 ? "" : "s"} to the calendar${cal.warnings?.length ? ` — ${cal.warnings[0]}` : ""}`);
     } catch (err) {
-      toast(err.message || "Couldn't generate content ideas.", "error");
+      toast(err.message || "Couldn't generate the calendar.", "error");
     } finally {
       setGeneratingIdeas(false);
     }
   }
+  function saveDraft(id, draft) {
+    mutate((arr) => arr.map((x) => (x.id === id ? { ...x, draft, status: x.status === "Idea" ? "Drafting" : x.status } : x)));
+  }
 
   return (
     <div className="space-y-4">
-      <div className="flex justify-end gap-2">
-        <Button variant="soft" icon={generatingIdeas ? Loader2 : Sparkles} disabled={generatingIdeas} onClick={generateIdeasWithAi}>{generatingIdeas ? "Generating…" : "Generate ideas with AI"}</Button>
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div className="flex gap-1">
+          {[["calendar", "Calendar"], ["list", "List"]].map(([id, label]) => (
+            <button key={id} type="button" onClick={() => setView(id)} className="vr-focus text-sm font-medium rounded-lg px-3 py-1.5" style={{ background: view === id ? BRAND.primarySoft : "transparent", color: view === id ? BRAND.primary : BRAND.inkSoft }}>{label}</button>
+          ))}
+        </div>
+        <div className="flex items-end gap-2">
+          <Field label="Calendar starts"><TextInput type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} /></Field>
+          <div className="mb-3.5"><Button variant="soft" icon={generatingIdeas ? Loader2 : Sparkles} disabled={generatingIdeas} onClick={generateIdeasWithAi}>{generatingIdeas ? "Building… (up to a minute)" : "Generate 30-day calendar"}</Button></div>
+        </div>
       </div>
-      {b.contentIdeas.length === 0 ? <Card><EmptyState icon={FileText} title="No content ideas yet" body="Let VertexRank AI generate complete ideas from the crawl and known gaps." action={<Button variant="soft" icon={Sparkles} onClick={generateIdeasWithAi}>Generate ideas with AI</Button>} /></Card> : (
+      <p className="text-xs" style={{ color: BRAND.inkSoft }}>Topics come from your real data: Search Console queries, keyword gaps, unanswered questions, GEO gaps and live-search checks. Only topics that pass a quality check are kept, so you may get fewer than 30 rather than filler. The more of those analyses you've run, the stronger the calendar.</p>
+      {b.contentIdeas.length === 0 ? <Card><EmptyState icon={FileText} title="No content calendar yet" body="Generate a 30-day calendar of specific, well-grounded topics from your crawl and everything VertexRank has measured." action={<Button variant="soft" icon={Sparkles} onClick={generateIdeasWithAi}>Generate 30-day calendar</Button>} /></Card> : (
+        <>
+        {view === "calendar" && <ContentCalendarGrid items={b.contentIdeas} onOpen={setDrawer} />}
+        {(view === "list" || b.contentIdeas.some((c) => !isoDay(c.scheduledFor))) && (
         <div className="grid sm:grid-cols-2 gap-4">
-          {b.contentIdeas.map((c) => (
+          {[...b.contentIdeas].filter((c) => view === "list" || !isoDay(c.scheduledFor)).sort((a, c) => String(a.scheduledFor || "9").localeCompare(String(c.scheduledFor || "9"))).map((c) => (
             <Card key={c.id} className="p-4 cursor-pointer" onClick={() => setDrawer(c)}>
               <div className="flex items-start justify-between">
                 <p className="font-semibold text-sm pr-2">{c.title}</p>
@@ -4240,14 +4370,17 @@ function ContentPlannerView() {
                   <IconButton icon={Trash2} danger onClick={() => setConfirmDelete(c)} title="Delete" />
                 </div>
               </div>
-              <p className="text-xs mt-1" style={{ color: BRAND.inkSoft }}>{c.primaryKeyword || "No primary keyword set"}</p>
-              <div className="flex gap-2 mt-3">
+              <p className="text-xs mt-1" style={{ color: BRAND.inkSoft }}>{c.primaryKeyword || "No primary keyword set"}{c.scheduledFor ? ` · ${c.scheduledFor}` : ""}</p>
+              <div className="flex gap-2 mt-3 flex-wrap">
                 <Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{c.intent}</Badge>
                 <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>{c.status}</Badge>
+                {c.draft && <Badge color={{ fg: BRAND.amber, bg: BRAND.amberSoft }}>Draft written</Badge>}
               </div>
             </Card>
           ))}
         </div>
+        )}
+        </>
       )}
 
       <Modal open={!!modal} onClose={() => setModal(null)} title="Edit content idea" width={620}
@@ -4274,8 +4407,22 @@ function ContentPlannerView() {
       <Modal open={!!drawer} onClose={() => setDrawer(null)} title={drawer?.title} width={640}>
         {drawer && (
           <div className="space-y-4">
-            <div className="flex gap-2"><Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{drawer.intent}</Badge><Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>{drawer.status}</Badge></div>
+            <div className="flex gap-2 flex-wrap"><Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{drawer.intent}</Badge><Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>{drawer.status}</Badge>{drawer.funnel && <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>{drawer.funnel}</Badge>}{drawer.format && <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>{drawer.format}</Badge>}{drawer.scheduledFor && <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>Publish {drawer.scheduledFor}</Badge>}</div>
+            <div className="flex gap-2 flex-wrap">
+              <Button icon={FileText} onClick={() => { setWriter(drawer); setDrawer(null); }}>{drawer.draft ? "Open saved draft" : "Write the article"}</Button>
+              <GenerateFixButton variant="soft" rec={{ title: `Publish: ${drawer.title}`, evidence: drawer.grounding?.text ? `Grounded in: ${drawer.grounding.text}${drawer.grounding.note ? ` (${drawer.grounding.note})` : ""}` : drawer.rationale, recommendedAction: `Create the page for "${drawer.primaryKeyword}": ${drawer.angle || drawer.rationale || ""}`, module: "Content Planner", source: drawer.source, actionType: "Content Update", urls: drawer.internalLinkTargets }} />
+            </div>
+            {drawer.grounding && (
+              <div className="rounded-lg p-3" style={{ background: BRAND.canvas }}>
+                <div className="flex items-center gap-2 mb-1"><p className="text-xs font-semibold" style={{ color: BRAND.inkSoft }}>Why this topic</p><DataLabel kind={drawer.grounding.kind === "site" ? "ai_analysis" : "observed"} title="The data item this topic is based on.">{drawer.grounding.kind === "Q" ? "Search Console" : drawer.grounding.kind === "S" ? "Live search" : drawer.grounding.kind === "site" ? "From your site" : "From your analyses"}</DataLabel></div>
+                <p className="text-sm">{drawer.grounding.text}</p>
+                {drawer.grounding.note && <p className="text-xs" style={{ color: BRAND.inkSoft }}>{drawer.grounding.note}</p>}
+                {drawer.rationale && <p className="text-xs mt-1">{drawer.rationale}</p>}
+              </div>
+            )}
+            {drawer.angle && <div><p className="text-xs font-semibold mb-1" style={{ color: BRAND.inkSoft }}>Original angle</p><p className="text-sm">{drawer.angle}</p></div>}
             <div><p className="text-xs font-semibold mb-1" style={{ color: BRAND.inkSoft }}>Primary keyword</p><p className="text-sm">{drawer.primaryKeyword || "—"}</p></div>
+            {drawer.internalLinkTargets?.length > 0 && <div><p className="text-xs font-semibold mb-1" style={{ color: BRAND.inkSoft }}>Link to these pages</p><ul className="text-xs vr-mono space-y-0.5 break-all">{drawer.internalLinkTargets.map((u) => <li key={u}>{u}</li>)}</ul></div>}
             {drawer.secondaryKeywords?.length > 0 && <div><p className="text-xs font-semibold mb-1" style={{ color: BRAND.inkSoft }}>Secondary keywords</p><div className="flex flex-wrap gap-1.5">{drawer.secondaryKeywords.map((k) => <span key={k} className="text-xs rounded px-2 py-1" style={{ background: BRAND.canvas }}>{k}</span>)}</div></div>}
             {drawer.questions?.length > 0 && <div><p className="text-xs font-semibold mb-1" style={{ color: BRAND.inkSoft }}>Questions to answer</p><ul className="text-sm list-disc pl-4 space-y-0.5">{drawer.questions.map((q) => <li key={q}>{q}</li>)}</ul></div>}
             {drawer.outline?.length > 0 && <div><p className="text-xs font-semibold mb-1" style={{ color: BRAND.inkSoft }}>Outline</p><ol className="text-sm list-decimal pl-4 space-y-0.5">{drawer.outline.map((o) => <li key={o}>{o}</li>)}</ol></div>}
@@ -4289,8 +4436,217 @@ function ContentPlannerView() {
         )}
       </Modal>
 
+      {writer && <ArticleWriterModal idea={b.contentIdeas.find((x) => x.id === writer.id) || writer} onClose={() => setWriter(null)} onSave={(d) => saveDraft(writer.id, d)} />}
+
       <ConfirmDialog open={!!confirmDelete} onClose={() => setConfirmDelete(null)} title="Delete content idea" body="This content idea will be permanently removed." onConfirm={() => del(confirmDelete.id)} />
     </div>
+  );
+}
+
+/* ============================== Content calendar grid + article writer ============================== */
+
+const todayPlus = (n) => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
+const isoDay = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || "");
+const mondayOf = (iso) => { const d = new Date(`${iso}T00:00:00Z`); d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7)); return d; };
+
+/** The month at a glance: topics laid out on their scheduled days, Monday to Sunday. */
+function ContentCalendarGrid({ items, onOpen }) {
+  const dated = items.filter((c) => isoDay(c.scheduledFor));
+  if (dated.length === 0) return null;
+  const days = dated.map((c) => c.scheduledFor).sort();
+  const first = mondayOf(days[0]);
+  const last = new Date(`${days[days.length - 1]}T00:00:00Z`);
+  const weeks = [];
+  for (let d = new Date(first); d <= last; d.setUTCDate(d.getUTCDate() + 7)) {
+    weeks.push(Array.from({ length: 7 }, (_, i) => { const x = new Date(d); x.setUTCDate(x.getUTCDate() + i); return x.toISOString().slice(0, 10); }));
+  }
+  const byDay = new Map();
+  for (const c of dated) { if (!byDay.has(c.scheduledFor)) byDay.set(c.scheduledFor, []); byDay.get(c.scheduledFor).push(c); }
+  return (
+    <Card className="p-3 overflow-x-auto">
+      <div style={{ minWidth: 760 }}>
+        <div className="grid grid-cols-7 gap-1 mb-1">
+          {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((d) => <div key={d} className="text-[11px] font-semibold text-center" style={{ color: BRAND.inkSoft }}>{d}</div>)}
+        </div>
+        {weeks.map((w) => (
+          <div key={w[0]} className="grid grid-cols-7 gap-1 mb-1">
+            {w.map((day) => (
+              <div key={day} className="rounded p-1.5 min-h-[84px]" style={{ background: byDay.has(day) ? BRAND.canvas : "transparent", border: `1px solid ${BRAND.line}` }}>
+                <div className="text-[10px] mb-1" style={{ color: BRAND.inkSoft }}>{day.slice(8) === "01" || day === w[0] ? new Date(`${day}T00:00:00Z`).toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" }) : Number(day.slice(8))}</div>
+                {(byDay.get(day) || []).map((c) => (
+                  <button key={c.id} type="button" onClick={() => onOpen(c)} title={c.title} className="vr-focus block w-full text-left text-[11px] leading-snug rounded px-1.5 py-1 mb-1"
+                    style={{ background: c.status === "Published" ? BRAND.visibilitySoft : c.draft ? BRAND.amberSoft : BRAND.primarySoft, color: c.status === "Published" ? BRAND.visibility : c.draft ? BRAND.amber : BRAND.primary }}>
+                    <span className="line-clamp-3">{c.title}</span>
+                  </button>
+                ))}
+              </div>
+            ))}
+          </div>
+        ))}
+        <p className="text-[10px] mt-2" style={{ color: BRAND.inkSoft }}>Blue = idea · amber = draft written · green = published. Click a topic to see why it's on the calendar and to write it.</p>
+      </div>
+    </Card>
+  );
+}
+
+const CHECK_STYLE = { pass: { fg: "visibility", icon: Check }, warn: { fg: "amber", icon: AlertTriangle }, fail: { fg: "red", icon: X } };
+
+/** Writes an article for a calendar topic from REAL sources: it finds (or takes pasted) source pages, reads their text, and writes a
+ *  two-part draft that may only cite what those pages say. The result is a draft with an automatic on-page checklist and
+ *  [ADD: …] slots for what only the owner can supply. See lib/articleWriter.js, lib/articleChecks.js. */
+function ArticleWriterModal({ idea, onClose, onSave }) {
+  const { bundle, websites, currentWebsiteId, toast } = useApp();
+  const b = bundle();
+  const website = websites.find((w) => w.id === currentWebsiteId);
+  const crawl = b.siteCrawl;
+  const country = countryOf(currentWebsiteId);
+  const internal = (crawl?.pages || []).slice(0, 30).map((p) => ({ url: p.url, title: p.title }));
+  const saved = idea.draft;
+  const [stage, setStage] = useState(saved ? "done" : "setup"); // setup | working | done
+  const [candidates, setCandidates] = useState([]);
+  const [picked, setPicked] = useState([]);
+  const [pasted, setPasted] = useState("");
+  const [firstHand, setFirstHand] = useState(saved?.firstHand || "");
+  const [target, setTarget] = useState(idea.wordCountTarget || 1200);
+  const [finding, setFinding] = useState(false);
+  const [findNote, setFindNote] = useState("");
+  const [progress, setProgress] = useState("");
+  const [error, setError] = useState("");
+  const [md, setMd] = useState(saved?.markdown || "");
+  const [meta, setMeta] = useState(saved?.metaDescription || "");
+  const [slug, setSlug] = useState(saved?.slug || "");
+  const [srcs, setSrcs] = useState(saved?.sources || []);
+  const [faq, setFaq] = useState(saved?.faq || []);
+  const [showSchema, setShowSchema] = useState(false);
+  const [skipped, setSkipped] = useState([]);
+
+  async function findSources() {
+    setFinding(true); setFindNote(""); setError("");
+    try {
+      const data = await postJson("/api/content-sources", { query: idea.primaryKeyword || idea.title, siteHost: website?.url || "", country });
+      setCandidates(data.candidates || []);
+      if (!data.candidates?.length) setFindNote("No usable sources came back for that search. Paste source URLs below instead.");
+    } catch (e) { setFindNote(`${e.message || "Couldn't find sources."} You can paste source URLs below instead.`); }
+    finally { setFinding(false); }
+  }
+
+  async function write() {
+    setStage("working"); setError(""); setSkipped([]);
+    try {
+      const urls = [...new Set([...picked, ...pasted.split(/\s+/).filter((u) => /^https?:\/\//i.test(u))])].slice(0, 5);
+      let sources = [];
+      if (urls.length) {
+        setProgress("Reading your sources…");
+        const got = await postJson("/api/content-extract", { urls, country });
+        sources = (got.sources || []).filter((s) => s.ok).map((s, i) => ({ n: i + 1, url: s.url, title: s.title, host: s.host, publishedTime: s.publishedTime, excerpt: s.excerpt }));
+        setSkipped((got.sources || []).filter((s) => !s.ok));
+      }
+      const common = {
+        idea: { title: idea.title, primaryKeyword: idea.primaryKeyword, secondaryKeywords: idea.secondaryKeywords, intent: idea.intent, questions: idea.questions, outline: idea.outline, angle: idea.angle, format: idea.format, wordCountTarget: target },
+        site: { domain: crawl?.domain || "", name: website?.name || "", summary: siteMetaFrom(b)?.fullText?.slice(0, 1000) || "" },
+        sources, internalLinks: internal, firstHand, country,
+      };
+      setProgress("Writing the first half…");
+      const p1 = (await postJson("/api/content-write", { ...common, part: 1 })).draft;
+      const written = [`# ${p1.title}`, p1.intro, ...p1.sections.map((s) => `## ${s.heading}\n${s.body}`)].join("\n\n");
+      setProgress("Writing the second half, FAQ and conclusion…");
+      const p2 = (await postJson("/api/content-write", { ...common, part: 2, plannedOutline: p1.outline, written })).draft;
+      setMd(assembleArticle(p1, p2, sources)); setMeta(p1.metaDescription); setSlug(p1.slug); setSrcs(sources.map(({ excerpt, ...s }) => s)); setFaq(p2.faq);
+      setStage("done");
+    } catch (e) {
+      setError(e.message || "Couldn't write the article."); setStage("setup");
+    }
+  }
+
+  const title = /^#\s+(.+)$/m.exec(md)?.[1] || idea.title;
+  const checks = useMemo(() => (md ? checkArticle({ markdown: md, title, metaDescription: meta, primaryKeyword: idea.primaryKeyword, sources: srcs, internalUrls: internal.map((u) => u.url), wordTarget: target, intent: idea.intent, hasFirstHand: !!firstHand.trim() }) : null), [md, meta, srcs, target, firstHand]); // eslint-disable-line react-hooks/exhaustive-deps
+  const schema = useMemo(() => (md ? buildArticleSchema({ title, metaDescription: meta, siteName: website?.name, faq }) : ""), [md, meta, faq]); // eslint-disable-line react-hooks/exhaustive-deps
+  const download = () => { const url = URL.createObjectURL(new Blob([md], { type: "text/markdown" })); const a = document.createElement("a"); a.href = url; a.download = `${slug || "article"}.md`; a.click(); URL.revokeObjectURL(url); };
+
+  return (
+    <Modal open onClose={onClose} title={stage === "done" ? "Article draft" : "Write this article"} width={760}
+      footer={stage === "done" ? <>
+        <Button variant="outline" icon={RefreshCw} onClick={() => setStage("setup")}>Rewrite</Button>
+        <CopyButton label="Copy markdown" variant="soft" getText={() => md} />
+        <Button variant="outline" icon={Download} onClick={download}>Download .md</Button>
+        <Button icon={Check} onClick={() => { onSave({ markdown: md, metaDescription: meta, slug, title, sources: srcs, faq, firstHand, savedAt: new Date().toISOString() }); toast("Draft saved to this topic"); onClose(); }}>Save draft</Button>
+      </> : stage === "setup" ? <><Button variant="outline" onClick={onClose}>Cancel</Button><Button icon={Sparkles} onClick={write}>Read sources &amp; write</Button></> : null}>
+      <p className="text-sm font-semibold mb-1">{idea.title}</p>
+      <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>{idea.primaryKeyword}{idea.angle ? ` · Angle: ${idea.angle}` : ""}</p>
+
+      {stage === "working" && (
+        <div className="flex flex-col items-center py-10 gap-3 text-center">
+          <Loader2 className="vr-spin" size={26} style={{ color: BRAND.primary }} />
+          <p className="text-sm" style={{ color: BRAND.inkSoft }}>{progress}</p>
+          <p className="text-[11px]" style={{ color: BRAND.inkSoft }}>Two AI passes plus reading your sources: about a minute. Keep this window open.</p>
+        </div>
+      )}
+
+      {stage === "setup" && (
+        <div className="space-y-4">
+          <div className="flex items-start gap-2 rounded-lg px-3 py-2 text-xs" style={{ background: BRAND.amberSoft, color: BRAND.amber }}>
+            <Info size={14} className="mt-0.5 shrink-0" />
+            <span>Google welcomes AI-assisted content that is helpful and made for people, but treats many pages made mainly to rank, without added value, as spam (scaled content abuse). Treat every draft as a starting point: add your real experience, check each fact, and publish only what you'd stand behind.</span>
+          </div>
+          {error && <div className="flex items-start gap-2 rounded-lg px-3 py-2 text-xs" style={{ background: BRAND.redSoft, color: BRAND.red }}><AlertTriangle size={14} className="mt-0.5 shrink-0" /><span>{error}</span></div>}
+          <div>
+            <div className="flex items-center justify-between gap-2 mb-1.5">
+              <div className="text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>1. Sources to cite</div>
+              <Button size="sm" variant="soft" icon={finding ? Loader2 : Search} disabled={finding} onClick={findSources}>{finding ? "Searching…" : "Find sources (uses 1 live search)"}</Button>
+            </div>
+            <p className="text-xs mb-2" style={{ color: BRAND.inkSoft }}>The writer reads each page you pick and may cite it only for what it actually says. Prefer government, education and organisation pages.</p>
+            {findNote && <p className="text-xs mb-2" style={{ color: BRAND.amber }}>{findNote}</p>}
+            {candidates.length > 0 && (
+              <div className="space-y-1.5 mb-2">
+                {candidates.map((c) => (
+                  <label key={c.url} className="flex items-start gap-2 rounded-lg px-3 py-2 cursor-pointer text-sm" style={{ background: BRAND.canvas }}>
+                    <input type="checkbox" className="mt-1" checked={picked.includes(c.url)} onChange={(e) => setPicked((p) => (e.target.checked ? [...p, c.url].slice(0, 5) : p.filter((u) => u !== c.url)))} />
+                    <span className="min-w-0"><span className="font-medium break-words">{c.title}</span> <Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{c.authority}</Badge><span className="block text-xs break-all" style={{ color: BRAND.inkSoft }}>{c.host}{c.snippet ? ` — ${c.snippet}` : ""}</span></span>
+                  </label>
+                ))}
+              </div>
+            )}
+            <Field label="Or paste source URLs (one per line, up to 5 in total)"><TextArea value={pasted} placeholder="https://…" onChange={(e) => setPasted(e.target.value)} style={{ minHeight: 64 }} /></Field>
+          </div>
+          <div>
+            <div className="text-xs font-semibold uppercase tracking-wide mb-1.5" style={{ color: BRAND.inkSoft }}>2. Your first-hand input (strongly recommended)</div>
+            <TextArea value={firstHand} onChange={(e) => setFirstHand(e.target.value)} placeholder="Real experience, numbers, examples, mistakes you've seen, what you actually do. The writer may use this as fact. Leave blank and the draft will mark where your experience belongs." style={{ minHeight: 96 }} />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Target length"><Select value={target} onChange={(e) => setTarget(Number(e.target.value))}>{[800, 1200, 1600, 2000].map((n) => <option key={n} value={n}>about {n} words</option>)}</Select></Field>
+          </div>
+        </div>
+      )}
+
+      {stage === "done" && (
+        <div className="space-y-4">
+          {skipped.length > 0 && <div className="rounded-lg px-3 py-2 text-xs" style={{ background: BRAND.amberSoft, color: BRAND.amber }}>{skipped.length} source{skipped.length === 1 ? "" : "s"} couldn't be read and {skipped.length === 1 ? "was" : "were"} left out: {skipped.map((s) => `${s.url} (${s.error})`).join("; ")}</div>}
+          {checks && (
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <div className="text-xs font-semibold uppercase tracking-wide" style={{ color: BRAND.inkSoft }}>On-page checklist (updates as you edit)</div>
+                <span className="text-xs" style={{ color: BRAND.inkSoft }}>{checks.pass} pass · {checks.warn} to review · {checks.fail} to fix · {checks.words} words</span>
+              </div>
+              <div className="grid sm:grid-cols-2 gap-1.5">
+                {checks.items.map((c) => { const st = CHECK_STYLE[c.status]; const Icon = st.icon; return (
+                  <div key={c.id} className="flex items-start gap-2 rounded px-2.5 py-1.5" style={{ background: BRAND.canvas }}>
+                    <Icon size={14} className="mt-0.5 shrink-0" style={{ color: BRAND[st.fg] }} />
+                    <div className="min-w-0"><p className="text-xs font-medium">{c.label}</p><p className="text-[11px]" style={{ color: BRAND.inkSoft }}>{c.detail}</p></div>
+                  </div>); })}
+              </div>
+              <p className="text-[11px] mt-2" style={{ color: BRAND.inkSoft }}>{checks.note}</p>
+            </div>
+          )}
+          <Field label={`Meta description (${meta.length} characters)`}><TextInput value={meta} maxLength={200} onChange={(e) => setMeta(e.target.value)} /></Field>
+          <Field label="Article (markdown — edit freely; fill every [ADD: …] spot)"><TextArea value={md} onChange={(e) => setMd(e.target.value)} className="vr-mono" style={{ minHeight: 420, fontSize: 12 }} /></Field>
+          <div>
+            <button type="button" className="vr-focus text-xs underline" style={{ color: BRAND.primary }} onClick={() => setShowSchema((v) => !v)}>{showSchema ? "Hide" : "Show"} Article + FAQ structured data (JSON-LD)</button>
+            {showSchema && <div className="mt-2"><div className="flex justify-end"><CopyButton label="Copy JSON-LD" getText={() => schema} /></div><pre className="vr-mono text-xs whitespace-pre-wrap break-words p-3 rounded" style={{ background: BRAND.canvas }}>{schema}</pre><p className="text-[11px]" style={{ color: BRAND.inkSoft }}>Author and dates are placeholders: replace them with real values before adding this to the page.</p></div>}
+          </div>
+          <p className="text-[11px]" style={{ color: BRAND.inkSoft }}>Generated by VertexRank AI from the sources listed at the end. It is a draft: verify every claim against its source, add your own experience, and publish only when it is genuinely useful.</p>
+        </div>
+      )}
+    </Modal>
   );
 }
 
@@ -4388,9 +4744,12 @@ function InternalLinksView() {
                           <p className="text-sm font-medium mt-0.5">"{l.anchorText}"</p>
                           <p className="text-xs mt-0.5" style={{ color: BRAND.inkSoft }}>{l.reason}</p>
                         </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                        <GenerateFixButton rec={{ title: `Add an internal link from ${l.fromUrl} to ${r.targetUrl}`, evidence: l.reason, recommendedAction: `Link to ${r.targetUrl} using the anchor text "${l.anchorText}" from ${l.fromUrl}.`, module: "Internal Linking", source: "VertexRank crawl", urls: [l.fromUrl, r.targetUrl] }} />
                         <Button size="sm" variant={isTracked(l.fromUrl, r.targetUrl) ? "outline" : "soft"} icon={isTracked(l.fromUrl, r.targetUrl) ? Check : ListPlus} disabled={isTracked(l.fromUrl, r.targetUrl)} onClick={() => addRecToTracker(r.targetUrl, l)}>
                           {isTracked(l.fromUrl, r.targetUrl) ? "Added" : "Add"}
                         </Button>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -4533,7 +4892,8 @@ function BacklinksView() {
                 <p className="text-[11px] mb-1" style={{ color: BRAND.inkSoft }}>{o.destinationType} · via {o.competitorName}</p>
                 <p className="text-xs mb-1.5">{o.whyRelevant}</p>
                 {o.suggestedApproach && <p className="text-xs mb-2" style={{ color: BRAND.inkSoft }}>Next step: {o.suggestedApproach}</p>}
-                <div className="flex justify-end">
+                <div className="flex justify-end gap-2">
+                  <GenerateFixButton rec={{ title: `Backlink prospect: ${o.host}`, evidence: o.whyRelevant, recommendedAction: o.suggestedApproach || `Reach out to ${o.host} with a concrete reason to link.`, module: "Backlink Opportunities", source: o.competitorName ? `Via ${o.competitorName}` : "VertexRank crawl", priority: o.priority }} />
                   <Button size="sm" variant={isTracked(o.host) ? "outline" : "soft"} icon={isTracked(o.host) ? Check : ListPlus} disabled={isTracked(o.host)} onClick={() => addToTracker(o)}>
                     {isTracked(o.host) ? "In tracker" : "Add to tracker"}
                   </Button>
@@ -4561,7 +4921,8 @@ function BacklinksView() {
               <div key={o.id} className="rounded-lg p-3" style={{ background: BRAND.canvas }}>
                 <div className="flex items-center justify-between gap-2 mb-1"><p className="text-sm font-medium">{o.host}</p><PriorityBadge priority={o.priority} /></div>
                 <p className="text-xs mb-1.5">{o.whyRelevant}</p>
-                <div className="flex justify-end">
+                <div className="flex justify-end gap-2">
+                  <GenerateFixButton rec={{ title: `Backlink prospect: ${o.host}`, evidence: o.whyRelevant, recommendedAction: o.suggestedApproach || `Reach out to ${o.host} with a concrete reason to link.`, module: "Backlink Opportunities", source: o.competitorName ? `Via ${o.competitorName}` : "VertexRank crawl", priority: o.priority }} />
                   <Button size="sm" variant={isTracked(o.host) ? "outline" : "soft"} icon={isTracked(o.host) ? Check : ListPlus} disabled={isTracked(o.host)} onClick={() => addToTracker(o)}>
                     {isTracked(o.host) ? "In tracker" : "Add to tracker"}
                   </Button>
