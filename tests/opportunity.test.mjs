@@ -5,7 +5,7 @@ import {
   fromCompetitorGap, compareOpportunities, collectCandidates, migrateOpportunity, migrateOpportunities, canonicalSourceId,
   buildQueue, summarizeQueue, groupOf, hasRecord, OPEN, ACTION_TYPES, PRIORITIES, OPPORTUNITY_VERSION,
 } from "../lib/opportunity.js";
-import { computeSiteAuditIssues, formatAction, sectionOpportunities, PAGE_EXPORTERS } from "../lib/copyExport.js";
+import { computeSiteAuditIssues, formatAction, PAGE_EXPORTERS } from "../lib/copyExport.js";
 
 const baseSiteWide = { orphanPages: [], weakLinkedPages: [], duplicateTitles: [], duplicateMetaDescriptions: [], nearDuplicateContentPairs: [], recurringIssues: [] };
 const finding = (over = {}) => ({
@@ -224,15 +224,17 @@ test("exports read both record shapes", () => {
   assert.match(flat, /Market.*Kenya/); assert.match(flat, /https:\/\/a\.com\/p/); assert.match(flat, /Evidence from crawl.*E/);
 });
 
-test("the queue page export lists items in rank order with their state", () => {
+test("the Opportunities page export lists open items best first, leaves out finished ones, and is empty with no data", () => {
   const b = analyses();
-  b.actions = [toRecord(fromKeywordOpportunity({ id: "kw1", problem: "Weak H1", priority: "High" }), { id: "a1", websiteId: "s", status: "Applied" })];
-  const md = PAGE_EXPORTERS.queue({ url: "a.com", country: "Kenya" }, b);
-  assert.match(md, /## Opportunity Queue \(/);
-  assert.ok(md.indexOf("Homepage is noindex") < md.indexOf("Weak H1"));
-  assert.match(md, /Status\*\*: Applied|Status.*Applied/);
-  assert.equal(sectionOpportunities([]), "");
-  assert.equal(PAGE_EXPORTERS.queue({ url: "a.com" }, { siteCrawl: null, actions: [] }), "");
+  const open = PAGE_EXPORTERS.opportunities({ url: "a.com", country: "Kenya" }, b);
+  assert.match(open, /## Unified AI Recommendations/);
+  assert.ok(open.includes("Homepage is noindex") && open.includes("Weak H1"));
+  assert.ok(open.indexOf("Homepage is noindex") < open.indexOf("Weak H1"), "a Critical indexing problem outranks a keyword fix");
+  // An item whose action has been applied is no longer open work, so the export drops it.
+  b.actions = [{ id: "a1", websiteId: "s", title: "Weak H1", type: "Meta Fix", status: "Applied", detail: { sourceId: "kw1", module: "Site-wide Keyword Intelligence" } }];
+  const after = PAGE_EXPORTERS.opportunities({ url: "a.com", country: "Kenya" }, b);
+  assert.ok(!after.includes("Weak H1") && after.includes("Homepage is noindex"));
+  assert.equal(PAGE_EXPORTERS.opportunities({ url: "a.com" }, { siteCrawl: null, actions: [] }), "");
 });
 
 test("toRecord strips UI-only fields and refuses an unidentifiable candidate", () => {

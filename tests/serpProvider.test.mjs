@@ -95,3 +95,76 @@ test("site matching: www and subdomains match, lookalike hosts don't, and the be
   const results = [{ rank: 1, url: "https://other.com/" }, { rank: 4, url: "https://blog.example.com/p" }, { rank: 7, url: "https://example.com/" }];
   assert.equal(findSiteRank(results, "example.com").rank, 4); assert.equal(findSiteRank(results, "nowhere.com"), null); assert.equal(findSiteRank(null, "example.com"), null);
 });
+
+import { listSerpKeys, countSerpKeys } from "../lib/serpProvider.js";
+
+// --- several keys that rotate -------------------------------------------------------------------------------------------------------
+const freshState = () => ({ cooling: new Map(), cursor: 0 });
+function multi(env, handler, { now = () => NOW, state = freshState() } = {}) {
+  const used = [];
+  const fetchImpl = async (url) => { const k = new URL(url).searchParams.get("api_key"); used.push(k); return handler(k, url); };
+  return { provider: createSerpApiProvider({ env, fetchImpl, now, state }), used, state };
+}
+const OK = () => json(200, GOOD);
+
+test("listSerpKeys reads SERPAPI_KEY, SERPAPI_KEYS and SERPAPI_KEY_1..N in a stable order, without blanks or duplicates", () => {
+  assert.deepEqual(listSerpKeys({ SERPAPI_KEY: "a", SERPAPI_KEYS: "b, c\nd e", SERPAPI_KEY_1: "f", SERPAPI_KEY_3: "g", SERPAPI_KEY_2: " ", SERPAPI_KEY_4: "a" }), ["a", "b", "c", "d", "e", "f", "g"]);
+  assert.deepEqual(listSerpKeys({ SERPAPI_KEY_2: "y", SERPAPI_KEY_1: "x", SERPAPI_KEY_50: "z", SERPAPI_KEY_51: "ignored" }), ["x", "y", "z"]);
+  assert.deepEqual(listSerpKeys({}), []); assert.equal(countSerpKeys({ SERPAPI_KEY_1: "a", SERPAPI_KEY_2: "b" }), 2);
+  assert.deepEqual(listSerpKeys({ SERPAPI_KEY: 5, SERPAPI_KEYS: null }), []);
+});
+
+test("keys given only as SERPAPI_KEY_n make the provider configured, and it reports how many it has", () => {
+  const { provider } = multi({ SERPAPI_KEY_1: "k1", SERPAPI_KEY_2: "k2" }, OK);
+  assert.equal(provider.configured(), true); assert.equal(provider.keyCount(), 2);
+  assert.equal(multi({}, OK).provider.configured(), false);
+});
+
+test("searches rotate round-robin so each key is used evenly", async () => {
+  const { provider, used } = multi({ SERPAPI_KEY_1: "k1", SERPAPI_KEY_2: "k2", SERPAPI_KEY_3: "k3" }, OK);
+  for (let i = 0; i < 6; i++) await provider.search(req);
+  assert.deepEqual(used, ["k1", "k2", "k3", "k1", "k2", "k3"]);
+});
+
+test("a key that is used up fails over to the next key within the same search, and is skipped afterwards", async () => {
+  const { provider, used } = multi({ SERPAPI_KEY_1: "k1", SERPAPI_KEY_2: "k2", SERPAPI_KEY_3: "k3" }, (k) => (k === "k1" ? json(429, { error: "Your account has run out of searches." }) : OK()));
+  const r = await provider.search(req);
+  assert.equal(r.results.length, 2); assert.deepEqual(used, ["k1", "k2"], "k1 failed, k2 answered, in one search");
+  used.length = 0; await provider.search(req); await provider.search(req); await provider.search(req);
+  assert.ok(!used.includes("k1"), `k1 is cooling down: ${used}`); assert.deepEqual(used, ["k2", "k3", "k2"]);
+});
+
+test("a cooled-down key is tried again after its cooldown, and a success clears it", async () => {
+  let t = NOW; let k1Broken = true;
+  const { provider, used, state } = multi({ SERPAPI_KEY_1: "k1", SERPAPI_KEY_2: "k2" }, (k) => (k === "k1" && k1Broken ? json(429, { error: "Too many requests" }) : OK()), { now: () => t });
+  await provider.search(req); assert.deepEqual(used, ["k1", "k2"]); assert.equal(state.cooling.size, 1);
+  used.length = 0; k1Broken = false; t += 61_000; // a rate-limit cooldown is one minute
+  await provider.search(req); await provider.search(req); assert.ok(used.includes("k1")); assert.equal(state.cooling.size, 0);
+});
+
+test("a rejected key (bad key) also rotates; the error for every-key-failed names the count and never a key", async () => {
+  let r = multi({ SERPAPI_KEY_1: "bad", SERPAPI_KEY_2: "good" }, (k) => (k === "bad" ? json(401, { error: "Invalid API key." }) : OK()));
+  assert.equal((await r.provider.search(req)).results.length, 2);
+  const allQuota = multi({ SERPAPI_KEY_1: "SECRET-1", SERPAPI_KEY_2: "SECRET-2", SERPAPI_KEY_3: "SECRET-3" }, () => json(429, { error: "Your account has run out of searches." }));
+  await assert.rejects(allQuota.provider.search(req), (e) => e.code === "QUOTA" && /All 3 search keys/.test(e.message) && !/SECRET/.test(e.message)); assert.equal(allQuota.used.length, 3);
+  const allBad = multi({ SERPAPI_KEY_1: "a", SERPAPI_KEY_2: "b" }, () => json(401, { error: "Invalid API key." }));
+  await assert.rejects(allBad.provider.search(req), (e) => e.code === "AUTH_FAILED" && /all 2 API keys/.test(e.message));
+  const mixed = multi({ SERPAPI_KEY_1: "a", SERPAPI_KEY_2: "b" }, (k) => (k === "a" ? json(401, { error: "Invalid API key." }) : json(429, { error: "Too many requests" })));
+  await assert.rejects(mixed.provider.search(req), (e) => e.code === "RATE_LIMIT");
+});
+
+test("when every key is cooling down they are still tried (so a renewed allowance is noticed), and outages don't burn other keys", async () => {
+  let broken = true;
+  const { provider, used } = multi({ SERPAPI_KEY_1: "k1", SERPAPI_KEY_2: "k2" }, () => (broken ? json(429, { error: "Your account has run out of searches." }) : OK()));
+  await assert.rejects(provider.search(req), (e) => e.code === "QUOTA"); used.length = 0; broken = false;
+  assert.equal((await provider.search(req)).results.length, 2); assert.equal(used.length, 1, "every key was cooling, so the first tried is used and answers");
+  const down = multi({ SERPAPI_KEY_1: "k1", SERPAPI_KEY_2: "k2", SERPAPI_KEY_3: "k3" }, () => { throw new Error("connect failed"); });
+  await assert.rejects(down.provider.search(req), (e) => e.code === "NETWORK"); assert.equal(down.used.length, 1, "a network failure is not retried on other keys");
+  const upstream = multi({ SERPAPI_KEY_1: "k1", SERPAPI_KEY_2: "k2" }, () => json(500, {}));
+  await assert.rejects(upstream.provider.search(req), (e) => e.code === "UPSTREAM"); assert.equal(upstream.used.length, 1);
+});
+
+test("a single key behaves exactly as before (same error messages)", async () => {
+  const one = multi({ SERPAPI_KEY: "only" }, () => json(429, { error: "Your account has run out of searches." }));
+  await assert.rejects(one.provider.search(req), (e) => e.code === "QUOTA" && /monthly search allowance is used up/.test(e.message));
+});

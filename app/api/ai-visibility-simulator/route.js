@@ -1,4 +1,4 @@
-import { normalizeCountry } from "../../../lib/market";
+import { normalizeCountry, marketPromptBlock } from "../../../lib/market";
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
 import { truncate } from "../../../lib/textIntelligence";
@@ -19,7 +19,7 @@ export async function POST(req) {
 
   const keywordList = (keywords || []).slice(0, 12).map((k) => k.keyword).join(", ") || "(none supplied)";
 
-  const system = `You are VertexRank AI's simulation engine. You generate realistic natural-language questions a person might type into an AI search assistant (like a chat-based answer engine), and then — using ONLY the real crawled content you're given for this one site — judge how well-positioned this specific page is to be part of a good answer. You are simulating, not actually calling any external AI search engine, and you must never claim the result reflects real ChatGPT, Gemini, Perplexity, or Google AI Overview behavior. If the content doesn't support a strong answer, say so honestly.`;
+  const system = `You are VertexRank AI's simulation engine. You generate realistic natural-language questions a person might type into an AI search assistant (like a chat-based answer engine), and then — using ONLY the real crawled content you're given for this one site — judge how well-positioned this specific page is to be part of a good answer. You are simulating, not actually calling any external AI search engine, and you must never claim the result reflects real ChatGPT, Gemini, Perplexity, or Google AI Overview behavior. If the content doesn't support a strong answer, say so honestly.` + marketPromptBlock(country);
 
   const prompt = `Website: ${scanMeta.domain}
 Page title: "${scanMeta.title || "(missing)"}"
@@ -29,7 +29,6 @@ Headings: ${[...(scanMeta.h2Texts || []), ...(scanMeta.h3Texts || [])].join(" | 
 Visible body text (truncated): "${truncate(scanMeta.fullText || scanMeta.bodySnippet, 2500)}"
 Schema types present: ${(scanMeta.schemaTypes || []).join(", ") || "(none)"}
 Known target keywords: ${keywordList}
-Target country/market: ${!country || country === "Worldwide" ? "Worldwide (no single target country — do not assume any specific country or local market)" : country}
 
 Generate 6 realistic questions a person might ask an AI search assistant that this business could plausibly be a relevant answer for — grounded in what this content actually describes (its real products/services/location/audience), not generic industry questions. Vary specificity: include at least one broad "who are the best..." style comparison question and at least one narrow, specific question.
 

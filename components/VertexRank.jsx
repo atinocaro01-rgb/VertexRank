@@ -3194,7 +3194,7 @@ function RankHistoryPanel() {
             {run ? `Last run ${fmt(run.startedAt)} — ${run.note || run.status}` : "No scheduled run yet. After you deploy with CRON_SECRET set, Vercel runs it once a day."}
             {run && run.errors?.length > 0 ? ` Problem: ${run.errors[0].message}` : ""}
           </p>
-          <p style={{ color: BRAND.inkSoft }}>Each keyword is re-checked about every {budget.intervalDays} days, up to {budget.perRun} per run. This month: {budget.used} of {budget.monthly} tracked-keyword searches used ({budget.reserve} are kept for manual checks).</p>
+          <p style={{ color: BRAND.inkSoft }}>Each keyword is re-checked about every {budget.intervalDays} days, up to {budget.perRun} per run. This month: {budget.used} of {budget.monthly} tracked-keyword searches used ({budget.reserve} are kept for manual checks).{budget.keys > 1 ? ` Searches rotate across ${budget.keys} API keys.` : ""}</p>
         </Card>
       )}
 
@@ -4553,10 +4553,10 @@ function ArticleWriterModal({ idea, onClose, onSave }) {
         sources, internalLinks: internal, firstHand, outlineHints, country,
       };
       setProgress("Writing the first half…");
-      const p1 = (await postJson("/api/content-write", { ...common, part: 1 })).draft;
+      const p1 = (await postJson("/api/content-write", { ...common, part: 1, country })).draft;
       const written = [`# ${p1.title}`, p1.intro, ...p1.sections.map((s) => `## ${s.heading}\n${s.body}`)].join("\n\n");
       setProgress("Writing the second half, FAQ and conclusion…");
-      const p2 = (await postJson("/api/content-write", { ...common, part: 2, plannedOutline: p1.outline, written })).draft;
+      const p2 = (await postJson("/api/content-write", { ...common, part: 2, plannedOutline: p1.outline, written, country })).draft;
       setMd(assembleArticle(p1, p2, sources)); setMeta(p1.metaDescription); setSlug(p1.slug); setSrcs(sources.map(({ excerpt, ...s }) => s)); setFaq(p2.faq);
       setStage("done");
     } catch (e) {
@@ -4832,7 +4832,7 @@ function InternalLinksView() {
     const market = countryOf(currentWebsiteId);
     const ticket = tracker.beginAnalysis(currentWebsiteId, "internalLinkRecs");
     try {
-      const data = await postJson("/api/internal-linking", { crawl: b.siteCrawl });
+      const data = await postJson("/api/internal-linking", { crawl: b.siteCrawl, country: countryOf(currentWebsiteId) });
       if (!analysisUsable(ticket, toast)) return;
       setBundles((prev) => {
         const site = prev[currentWebsiteId];

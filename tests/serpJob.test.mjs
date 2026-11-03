@@ -97,3 +97,9 @@ test("recordIfTracked saves a snapshot only for an active tracked keyword, and n
   assert.equal(await recordIfTracked({ store: store({ id: "k1", active: true }), siteHost: "", result }), false);
   assert.equal(await recordIfTracked({ store: { configured: () => true, findKeyword: async () => { throw new Error("db down"); } }, siteHost: "mysite.com", result }), false);
 });
+
+test("jobConfig scales the default budget and manual reserve with the number of SerpApi keys; explicit values win", () => {
+  assert.deepEqual(jobConfig({ SERPAPI_KEY_1: "a", SERPAPI_KEY_2: "b", SERPAPI_KEY_3: "c" }), { perRunMax: 5, intervalDays: 7, monthlyBudget: 600, reserve: 150 });
+  assert.equal(jobConfig({ SERPAPI_KEY: "a" }).monthlyBudget, 200);
+  const explicit = jobConfig({ SERPAPI_KEY_1: "a", SERPAPI_KEY_2: "b", SERP_MONTHLY_BUDGET: "100", SERP_MANUAL_RESERVE: "10" }); assert.equal(explicit.monthlyBudget, 100); assert.equal(explicit.reserve, 10);
+});

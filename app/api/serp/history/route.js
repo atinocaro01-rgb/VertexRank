@@ -3,6 +3,7 @@ import { serpStoreFromEnv } from "../../../../lib/serpStoreEnv";
 import { errorResponse, siteHostFrom } from "../../../../lib/serpRoutes";
 import { summarize, monthStartIso } from "../../../../lib/rankHistory";
 import { jobConfig, usedThisMonth } from "../../../../lib/serpJob";
+import { countSerpKeys } from "../../../../lib/serpProvider";
 import { StoreError } from "../../../../lib/serpStore";
 
 export const runtime = "nodejs";
@@ -30,7 +31,7 @@ export async function POST(req) {
     return Response.json({
       configured: true, siteHost, days, monthStart: monthStartIso(now),
       keywords: keywords.map((k) => ({ ...k, ...summarize(byKeyword.get(k.id) || []) })),
-      budget: { used, monthly: cfg.monthlyBudget, reserve: cfg.reserve, perRun: cfg.perRunMax, intervalDays: cfg.intervalDays },
+      budget: { used, monthly: cfg.monthlyBudget, reserve: cfg.reserve, perRun: cfg.perRunMax, intervalDays: cfg.intervalDays, keys: countSerpKeys() },
       lastRun: runs[0] || null,
     });
   } catch (err) {

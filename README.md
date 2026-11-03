@@ -84,6 +84,8 @@ Setup:
 
 1. Create a SerpApi account (the free plan includes 250 searches per month) and copy your API key from its dashboard.
 2. Set `SERPAPI_KEY` as an environment variable on your host (Vercel: Project → Settings → Environment Variables), then redeploy. Never commit it.
+
+**Several keys.** To get more searches, add more keys and they rotate: `SERPAPI_KEY_1`, `SERPAPI_KEY_2`, `SERPAPI_KEY_3`, … (up to 50; gaps are fine), or one `SERPAPI_KEYS` variable with keys separated by commas, spaces or new lines. `SERPAPI_KEY` still works and can be mixed in; duplicates are ignored. Searches are spread round-robin across the keys. If a key is rejected, used up or rate-limited, that same search moves on to the next key and the bad key is left alone for a while (1 hour for a rejected key, 6 hours for a used-up allowance, 1 minute for a rate limit); if every key is down you get one clear message. Network and provider outages are not retried on other keys. The tracked-keyword budget defaults scale with the number of keys (200 searches and a 50-search manual reserve per key); set `SERP_MONTHLY_BUDGET` / `SERP_MANUAL_RESERVE` to override. Rank History shows how many keys are rotating. Cool-down memory is per server instance, which only means an instance may retry a spent key once (failed calls aren't billed).
 3. Recommended: set `VR_GLOBAL_DAILY_SERP` (for example `8`) so the whole app can never spend more than your plan allows. Without `SERPAPI_KEY` the tab explains that live results aren't set up and nothing else is affected.
 
 Notes:

@@ -1,3 +1,4 @@
+import { normalizeCountry, marketPromptBlock } from "../../../lib/market";
 import { guardJson } from "../../../lib/apiGuard";
 import { callOpenRouterJson } from "../../../lib/openrouter";
 import { findLinkCandidates } from "../../../lib/internalLinking";
@@ -22,6 +23,7 @@ export async function POST(req) {
   const body = guard.body;
 
   const { crawl } = body || {};
+  const country = normalizeCountry(body?.country); // validated against the fixed list: never free text into a prompt
   if (!crawl?.pages?.length) {
     return Response.json({ error: "Site crawl data is required. Run a full-site crawl first." }, { status: 400 });
   }
@@ -66,7 +68,7 @@ export async function POST(req) {
     .map((t, i) => `${i + 1}. TARGET: "${t.targetTitle}" (${t.targetUrl}), H1: "${t.targetH1}"\n   Candidate source pages: ${t.candidates.map((c) => `"${c.title}" (${c.url}) [${c.similarity}% content overlap]`).join("; ")}`)
     .join("\n");
 
-  const system = `You are VertexRank AI, an internal linking strategist. You are given real target pages that currently have few or no internal links pointing at them, and a real, deterministically-ranked shortlist of other pages on the same site that share topical content overlap. Your job is to pick which of the GIVEN candidates make natural editorial sense to link from (not all candidates need to be used), and write natural anchor text for each — text a human editor would actually write, incorporating a relevant term, never generic text like "click here". You never invent a source page that wasn't in the candidate list given.`;
+  const system = `You are VertexRank AI, an internal linking strategist. You are given real target pages that currently have few or no internal links pointing at them, and a real, deterministically-ranked shortlist of other pages on the same site that share topical content overlap. Your job is to pick which of the GIVEN candidates make natural editorial sense to link from (not all candidates need to be used), and write natural anchor text for each — text a human editor would actually write, incorporating a relevant term, never generic text like "click here". You never invent a source page that wasn't in the candidate list given.` + marketPromptBlock(country);
 
   const prompt = `Website: ${crawl.domain}
 
