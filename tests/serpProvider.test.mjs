@@ -50,7 +50,7 @@ test("search: calls only SerpApi's fixed host with the right parameters and retu
   const p = calls[0].url.searchParams;
   assert.equal(p.get("engine"), "google"); assert.equal(p.get("q"), "kenya safari"); assert.equal(p.get("gl"), "ke"); assert.equal(p.get("hl"), "en"); assert.equal(p.get("device"), "desktop"); assert.equal(p.get("api_key"), KEY);
   assert.ok(calls[0].init.signal, "has a timeout");
-  assert.deepEqual({ ...r, results: r.results.length }, { query: "kenya safari", country: "Kenya", device: "desktop", results: 2, source: "SerpApi (Google)", observedAt: "2026-11-01T10:00:00.000Z" });
+  assert.deepEqual({ ...r, results: r.results.length }, { query: "kenya safari", country: "Kenya", device: "desktop", results: 2, related: { searches: [], questions: [] }, source: "SerpApi (Google)", observedAt: "2026-11-01T10:00:00.000Z" });
 });
 
 test("search: Worldwide omits gl; an unconfigured provider is reported, not thrown as a crash, and makes no request", async () => {

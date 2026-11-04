@@ -25,6 +25,7 @@ import { findSiteRank, sameSite, hostOf } from "../lib/serpMatch";
 import { slimCheck, upsertCheck, competitorProspects } from "../lib/serpInsights";
 import { buildFixInput, fixCacheKey } from "../lib/fixContext";
 import { buildCalendarInput } from "../lib/calendarContext";
+import { extractPagePhrases, mergeKeywordIdeas } from "../lib/keywordIntel";
 import { slimCompetitorCrawl, questionBank, outlineGaps, outlineHintsFor, competitorCitations, citationsForTopic } from "../lib/competitorIntel";
 import { checkArticle, buildArticleSchema } from "../lib/articleChecks";
 import { assembleArticle } from "../lib/articleWriter";
@@ -2577,14 +2578,14 @@ function KeywordsView() {
   return (
     <div className="space-y-4">
       <div className="flex gap-1 rounded-lg p-1 w-fit" style={{ background: BRAND.canvas }}>
-        {[["clusters", "AI Keyword Intelligence"], ["manual", "Manual Tracking"], ["serp", "Live Results"], ["history", "Rank History"]].map(([id, label]) => (
+        {[["clusters", "AI Keyword Intelligence"], ["manual", "Manual Tracking"], ["serp", "Live Results"], ["history", "Rank History"], ["ideas", "Keyword Ideas"]].map(([id, label]) => (
           <button key={id} onClick={() => setTab(id)} className="vr-focus text-sm font-medium rounded-md px-3 py-1.5"
             style={{ background: tab === id ? BRAND.surface : "transparent", color: tab === id ? BRAND.primary : BRAND.inkSoft, boxShadow: tab === id ? `0 1px 2px rgba(0,0,0,0.06)` : "none" }}>
             {label}
           </button>
         ))}
       </div>
-      {tab === "clusters" ? <SiteKeywordClusteringPanel /> : tab === "serp" ? <SerpPanel /> : tab === "history" ? <RankHistoryPanel /> : <ManualKeywordTracker />}
+      {tab === "clusters" ? <SiteKeywordClusteringPanel /> : tab === "serp" ? <SerpPanel /> : tab === "history" ? <RankHistoryPanel /> : tab === "ideas" ? <KeywordIdeasPanel /> : <ManualKeywordTracker />}
     </div>
   );
 }
@@ -3090,6 +3091,24 @@ function SerpPanel() {
               );
             })}
           </ol>
+          {(shown.related?.searches?.length > 0 || shown.related?.questions?.length > 0) && (
+            <div className="px-4 py-3 space-y-2" style={{ borderBottom: `1px solid ${BRAND.line}` }}>
+              <div className="flex items-center gap-2"><p className="text-xs font-semibold" style={{ color: BRAND.inkSoft }}>Google's suggestions for this search</p><DataLabel kind="observed" title="Returned by Google with this search, at no extra cost.">Observed</DataLabel></div>
+              {shown.related.searches?.length > 0 && (
+                <div>
+                  <p className="text-[11px] mb-1" style={{ color: BRAND.inkSoft }}>Related searches (click one to search it)</p>
+                  <div className="flex flex-wrap gap-1.5">{shown.related.searches.map((r) => <button key={r} type="button" disabled={loading} onClick={() => { setQuery(r); run(false, r); }} className="vr-focus text-xs rounded-full px-2.5 py-1" style={{ background: BRAND.canvas, color: BRAND.ink, border: `1px solid ${BRAND.line}` }}>{r}</button>)}</div>
+                </div>
+              )}
+              {shown.related.questions?.length > 0 && (
+                <div>
+                  <p className="text-[11px] mb-1" style={{ color: BRAND.inkSoft }}>People also ask</p>
+                  <ul className="text-sm list-disc pl-5 space-y-0.5">{shown.related.questions.map((r) => <li key={r}>{r}</li>)}</ul>
+                </div>
+              )}
+              <p className="text-[11px]" style={{ color: BRAND.inkSoft }}>All of these are saved with this search and appear in the Keyword Ideas tab, where you can track them.</p>
+            </div>
+          )}
           <p className="px-4 py-3 text-[11px]" style={{ color: BRAND.inkSoft }}>
             Saved with this website: it feeds the Opportunity Queue and the competitor suggestions. This is a snapshot of the first page of organic results for one query, country, device and moment. Results vary by person and location, so treat the position as a guide, not a guaranteed rank. For your own site's averaged positions, use Search Data (Search Console). Search volume and difficulty are not part of these results.
           </p>
@@ -3207,6 +3226,21 @@ function RankHistoryPanel() {
         <p className="text-xs" style={{ color: BRAND.inkSoft }}>Tracked in {country === "Worldwide" ? "no specific country" : country} (this website's target market). Up to 25 keywords per website. Adding a keyword doesn't search yet.</p>
       </Card>
 
+      {(data?.owners || []).length > 0 && (
+        <Card className="p-4">
+          <div className="flex items-center gap-2 mb-1"><h3 className="font-semibold vr-display">Who ranks across your tracked keywords</h3><DataLabel kind="observed" title="From the first page of results saved at each keyword's latest check.">Observed</DataLabel></div>
+          <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Sites that keep appearing in the top 10 for the keywords you track (big general platforms left out). These are your real search competitors, which may differ from the competitors you added by hand.</p>
+          <div className="space-y-1.5">
+            {data.owners.map((o) => (
+              <div key={o.host} className="flex flex-wrap items-center justify-between gap-2 rounded-lg px-3 py-2" style={{ background: BRAND.canvas }}>
+                <div className="min-w-0"><p className="text-sm font-medium break-all">{o.host}</p><p className="text-[11px]" style={{ color: BRAND.inkSoft }}>In {o.keywords} of your keywords · average position #{o.avgRank} · best #{o.bestRank} · e.g. {o.sample.map((s) => `“${s}”`).join(", ")}</p></div>
+                <TrackCompetitorLink host={o.host} />
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+
       <Card className="overflow-hidden">
         <div className="flex flex-wrap items-center justify-between gap-2 p-4" style={{ borderBottom: `1px solid ${BRAND.line}` }}>
           <div className="flex items-center gap-2"><h3 className="font-semibold vr-display">Tracked keywords</h3><DataLabel kind="observed" title="Positions returned by the search provider at the time of each check.">Observed</DataLabel></div>
@@ -3250,6 +3284,26 @@ function RankHistoryPanel() {
                           </LineChart>
                         </ResponsiveContainer>
                       )}
+                      {k.serp && (
+                        <div className="mt-3">
+                          <p className="text-xs font-semibold mb-1.5" style={{ color: BRAND.inkSoft }}>Who ranks for “{k.query}” (checked {fmt(k.serp.checkedAt)}{k.serp.previousCheckedAt ? `, compared with ${fmt(k.serp.previousCheckedAt)}` : ""})</p>
+                          <div className="space-y-1">
+                            {k.serp.rows.map((r) => (
+                              <div key={r.host} className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs rounded px-2.5 py-1.5" style={{ background: BRAND.canvas }}>
+                                <span className="vr-mono w-8" style={{ color: BRAND.inkSoft }}>#{r.rank}</span>
+                                <a href={r.url} target="_blank" rel="noopener noreferrer" className="underline break-all flex-1 min-w-0" style={{ color: BRAND.primary }}>{r.host}</a>
+                                <span className="w-16" style={{ color: r.isNew ? BRAND.primary : r.change > 0 ? BRAND.visibility : r.change < 0 ? BRAND.red : BRAND.inkSoft }}>{r.isNew ? "new in top 10" : r.change > 0 ? `▲ ${r.change}` : r.change < 0 ? `▼ ${Math.abs(r.change)}` : r.change === 0 ? "same" : ""}</span>
+                                <TrackCompetitorLink host={r.host} />
+                              </div>
+                            ))}
+                          </div>
+                          <p className="text-[11px] mt-1.5" style={{ color: BRAND.inkSoft }}>
+                            {k.serp.ownRank ? `Your site: #${k.serp.ownRank}${k.serp.ownPrevRank ? ` (was #${k.serp.ownPrevRank})` : ""}.` : "Your site isn't in the top 10."}
+                            {k.serp.dropped.length > 0 ? ` Dropped out of the top 10 since the previous check: ${k.serp.dropped.map((d) => `${d.host} (was #${d.prevRank})`).join(", ")}.` : ""}
+                          </p>
+                          {(k.serp.related.searches.length > 0 || k.serp.related.questions.length > 0) && <p className="text-[11px] mt-1" style={{ color: BRAND.inkSoft }}>Google's related searches and questions for this keyword are in the Keyword Ideas tab.</p>}
+                        </div>
+                      )}
                     </div>
                   )}
                 </li>
@@ -3259,6 +3313,138 @@ function RankHistoryPanel() {
         )}
         <p className="px-4 py-3 text-[11px]" style={{ color: BRAND.inkSoft }}>Each point is a snapshot of the first page of results for one query, country, device and moment, so small moves are normal. Your own site's averaged positions are in Search Data (Search Console) and will differ. Search volume and difficulty are not part of this data.</p>
       </Card>
+    </div>
+  );
+}
+
+/* ============================== Keyword ideas (competitor pages + Google's own suggestions) ============================== */
+
+/** Adds a host to the competitors list (once). Used from every place that shows who ranks. */
+function TrackCompetitorLink({ host }) {
+  const { bundle, setBundles, currentWebsiteId, toast } = useApp();
+  const has = (bundle().competitors || []).some((c) => hostOf(c.url || c.name) === host);
+  if (has) return <span className="text-[11px]" style={{ color: BRAND.inkSoft }}>Tracked competitor</span>;
+  return (
+    <button type="button" className="vr-focus text-[11px] underline" style={{ color: BRAND.primary }} onClick={() => {
+      setBundles((prev) => { const site = prev[currentWebsiteId]; if (!site || (site.competitors || []).some((c) => hostOf(c.url || c.name) === host)) return prev; return { ...prev, [currentWebsiteId]: { ...site, competitors: [...site.competitors, { id: uid("comp"), websiteId: currentWebsiteId, siteAnalysis: null, name: host, url: host }] } }; });
+      toast(`${host} added to Competitors`);
+    }}>Track as competitor</button>
+  );
+}
+
+const IDEA_SRC = { competitor_pages: "Competitor pages", related_search: "Google related search", people_also_ask: "People also ask" };
+const TARGET = { yes: { label: "You target this", fg: "visibility", bg: "visibilitySoft" }, partial: { label: "Mentioned, not targeted", fg: "amber", bg: "amberSoft" }, no: { label: "Not targeted", fg: "red", bg: "redSoft" } };
+
+/** Keywords you can use, from what is actually observable: the phrases competitors' pages are built around, and Google's own related
+ *  searches and "people also ask" questions from your live searches and tracked keywords. No volume or difficulty (those need a paid
+ *  keyword index). One click tracks a keyword; questions can become fixes or Action Center tasks. See lib/keywordIntel.js. */
+function KeywordIdeasPanel() {
+  const { websites, bundle, currentWebsiteId, addAction, toast } = useApp();
+  const b = bundle();
+  const website = websites.find((w) => w.id === currentWebsiteId);
+  const siteHost = hostOf(website?.url || "");
+  const country = normalizeCountry(website?.country);
+  const [hist, setHist] = useState(null); // { configured, keywords } from rank history, when the database is set up
+  const [busy, setBusy] = useState("");
+  const [kind, setKind] = useState("keyword");
+  const [source, setSource] = useState("all");
+  const [hideTracked, setHideTracked] = useState(true);
+  const [search, setSearch] = useState("");
+  const [shown, setShown] = useState(30);
+
+  async function loadHistory() {
+    if (!siteHost) return;
+    try { setHist(await postJson("/api/serp/history", { siteHost, days: 90, country })); } catch { setHist({ configured: false }); }
+  }
+  useEffect(() => { setHist(null); loadHistory(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [siteHost]);
+
+  const withData = (b.competitors || []).filter((c) => c.crawlSummary?.pages?.length);
+  const trackedDb = (hist?.keywords || []).map((k) => k.query);
+  const trackedAll = [...(b.keywords || []).map((k) => k.keyword), ...trackedDb];
+  const gscQueries = (b.gscReport?.queries || []).map((q) => q.query);
+  const ideas = useMemo(() => {
+    const phrases = extractPagePhrases(withData, b.siteCrawl, { tracked: trackedAll, gscQueries });
+    const trackedRelated = (hist?.keywords || []).filter((k) => k.serp?.related).map((k) => ({ query: k.query, related: k.serp.related }));
+    return mergeKeywordIdeas({ phrases, checks: b.serpChecks || [], trackedRelated, tracked: trackedAll, gscQueries, ourCrawl: b.siteCrawl });
+  }, [b.competitors, b.siteCrawl, b.serpChecks, b.keywords, b.gscReport, hist]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const q = search.trim().toLowerCase();
+  const visible = ideas.filter((i) => i.kind === kind && (source === "all" || i.sources.some((s) => s.type === source)) && (!hideTracked || !i.tracked) && (!q || i.query.toLowerCase().includes(q)));
+  const isAdded = (id) => b.actions.some((a) => a.detail?.sourceId === id);
+
+  async function track(list) {
+    if (!hist?.configured) { toast("Tracking needs rank history set up (see the Rank History tab).", "error"); return; }
+    setBusy("track");
+    let ok = 0, last = "";
+    for (const i of list) {
+      try { await postJson("/api/serp/tracked", { action: "add", siteHost, query: i.query, country, device: "desktop" }); ok++; } catch (e) { last = e.message; break; }
+    }
+    await loadHistory(); setBusy("");
+    toast(ok ? `Tracking ${ok} keyword${ok === 1 ? "" : "s"}. They're checked about weekly.${last ? ` ${last}` : ""}` : (last || "Couldn't start tracking."), ok ? undefined : "error");
+  }
+  const questionRec = (i) => ({ title: `Answer: "${i.query}"`, evidence: `Google lists this as a related question for ${i.sources.filter((s) => s.type === "people_also_ask").map((s) => `"${s.detail}"`).join(", ")}.`, recommendedAction: "Write an original answer from your own facts and experience: a direct 40-60 word answer first, then supporting detail.", module: "Keyword Ideas (people also ask)", source: "Google suggestions (observed)", actionType: "FAQ Addition", priority: "Medium" });
+
+  const untrackedTop = visible.filter((i) => !i.tracked).slice(0, 5);
+  return (
+    <div className="space-y-4">
+      <div className="flex items-start gap-2 rounded-lg px-4 py-2.5 text-xs" style={{ background: BRAND.amberSoft, color: BRAND.amber }}>
+        <Info size={14} className="mt-0.5 shrink-0" />
+        <span>VertexRank can't see every keyword a competitor ranks for: that needs a paid keyword index. These ideas come from what is observable: phrases competitors' pages are built around, and Google's own related searches and "people also ask" questions from your live searches. There is no search volume or difficulty here.</span>
+      </div>
+      <Card className="p-4">
+        <div className="flex flex-wrap items-end gap-3">
+          <Field label="Show"><Select value={kind} onChange={(e) => { setKind(e.target.value); setShown(30); }}><option value="keyword">Keywords ({ideas.filter((i) => i.kind === "keyword").length})</option><option value="question">Questions ({ideas.filter((i) => i.kind === "question").length})</option></Select></Field>
+          <Field label="From"><Select value={source} onChange={(e) => { setSource(e.target.value); setShown(30); }}><option value="all">All sources</option>{Object.entries(IDEA_SRC).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</Select></Field>
+          <Field label="Search"><TextInput value={search} placeholder="Filter" onChange={(e) => { setSearch(e.target.value); setShown(30); }} /></Field>
+          <label className="flex items-center gap-2 text-sm mb-3.5"><input type="checkbox" checked={hideTracked} onChange={(e) => setHideTracked(e.target.checked)} /> Hide already tracked</label>
+          <div className="mb-3.5 flex gap-2">
+            <CopyButton label={`Copy ${visible.length}`} variant="soft" getText={() => visible.map((i) => i.query).join("\n")} />
+            {kind === "keyword" && <Button size="sm" icon={busy === "track" ? Loader2 : TrendingUp} disabled={busy === "track" || untrackedTop.length === 0} onClick={() => track(untrackedTop)}>Track top {untrackedTop.length || 5}</Button>}
+          </div>
+        </div>
+        {withData.length === 0 && <p className="text-xs mt-2" style={{ color: BRAND.inkSoft }}>No competitor crawls stored yet: run the site-wide analysis on a competitor to get their page phrases. Related searches appear after you run searches in Live Results.</p>}
+        {hist && hist.configured === false && <p className="text-xs mt-1" style={{ color: BRAND.inkSoft }}>Rank history isn't set up, so tracking is off and suggestions from tracked keywords aren't included.</p>}
+      </Card>
+
+      {visible.length === 0 ? (
+        <Card><EmptyState icon={Search} title="No ideas to show" body={ideas.length === 0 ? "Run a search in Live Results (it returns Google's related searches and questions), and analyse a competitor to see the phrases their pages target." : "Nothing matches these filters."} /></Card>
+      ) : (
+        <Card className="overflow-hidden">
+          <ul>
+            {visible.slice(0, shown).map((i) => {
+              const t = TARGET[i.youTarget];
+              return (
+                <li key={i.id} className="px-4 py-3" style={{ borderBottom: `1px solid ${BRAND.line}` }}>
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium break-words">{i.kind === "question" ? `“${i.query}”` : i.query}</p>
+                      <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                        {[...new Set(i.sources.map((s) => s.type))].map((s) => <Badge key={s} color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{IDEA_SRC[s]}</Badge>)}
+                        {t && <Badge color={{ fg: BRAND[t.fg], bg: BRAND[t.bg] }}>{t.label}</Badge>}
+                        {i.tracked && <Badge color={{ fg: BRAND.visibility, bg: BRAND.visibilitySoft }}>Tracked</Badge>}
+                        {i.inGsc && <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>In Search Console</Badge>}
+                      </div>
+                      <p className="text-[11px] mt-1" style={{ color: BRAND.inkSoft }}>{i.sources.slice(0, 3).map((s) => (s.type === "competitor_pages" ? `Competitor pages: ${s.detail}` : `${IDEA_SRC[s.type]} for “${s.detail}”`)).join(" · ")}{i.sources.length > 3 ? ` · +${i.sources.length - 3} more` : ""}</p>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <CopyButton iconOnly label="Copy" getText={() => i.query} />
+                      {i.kind === "keyword" ? (
+                        <Button size="sm" variant={i.tracked ? "outline" : "soft"} icon={i.tracked ? Check : TrendingUp} disabled={i.tracked || busy === "track"} onClick={() => track([i])}>{i.tracked ? "Tracked" : "Track"}</Button>
+                      ) : (
+                        <>
+                          <GenerateFixButton rec={questionRec(i)} />
+                          <Button size="sm" variant={isAdded(i.id) ? "outline" : "soft"} icon={isAdded(i.id) ? Check : ListPlus} disabled={isAdded(i.id)} onClick={() => { const r = questionRec(i); addAction({ title: r.title, type: "FAQ Addition", status: "New", detail: { sourceId: i.id, module: r.module, evidence: r.evidence, recommendedAction: r.recommendedAction, priority: r.priority, source: r.source } }); toast("Added to Action Center"); }}>{isAdded(i.id) ? "Added" : "Add to Action Center"}</Button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+          {visible.length > shown && <div className="flex justify-center p-3"><Button variant="outline" onClick={() => setShown((n) => n + 30)}>Show more ({visible.length - shown} left)</Button></div>}
+        </Card>
+      )}
     </div>
   );
 }
