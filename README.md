@@ -157,6 +157,12 @@ VertexRank cannot see the full list of keywords a competitor ranks for (that nee
 
 The **Keyword Ideas** tab (Keyword Intelligence) merges these into one filterable list (keywords or questions, by source, hide already tracked), flags ideas you already track or already get impressions for, and lets you **Track** a keyword (or the top 5) in one click. Tracked keywords are re-checked about weekly, so they spend search allowance. Questions can become a Generate fix or an Action Center task. Ideas also feed the 30-day calendar as grounded items (ids `R…` for Google suggestions; competitor phrases you don't target join the `C…` items). No database change is needed: the extra data is stored inside the existing `top_results` column, and older snapshots still read. Code: `lib/keywordIntel.js`.
 
+## How structured data is detected
+
+The crawler reads the HTML each page sends and finds structured data in all three formats Google supports: **JSON-LD** (including the very common `{"@graph": [...]}` wrapper used by Yoast, Rank Math, Next.js and most generators), **Microdata** (`itemscope`/`itemtype`) and **RDFa** (`typeof`). The page's entity types come from its top-level nodes and every `@graph` member, with `@type` arrays and full `https://schema.org/…` types normalised; details such as an address or a Question inside a FAQPage are not listed as page types. JSON-LD wrapped in HTML comments or CDATA is accepted, and a block with broken JSON is reported as **"Structured data has invalid JSON"** rather than as missing. Earlier versions only read the top-level `@type`, so any page using `@graph` was wrongly flagged "No structured data found" (and its FAQ/Organization schema was missed by the AEO and GEO signals); re-crawl a site to refresh its results.
+
+One limit remains: markup that a site adds only with JavaScript after the page loads isn't in the HTML the server sends, so it isn't seen. If a page shows its schema in Google's Rich Results Test but not here, that is the likely reason. Code: `lib/structuredData.js`.
+
 ## Crawl identity and stale-data protection
 
 Every crawl gets a `crawlId` (minted in `lib/siteCrawler.js`). Analyses (AEO, GEO, keyword clusters, internal links, AI insights, competitor comparison, AI visibility) are stamped with the `crawlId` they were computed from, and an async result is only applied if that crawl is still the current one. The logic lives in `lib/crawlState.js` (unit-tested in `tests/crawlState.test.mjs`):

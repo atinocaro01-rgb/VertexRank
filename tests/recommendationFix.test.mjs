@@ -45,7 +45,7 @@ test("normalizeFix validates the shape, counts [ADD:] markers and flags links we
 
 test("fixContext picks the pages a recommendation is about and falls back to the homepage; the cache key is stable", () => {
   const crawl = { domain: "a.com", startUrl: "https://a.com/", pages: [
-    { url: "https://a.com/", title: "Home", fullText: "home text", h2Texts: ["x"], htmlLang: "en", schemaSignals: { types: ["Organization"] } },
+    { url: "https://a.com/", title: "Home", fullText: "home text", h2Texts: ["x"], htmlLang: "en", schemaTypes: ["Organization"] },
     { url: "https://a.com/blog/p1", title: "P1", fullText: "p1 text".repeat(500), wordCount: 900 },
     { url: "https://a.com/blog/p2", title: "P2", fullText: "p2" },
   ] };
@@ -53,7 +53,7 @@ test("fixContext picks the pages a recommendation is about and falls back to the
   assert.deepEqual(pagesFor({ evidence: "Affects https://a.com/blog/p1, https://a.com/blog/p2." }, crawl).map((p) => p.title), ["P1", "P2"]);
   assert.deepEqual(pagesFor({ title: "General" }, crawl).map((p) => p.title), ["Home"]); assert.deepEqual(pagesFor({}, null), []);
   const input = buildFixInput({ title: "T", evidence: "see https://a.com/blog/p1" }, crawl);
-  assert.equal(input.pages[0].excerpt.length, 1500); assert.equal(input.site.domain, "a.com"); assert.equal(input.knownUrls.length, 3); assert.equal(input.pages[0].schemaTypes.length, 0);
+  assert.equal(input.pages[0].excerpt.length, 1500); assert.equal(input.site.domain, "a.com"); assert.equal(input.knownUrls.length, 3); assert.equal(input.pages[0].schemaTypes.length, 0, "the page that was picked (p1) has no schema");
   assert.equal(fixCacheKey({ module: "m", title: "t", recommendedAction: "a" }, "s1"), fixCacheKey({ module: "m", title: "t", recommendedAction: "a" }, "s1"));
 });
 
