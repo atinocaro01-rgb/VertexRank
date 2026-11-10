@@ -25,6 +25,8 @@ import { findSiteRank, sameSite, hostOf } from "../lib/serpMatch";
 import { slimCheck, upsertCheck, competitorProspects } from "../lib/serpInsights";
 import { buildFixInput, fixCacheKey } from "../lib/fixContext";
 import { buildCalendarInput } from "../lib/calendarContext";
+import { enrichQueries, filterQueries, queriesToCsv, queriesForPage, contentIdeaFromQuery, fixRecForQuery, QUERY_FILTERS } from "../lib/searchTools";
+import { ideaStage, isMarked, splitForRegenerate, rememberRejected, regenerateSize, STAGES, STATUSES } from "../lib/contentIdeas";
 import { extractPagePhrases, mergeKeywordIdeas } from "../lib/keywordIntel";
 import { slimCompetitorCrawl, questionBank, outlineGaps, outlineHintsFor, competitorCitations, citationsForTopic } from "../lib/competitorIntel";
 import { checkArticle, buildArticleSchema } from "../lib/articleChecks";
@@ -305,7 +307,9 @@ function emptyBundle() {
     aiVisibility: null,
     competitorSuggestions: [],
     competitors: [],
+    rejectedCompetitors: [], // competitors you deleted or dismissed: "Suggest with AI" never brings them back
     contentIdeas: [],
+    rejectedIdeas: [], // content topics you deleted: regenerating never brings them back
     internalLinks: [],
     backlinks: [],
     actions: [],
@@ -518,12 +522,12 @@ function Modal({ open, onClose, title, children, footer, width = 560 }) {
   );
 }
 
-function ConfirmDialog({ open, onClose, onConfirm, title, body }) {
+function ConfirmDialog({ open, onClose, onConfirm, title, body, confirmLabel = "Delete", confirmIcon = Trash2, confirmVariant = "danger" }) {
   return (
     <Modal open={open} onClose={onClose} title={title} width={420}
       footer={<>
         <Button variant="outline" onClick={onClose}>Cancel</Button>
-        <Button variant="danger" onClick={() => { onConfirm(); onClose(); }} icon={Trash2}>Delete</Button>
+        <Button variant={confirmVariant} onClick={() => { onConfirm(); onClose(); }} icon={confirmIcon}>{confirmLabel}</Button>
       </>}>
       <p className="text-sm" style={{ color: BRAND.inkSoft }}>{body}</p>
     </Modal>
@@ -2111,8 +2115,6 @@ function SearchDataView() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [connect, setConnect] = useState(false);
-  const [queryRows, setQueryRows] = useState(15);
-  const [pageRows, setPageRows] = useState(15);
   const property = website?.gsc?.siteUrl;
   const opps = useMemo(
     () => (report ? buildOpportunityQueue(b, { country }).filter((o) => o.type === "search" && o.module === "Search Console").slice(0, 5) : []),
@@ -2137,27 +2139,6 @@ function SearchDataView() {
   const pctChange = (cur, prev) => (prev ? ((cur - prev) / prev) * 100 : null);
   const t = report?.totals, pt = report?.previousTotals;
   const pctStr = (n) => `${(n * 100).toFixed(1)}%`;
-  const table = (rows, keyName, label, limit, setLimit) => (
-    <Card className="p-4">
-      <h4 className="font-semibold vr-display text-sm mb-2">{label}</h4>
-      <div className="overflow-x-auto">
-        <table className="w-full text-xs">
-          <thead><tr style={{ color: BRAND.inkSoft }} className="text-left"><th className="py-1 pr-2">{keyName === "query" ? "Query" : "Page"}</th><th className="py-1 px-2 text-right">Clicks</th><th className="py-1 px-2 text-right">Impr.</th><th className="py-1 px-2 text-right">CTR</th><th className="py-1 pl-2 text-right">Position</th></tr></thead>
-          <tbody>
-            {rows.slice(0, limit).map((r) => (
-              <tr key={r[keyName]} style={{ borderTop: `1px solid ${BRAND.line}` }}>
-                <td className="py-1.5 pr-2 break-all max-w-[320px]">{keyName === "page" ? (() => { try { const u = new URL(r.page); return (u.pathname + u.search) || "/"; } catch { return r.page; } })() : r[keyName]}</td>
-                <td className="py-1.5 px-2 text-right vr-mono">{r.clicks.toLocaleString("en-US")}</td><td className="py-1.5 px-2 text-right vr-mono">{r.impressions.toLocaleString("en-US")}</td>
-                <td className="py-1.5 px-2 text-right vr-mono">{pctStr(r.ctr)}</td><td className="py-1.5 pl-2 text-right vr-mono">{r.position.toFixed(1)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      {rows.length > limit && <div className="mt-2"><Button size="sm" variant="outline" onClick={() => setLimit((n) => n + 25)}>Show more ({rows.length - limit} left)</Button></div>}
-    </Card>
-  );
-
   return (
     <div className="space-y-4">
       <Card className="p-5">
@@ -2225,10 +2206,8 @@ function SearchDataView() {
             </Card>
           )}
 
-          <div className="grid lg:grid-cols-2 gap-3">
-            {table(report.queries, "query", `Top queries${report.truncated?.queries ? " (top " + report.queries.length + ")" : ""}`, queryRows, setQueryRows)}
-            {table(report.pages, "page", `Top pages${report.truncated?.pages ? " (top " + report.pages.length + ")" : ""}`, pageRows, setPageRows)}
-          </div>
+          <QueryExplorer report={report} />
+          <PagesCard report={report} />
 
           {(report.devices?.length > 0 || report.countries?.length > 0) && (
             <div className="grid md:grid-cols-2 gap-3">
@@ -2238,6 +2217,18 @@ function SearchDataView() {
               ))}
             </div>
           )}
+
+          <Card className="p-4">
+            <p className="text-xs font-semibold mb-1" style={{ color: BRAND.inkSoft }}>More ways to use this data</p>
+            <ul className="list-disc pl-4 text-xs space-y-0.5" style={{ color: BRAND.inkSoft }}>
+              <li>Copy the queries (or download the CSV) and use them as your keyword list, or paste them into a doc as headings and FAQ questions.</li>
+              <li>Quick wins (positions 4–20) are the cheapest gains: improve those pages first, then watch the position in Rank History.</li>
+              <li>Low-CTR queries are a title and meta description problem, not a ranking problem: rewrite them to match what the searcher wants.</li>
+              <li>Question queries make good FAQ entries and short articles; turn them into Content Planner topics in one click.</li>
+              <li>When two of your pages show for the same query, merge them or make each page's purpose clearly different.</li>
+              <li>Open a page's queries to see the exact wording people use, and reuse it in that page's headings and meta description.</li>
+            </ul>
+          </Card>
 
           <Card className="p-4">
             <p className="text-xs font-semibold mb-1" style={{ color: BRAND.inkSoft }}>What this data can and can't tell you</p>
@@ -2256,6 +2247,172 @@ function SearchDataView() {
           }} />
       )}
     </div>
+  );
+}
+
+/** The queries table with filters and things you can do with them: copy, download CSV, use as tracked keywords, turn into content
+ *  topics, check the live Google result, or generate a fix for the page that ranks. Labels come from simple rules over the numbers
+ *  Search Console reported (see lib/searchTools.js). */
+function QueryExplorer({ report }) {
+  const { currentWebsiteId, bundle, setBundles, toast, setView } = useApp();
+  const b = bundle();
+  const [filter, setFilter] = useState("all");
+  const [text, setText] = useState("");
+  const [picked, setPicked] = useState([]);
+  const [limit, setLimit] = useState(25);
+  const rows = useMemo(() => enrichQueries(report, { tracked: (b.keywords || []).map((k) => k.keyword) }), [report, b.keywords]);
+  const counts = useMemo(() => Object.fromEntries(QUERY_FILTERS.map((f) => [f.id, filterQueries(rows, f.id).length])), [rows]);
+  const visible = filterQueries(rows, filter, text);
+  const chosen = picked.length ? rows.filter((r) => picked.includes(r.query)) : visible;
+  const pctStr = (n) => `${(n * 100).toFixed(1)}%`;
+  const togglePick = (q) => setPicked((p) => (p.includes(q) ? p.filter((x) => x !== q) : [...p, q]));
+
+  function siteUpdate(fn) { setBundles((prev) => { const site = prev[currentWebsiteId] || emptyBundle(); return { ...prev, [currentWebsiteId]: fn(site) }; }); }
+  function addKeywords(list) {
+    const have = new Set((b.keywords || []).map((k) => String(k.keyword || "").toLowerCase().trim()));
+    const fresh = list.filter((r) => !have.has(r.query.toLowerCase().trim())).slice(0, 50);
+    if (fresh.length === 0) { toast("Those queries are already in your keywords."); return; }
+    siteUpdate((site) => ({ ...site, keywords: [...site.keywords, ...fresh.map((r) => ({ id: uid("kw"), websiteId: currentWebsiteId, keyword: r.query, intent: "Informational", ranking: Math.round(r.position) || null, volume: null, difficulty: null, opportunity: null, usage: [] }))] }));
+    toast(`Added ${fresh.length} keyword${fresh.length === 1 ? "" : "s"} (Keyword Intelligence > Manual Tracking).`);
+  }
+  function planContent(list) {
+    const haveIdea = new Set((b.contentIdeas || []).flatMap((c) => [String(c.title || "").toLowerCase(), String(c.primaryKeyword || "").toLowerCase()]));
+    const fresh = list.filter((r) => !haveIdea.has(r.query.toLowerCase().trim())).slice(0, 30);
+    if (fresh.length === 0) { toast("Those queries are already in your Content Planner."); return; }
+    siteUpdate((site) => ({ ...site, contentIdeas: [...site.contentIdeas, ...fresh.map((r) => contentIdeaFromQuery(r, uid("ci"), currentWebsiteId))] }));
+    toast(`Added ${fresh.length} topic${fresh.length === 1 ? "" : "s"} to the Content Planner as ideas. Open one to fill it in with AI and write it.`);
+  }
+  function liveCheck(r) { navHint.current = { tab: "serp", query: r.query }; setView("keywords"); }
+  function downloadCsv() {
+    const blob = new Blob(["\ufeff" + queriesToCsv(chosen)], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `search-queries-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  return (
+    <Card className="p-4">
+      <div className="flex items-center justify-between gap-2 flex-wrap mb-2">
+        <h4 className="font-semibold vr-display text-sm">Top queries{report.truncated?.queries ? ` (top ${report.queries.length})` : ""}</h4>
+        <div className="w-44"><TextInput value={text} placeholder="Filter queries" onChange={(e) => { setText(e.target.value); setLimit(25); }} /></div>
+      </div>
+      <div className="flex flex-wrap gap-1.5 mb-3">
+        {QUERY_FILTERS.map((f) => (
+          <button key={f.id} type="button" title={f.hint} onClick={() => { setFilter(f.id); setLimit(25); }} className="vr-focus text-xs font-medium rounded-full px-2.5 py-1"
+            style={{ background: filter === f.id ? BRAND.primarySoft : "transparent", color: filter === f.id ? BRAND.primary : BRAND.inkSoft, border: `1px solid ${filter === f.id ? BRAND.primary : BRAND.line}` }}>{f.label} ({counts[f.id]})</button>
+        ))}
+      </div>
+      <p className="text-[11px] mb-2" style={{ color: BRAND.inkSoft }}>{QUERY_FILTERS.find((f) => f.id === filter)?.hint}</p>
+      <div className="flex flex-wrap items-center gap-2 mb-3 rounded-lg px-3 py-2" style={{ background: BRAND.canvas }}>
+        <span className="text-xs font-medium" style={{ color: BRAND.inkSoft }}>{picked.length ? `${picked.length} selected` : `All ${visible.length} shown`}:</span>
+        <CopyButton label="Copy queries" variant="soft" getText={() => chosen.map((r) => r.query).join("\n")} />
+        <Button size="sm" variant="soft" icon={Download} disabled={chosen.length === 0} onClick={downloadCsv}>CSV</Button>
+        <Button size="sm" variant="soft" icon={TrendingUp} disabled={chosen.length === 0} onClick={() => addKeywords(chosen)} title="Add as keywords you track (up to 50 at a time)">Use as keywords</Button>
+        <Button size="sm" variant="soft" icon={FileText} disabled={chosen.length === 0} onClick={() => planContent(chosen)} title="Add as ideas in the Content Planner (up to 30 at a time)">Plan content</Button>
+        {picked.length > 0 && <button type="button" className="vr-focus text-xs underline" style={{ color: BRAND.inkSoft }} onClick={() => setPicked([])}>Clear selection</button>}
+      </div>
+      {visible.length === 0 ? <p className="text-sm py-4 text-center" style={{ color: BRAND.inkSoft }}>No queries match this filter.</p> : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead><tr style={{ color: BRAND.inkSoft }} className="text-left"><th className="py-1 pr-2 w-6"></th><th className="py-1 pr-2">Query</th><th className="py-1 px-2 text-right">Clicks</th><th className="py-1 px-2 text-right">Impr.</th><th className="py-1 px-2 text-right">CTR</th><th className="py-1 px-2 text-right">Position</th><th className="py-1 pl-2 text-right">Do</th></tr></thead>
+            <tbody>
+              {visible.slice(0, limit).map((r) => (
+                <tr key={r.query} style={{ borderTop: `1px solid ${BRAND.line}` }} className="align-top">
+                  <td className="py-1.5 pr-2"><input type="checkbox" aria-label={`Select ${r.query}`} checked={picked.includes(r.query)} onChange={() => togglePick(r.query)} /></td>
+                  <td className="py-1.5 pr-2 break-words max-w-[300px]">
+                    <span className="block">{r.query}</span>
+                    <span className="flex flex-wrap gap-1 mt-1">
+                      {r.quickWin && <Badge color={{ fg: BRAND.amber, bg: BRAND.amberSoft }}>Quick win</Badge>}
+                      {r.lowCtr && <Badge color={{ fg: BRAND.red, bg: BRAND.redSoft }}>Low CTR</Badge>}
+                      {r.isQuestion && <Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>Question</Badge>}
+                      {r.compete && <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>{r.pages.length} pages</Badge>}
+                      {r.tracked && <Badge color={{ fg: BRAND.visibility, bg: BRAND.visibilitySoft }}>Tracked</Badge>}
+                    </span>
+                    {r.topPage && <span className="block text-[10px] mt-1 break-all" style={{ color: BRAND.inkSoft }}>{(() => { try { const u = new URL(r.topPage); return (u.pathname + u.search) || "/"; } catch { return r.topPage; } })()}</span>}
+                  </td>
+                  <td className="py-1.5 px-2 text-right vr-mono">{r.clicks.toLocaleString("en-US")}</td>
+                  <td className="py-1.5 px-2 text-right vr-mono">{r.impressions.toLocaleString("en-US")}</td>
+                  <td className="py-1.5 px-2 text-right vr-mono">{pctStr(r.ctr)}</td>
+                  <td className="py-1.5 px-2 text-right vr-mono">{r.position.toFixed(1)}</td>
+                  <td className="py-1.5 pl-2">
+                    <div className="flex items-center justify-end gap-0.5 flex-wrap">
+                      <CopyButton iconOnly label="Copy this query" getText={() => r.query} />
+                      <IconButton icon={TrendingUp} title="Use as a keyword" onClick={() => addKeywords([r])} />
+                      <IconButton icon={FileText} title="Plan a content topic" onClick={() => planContent([r])} />
+                      <IconButton icon={Search} title="Check the live Google result" onClick={() => liveCheck(r)} />
+                      {(r.quickWin || r.lowCtr) && <GenerateFixButton variant="soft" rec={fixRecForQuery(r)} />}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {visible.length > limit && <div className="mt-2"><Button size="sm" variant="outline" onClick={() => setLimit((n) => n + 25)}>Show more ({visible.length - limit} left)</Button></div>}
+      <p className="text-[11px] mt-2" style={{ color: BRAND.inkSoft }}>Labels are simple rules over Search Console's numbers, not predictions. Search volume isn't part of Search Console data.</p>
+    </Card>
+  );
+}
+
+/** Top pages, each able to show the queries it appears for, so you can copy them and reuse the exact wording. */
+function PagesCard({ report }) {
+  const { currentWebsiteId, bundle, setBundles, toast } = useApp();
+  const b = bundle();
+  const [limit, setLimit] = useState(15);
+  const [open, setOpen] = useState(null);
+  const pctStr = (n) => `${(n * 100).toFixed(1)}%`;
+  const pathOf = (u) => { try { const x = new URL(u); return (x.pathname + x.search) || "/"; } catch { return u; } };
+  function addKeywords(list) {
+    const have = new Set((b.keywords || []).map((k) => String(k.keyword || "").toLowerCase().trim()));
+    const fresh = list.filter((r) => !have.has(r.query.toLowerCase().trim())).slice(0, 50);
+    if (fresh.length === 0) { toast("Those queries are already in your keywords."); return; }
+    setBundles((prev) => { const site = prev[currentWebsiteId] || emptyBundle(); return { ...prev, [currentWebsiteId]: { ...site, keywords: [...site.keywords, ...fresh.map((r) => ({ id: uid("kw"), websiteId: currentWebsiteId, keyword: r.query, intent: "Informational", ranking: Math.round(r.position) || null, volume: null, difficulty: null, opportunity: null, usage: [] }))] } }; });
+    toast(`Added ${fresh.length} keyword${fresh.length === 1 ? "" : "s"}.`);
+  }
+  return (
+    <Card className="p-4">
+      <h4 className="font-semibold vr-display text-sm mb-2">Top pages{report.truncated?.pages ? ` (top ${report.pages.length})` : ""}</h4>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead><tr style={{ color: BRAND.inkSoft }} className="text-left"><th className="py-1 pr-2">Page</th><th className="py-1 px-2 text-right">Clicks</th><th className="py-1 px-2 text-right">Impr.</th><th className="py-1 px-2 text-right">CTR</th><th className="py-1 px-2 text-right">Position</th><th className="py-1 pl-2 text-right">Queries</th></tr></thead>
+          <tbody>
+            {report.pages.slice(0, limit).map((r) => {
+              const qs = open === r.page ? queriesForPage(report, r.page) : [];
+              return (
+                <React.Fragment key={r.page}>
+                  <tr style={{ borderTop: `1px solid ${BRAND.line}` }}>
+                    <td className="py-1.5 pr-2 break-all max-w-[320px]">{pathOf(r.page)}</td>
+                    <td className="py-1.5 px-2 text-right vr-mono">{r.clicks.toLocaleString("en-US")}</td><td className="py-1.5 px-2 text-right vr-mono">{r.impressions.toLocaleString("en-US")}</td>
+                    <td className="py-1.5 px-2 text-right vr-mono">{pctStr(r.ctr)}</td><td className="py-1.5 px-2 text-right vr-mono">{r.position.toFixed(1)}</td>
+                    <td className="py-1.5 pl-2 text-right"><button type="button" className="vr-focus underline" style={{ color: BRAND.primary }} onClick={() => setOpen(open === r.page ? null : r.page)}>{open === r.page ? "Hide" : "Show"}</button></td>
+                  </tr>
+                  {open === r.page && (
+                    <tr><td colSpan={6} className="pb-3">
+                      <div className="rounded-lg p-3" style={{ background: BRAND.canvas }}>
+                        {qs.length === 0 ? <p style={{ color: BRAND.inkSoft }}>No query detail for this page in the report (Search Console only returns the top combinations).</p> : (
+                          <>
+                            <div className="flex flex-wrap items-center gap-2 mb-2">
+                              <CopyButton label="Copy queries" variant="soft" getText={() => qs.map((x) => x.query).join("\n")} />
+                              <Button size="sm" variant="soft" icon={TrendingUp} onClick={() => addKeywords(qs)}>Use as keywords</Button>
+                              <span style={{ color: BRAND.inkSoft }}>Reuse this wording in the page's headings, FAQ and meta description.</span>
+                            </div>
+                            <ul className="space-y-0.5">{qs.map((x) => <li key={x.query} className="flex justify-between gap-3"><span className="break-words">{x.query}</span><span className="vr-mono shrink-0">{x.impressions.toLocaleString("en-US")} impr. · pos {x.position.toFixed(1)}</span></li>)}</ul>
+                          </>
+                        )}
+                      </div>
+                    </td></tr>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      {report.pages.length > limit && <div className="mt-2"><Button size="sm" variant="outline" onClick={() => setLimit((n) => n + 25)}>Show more ({report.pages.length - limit} left)</Button></div>}
+    </Card>
   );
 }
 
@@ -2571,9 +2728,13 @@ function ActionCenter() {
 
 /* ============================== Keyword Intelligence ============================== */
 
+/** Lets one screen open another on a specific tab with a search already filled in (e.g. Search data -> Live Results for a query). */
+const navHint = { current: null };
+
 function KeywordsView() {
   const { currentWebsiteId } = useApp();
-  const [tab, setTab] = useState("clusters");
+  const [tab, setTab] = useState(() => navHint.current?.tab || "clusters");
+  useEffect(() => { navHint.current = null; }, []);
   if (!currentWebsiteId) return <EmptyState icon={Globe2} title="Select a website" body="Choose a website from the top bar to see its keyword tracking." />;
   return (
     <div className="space-y-4">
@@ -2967,7 +3128,7 @@ function SerpPanel() {
   const website = websites.find((w) => w.id === currentWebsiteId);
   const b = bundle();
   const country = normalizeCountry(website?.country);
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(() => navHint.current?.query || "");
   const [device, setDevice] = useState("desktop");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -4094,13 +4255,18 @@ function AiVisibilitySimulatorPanel() {
 
 /* ============================== Competitors ============================== */
 
+const compKey = (v) => String(v || "").toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "").trim();
+
 function CompetitorsView() {
   const { websites, bundle, setBundles, currentWebsiteId, toast, addAction } = useApp();
   const b = bundle();
   const ownSite = websites.find((w) => w.id === currentWebsiteId)?.url || b.siteCrawl?.domain || "";
-  const prospects = competitorProspects(b.serpChecks, { site: ownSite, tracked: b.competitors });
+  const rejectedKeys = new Set((b.rejectedCompetitors || []).map(compKey));
+  const prospects = competitorProspects(b.serpChecks, { site: ownSite, tracked: b.competitors }).filter((p) => !rejectedKeys.has(compKey(p.host)));
   const [modal, setModal] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
+  const [selected, setSelected] = useState([]); // ids of tracked competitors ticked for bulk delete
+  const [confirmBulk, setConfirmBulk] = useState(false);
   const [form, setForm] = useState({ name: "", url: "" });
   const [analyzing, setAnalyzing] = useState(null);
   const [expanded, setExpanded] = useState(null);
@@ -4127,7 +4293,33 @@ function CompetitorsView() {
     toast("Competitor updated");
     setModal(null);
   }
-  function del(id) { mutate((arr) => arr.filter((x) => x.id !== id)); toast("Competitor removed"); }
+  function updateSite(fn) {
+    setBundles((prev) => { const site = prev[currentWebsiteId] || emptyBundle(); return { ...prev, [currentWebsiteId]: fn(site) }; });
+  }
+  /** Remembers names/domains you don't want, so "Suggest with AI" and the live-search list never bring them back. */
+  function remember(...vals) {
+    const keys = vals.map(compKey).filter(Boolean);
+    if (keys.length) updateSite((site) => ({ ...site, rejectedCompetitors: rememberRejected(site.rejectedCompetitors, keys) }));
+  }
+  function del(id) {
+    const gone = b.competitors.find((x) => x.id === id);
+    if (gone) remember(gone.url, gone.name);
+    mutate((arr) => arr.filter((x) => x.id !== id));
+    setSelected((sel) => sel.filter((x) => x !== id));
+    toast("Competitor removed. Suggestions won't bring it back.");
+  }
+  function delSelected() {
+    const gone = b.competitors.filter((x) => selected.includes(x.id));
+    remember(...gone.flatMap((c) => [c.url, c.name]));
+    mutate((arr) => arr.filter((x) => !selected.includes(x.id)));
+    setSelected([]);
+    toast(`Removed ${gone.length} competitor${gone.length === 1 ? "" : "s"}. Suggestions won't bring them back.`);
+  }
+  const toggleSel = (id) => setSelected((sel) => (sel.includes(id) ? sel.filter((x) => x !== id) : [...sel, id]));
+  function clearSuggestions() {
+    remember(...(b.competitorSuggestions || []).flatMap((x) => [x.url, x.name]));
+    setSuggestions(() => []);
+  }
 
   function analyze(c) {
     if (!b.siteCrawl?.pages?.length) { toast("Add a website first — a full-site crawl starts automatically and powers this.", "error"); return; }
@@ -4213,9 +4405,11 @@ function CompetitorsView() {
     if (!siteMeta) { toast("Add a website first — a full-site crawl starts automatically and powers this.", "error"); return; }
     setSuggesting(true);
     try {
-      const data = await postJson("/api/competitor-suggestions", { scanMeta: siteMeta, country: countryOf(currentWebsiteId) });
-      const existing = new Set(b.competitors.map((c) => c.name.toLowerCase()));
-      const fresh = (data.result.suggestions || []).filter((s) => s.name && !existing.has(s.name.toLowerCase()));
+      // The current suggestions are replaced, so they count as "not wanted" for this round; tracked and deleted ones are never repeated.
+      const avoid = [...new Set([...(b.rejectedCompetitors || []), ...b.competitors.flatMap((c) => [c.url, c.name]), ...(b.competitorSuggestions || []).flatMap((x) => [x.url, x.name])].map((v) => String(v || "").trim()).filter(Boolean))].slice(0, 40);
+      const data = await postJson("/api/competitor-suggestions", { scanMeta: siteMeta, country: countryOf(currentWebsiteId), avoid });
+      const existing = new Set(b.competitors.flatMap((c) => [compKey(c.name), compKey(c.url)]).filter(Boolean));
+      const fresh = (data.result.suggestions || []).filter((s) => s.name && !existing.has(compKey(s.name)) && !(s.url && existing.has(compKey(s.url))) && !rejectedKeys.has(compKey(s.name)) && !rejectedKeys.has(compKey(s.url)));
       setSuggestions(() => fresh);
       if (fresh.length === 0) toast("VertexRank AI didn't have any new competitor suggestions this time.");
     } catch (err) {
@@ -4229,7 +4423,11 @@ function CompetitorsView() {
     setSuggestions((arr) => arr.filter((x) => x.id !== s.id));
     toast(`${s.name} added — verify the URL before analyzing`);
   }
-  function dismissSuggestion(id) { setSuggestions((arr) => arr.filter((x) => x.id !== id)); }
+  function dismissSuggestion(id) {
+    const gone = (b.competitorSuggestions || []).find((x) => x.id === id);
+    if (gone) remember(gone.url, gone.name);
+    setSuggestions((arr) => arr.filter((x) => x.id !== id));
+  }
   function addProspect(p) {
     mutate((arr) => (arr.some((c) => hostOf(c.url || c.name) === p.host) ? arr : [...arr, { id: uid("comp"), websiteId: currentWebsiteId, siteAnalysis: null, name: p.host, url: p.host }]));
     toast(`${p.host} added to competitors`);
@@ -4244,7 +4442,8 @@ function CompetitorsView() {
           : "Run a full-site crawl of your own site first (from Websites — one starts automatically when you add a site) to unlock site-wide competitor comparison and automatic backlink discovery."}
       </div>
       <div className="flex justify-end gap-2">
-        <Button variant="soft" icon={suggesting ? Loader2 : Sparkles} disabled={suggesting} onClick={suggestCompetitors}>{suggesting ? "Suggesting…" : "Suggest with AI"}</Button>
+        {(b.competitorSuggestions || []).length > 0 && <Button variant="outline" icon={X} disabled={suggesting} onClick={clearSuggestions} title="Clear these suggestions. They won't be suggested again.">Clear suggestions</Button>}
+        <Button variant="soft" icon={suggesting ? Loader2 : (b.competitorSuggestions || []).length > 0 ? RefreshCw : Sparkles} disabled={suggesting} onClick={suggestCompetitors}>{suggesting ? "Suggesting…" : (b.competitorSuggestions || []).length > 0 ? "Regenerate suggestions" : "Suggest with AI"}</Button>
       </div>
 
       <CompetitorIntelPanel />
@@ -4260,7 +4459,10 @@ function CompetitorsView() {
                   <p className="text-sm font-medium break-all">{p.host}</p>
                   <p className="text-xs" style={{ color: BRAND.inkSoft }}>In {p.appearances} saved search{p.appearances === 1 ? "" : "es"} · best position #{p.bestRank} · e.g. {p.queries.slice(0, 3).map((q) => `“${q}”`).join(", ")}</p>
                 </div>
-                <Button size="sm" variant="soft" icon={Plus} onClick={() => addProspect(p)}>Add</Button>
+                <div className="flex gap-1 shrink-0">
+                  <Button size="sm" variant="soft" icon={Plus} onClick={() => addProspect(p)}>Add</Button>
+                  <IconButton icon={X} onClick={() => remember(p.host)} title="Not a competitor: hide it" />
+                </div>
               </div>
             ))}
           </div>
@@ -4289,14 +4491,24 @@ function CompetitorsView() {
         </Card>
       )}
 
+      {b.competitors.length > 1 && (
+        <div className="flex flex-wrap items-center gap-3 text-xs" style={{ color: BRAND.inkSoft }}>
+          <button type="button" className="vr-focus underline" onClick={() => setSelected(selected.length === b.competitors.length ? [] : b.competitors.map((c) => c.id))}>{selected.length === b.competitors.length ? "Clear selection" : "Select all"}</button>
+          {selected.length > 0 && <Button size="sm" variant="danger" icon={Trash2} onClick={() => setConfirmBulk(true)}>Delete {selected.length} selected</Button>}
+          <span>Delete the ones that aren't real competitors, then use Regenerate suggestions for better ones.</span>
+        </div>
+      )}
       {b.competitors.length === 0 ? <Card><EmptyState icon={Users} title="No competitors tracked" body="Let VertexRank AI suggest competitors from the crawl, then accept the ones that fit." action={<Button variant="soft" icon={Sparkles} onClick={suggestCompetitors}>Suggest with AI</Button>} /></Card> : (
         <div className="grid sm:grid-cols-2 gap-4">
           {b.competitors.map((c) => (
             <Card key={c.id} className="p-4">
               <div className="flex items-start justify-between">
-                <div>
-                  <p className="font-semibold text-sm">{c.name}</p>
-                  <p className="text-xs" style={{ color: BRAND.inkSoft }}>{c.url}</p>
+                <div className="flex items-start gap-2 min-w-0">
+                  {b.competitors.length > 1 && <input type="checkbox" className="mt-1" aria-label={`Select ${c.name}`} checked={selected.includes(c.id)} onChange={() => toggleSel(c.id)} />}
+                  <div className="min-w-0">
+                    <p className="font-semibold text-sm">{c.name}</p>
+                    <p className="text-xs" style={{ color: BRAND.inkSoft }}>{c.url}</p>
+                  </div>
                 </div>
                 <div className="flex gap-0.5">
                   <CopyButton iconOnly label="Copy this competitor and its analysis" getText={() => formatCompetitor(c, "##")} />
@@ -4415,7 +4627,8 @@ function CompetitorsView() {
         <Field label="Name"><TextInput value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} /></Field>
         <Field label="Website"><TextInput placeholder="competitor.com" value={form.url} onChange={(e) => setForm((f) => ({ ...f, url: e.target.value }))} /></Field>
       </Modal>
-      <ConfirmDialog open={!!confirmDelete} onClose={() => setConfirmDelete(null)} title="Remove competitor" body="This competitor will no longer be tracked." onConfirm={() => del(confirmDelete.id)} />
+      <ConfirmDialog open={!!confirmDelete} onClose={() => setConfirmDelete(null)} title="Remove competitor" body="This competitor will no longer be tracked, and Suggest with AI won't bring it back." onConfirm={() => del(confirmDelete.id)} />
+      <ConfirmDialog open={confirmBulk} onClose={() => setConfirmBulk(false)} title="Remove selected competitors" body={`${selected.length} competitor${selected.length === 1 ? "" : "s"} will no longer be tracked, and Suggest with AI won't bring them back.`} onConfirm={delSelected} />
     </div>
   );
 }
@@ -4433,7 +4646,8 @@ function ContentPlannerView() {
   const [startDate, setStartDate] = useState(() => todayPlus(1));
   const [view, setView] = useState("calendar"); // calendar | list
   const [writer, setWriter] = useState(null);
-  const blankForm = { title: "", primaryKeyword: "", secondaryKeywords: "", intent: "Informational", status: "Idea", questions: "", outline: "", aeoRecs: "", geoRecs: "" };
+  const [confirmRegen, setConfirmRegen] = useState(false);
+  const blankForm = { title: "", primaryKeyword: "", secondaryKeywords: "", intent: "Informational", status: "Idea", scheduledFor: "", questions: "", outline: "", aeoRecs: "", geoRecs: "" };
   const [form, setForm] = useState(blankForm);
 
   if (!currentWebsiteId) return <EmptyState icon={Globe2} title="Select a website" body="Choose a website from the top bar to plan content." />;
@@ -4447,11 +4661,13 @@ function ContentPlannerView() {
   function openEdit(c) {
     setForm({
       title: c.title, primaryKeyword: c.primaryKeyword, secondaryKeywords: (c.secondaryKeywords || []).join(", "),
-      intent: c.intent, status: c.status, questions: (c.questions || []).join("\n"), outline: (c.outline || []).join("\n"),
+      intent: c.intent, status: c.status, scheduledFor: isoDay(c.scheduledFor) ? c.scheduledFor : "", questions: (c.questions || []).join("\n"), outline: (c.outline || []).join("\n"),
       aeoRecs: c.aeoRecs || "", geoRecs: c.geoRecs || "",
     });
     setModal({ mode: "edit", c });
   }
+  // Your own topic (content you planned or already wrote outside the tool): mark its stage like any other.
+  function openAdd() { setForm(blankForm); setModal({ mode: "add" }); }
   async function generateWithAi() {
     if (!form.title.trim()) { toast("Add a title first", "error"); return; }
     setGenerating(true);
@@ -4481,21 +4697,44 @@ function ContentPlannerView() {
       secondaryKeywords: form.secondaryKeywords.split(",").map((k) => k.trim()).filter(Boolean),
       intent: form.intent,
       status: form.status,
+      scheduledFor: isoDay(form.scheduledFor) ? form.scheduledFor : "",
       questions: form.questions.split("\n").map((q) => q.trim()).filter(Boolean),
       outline: form.outline.split("\n").map((o) => o.trim()).filter(Boolean),
       aeoRecs: form.aeoRecs.trim(),
       geoRecs: form.geoRecs.trim(),
     };
-    mutate((arr) => arr.map((x) => (x.id === modal.c.id ? { ...x, ...payload } : x)));
-    toast("Content idea updated");
+    if (modal.mode === "add") {
+      mutate((arr) => [...arr, { id: uid("ci"), websiteId: currentWebsiteId, internalLinks: 0, funnel: "", pillar: "", format: "", angle: "", rationale: "", internalLinkTargets: [], source: "Added by you", ...payload }]);
+      toast("Topic added");
+    } else {
+      mutate((arr) => arr.map((x) => (x.id === modal.c.id ? { ...x, ...payload } : x)));
+      toast("Content idea updated");
+    }
     setModal(null);
   }
-  function del(id) { mutate((arr) => arr.filter((x) => x.id !== id)); toast("Content idea deleted"); }
+  function updateSite(fn) {
+    setBundles((prev) => { const site = prev[currentWebsiteId] || emptyBundle(); return { ...prev, [currentWebsiteId]: fn(site) }; });
+  }
+  // Deleting remembers the title, so regenerating never brings back a topic you didn't like.
+  function del(id) {
+    const gone = b.contentIdeas.find((x) => x.id === id);
+    updateSite((site) => ({ ...site, contentIdeas: site.contentIdeas.filter((x) => x.id !== id), rejectedIdeas: gone ? rememberRejected(site.rejectedIdeas, gone.title) : (site.rejectedIdeas || []) }));
+    if (drawer?.id === id) setDrawer(null);
+    toast("Content idea deleted. Regenerating won't suggest it again.");
+  }
+  // Mark a topic blue / amber / green yourself, whether or not the tool wrote the content.
+  function setStage(id, stage) {
+    const status = STAGES.find((x) => x.id === stage)?.status || "Idea";
+    mutate((arr) => arr.map((x) => (x.id === id ? { ...x, status } : x)));
+    setDrawer((d) => (d && d.id === id ? { ...d, status } : d));
+  }
 
   // Builds a 30-day content calendar from the real crawl and everything already measured (Search Console queries, keyword gaps,
   // unanswered questions, GEO gaps, live-search checks). The server proposes candidates and code keeps only topics that pass a
   // quality gate, so it may return fewer than 30 rather than pad the month with weak ideas. See lib/contentCalendar.js.
-  async function generateIdeasWithAi() {
+  // mode "add": appends new topics around what is already there. mode "replace" (Regenerate): swaps the plain blue ideas for fresh
+  // ones and keeps everything you marked amber or green (or wrote a draft for), plus never re-suggests topics you deleted.
+  async function generateIdeasWithAi({ mode = "add" } = {}) {
     const siteMeta = siteMetaFrom(b);
     if (!siteMeta) { toast("Add a website first — a full-site crawl starts automatically and powers this.", "error"); return; }
     if (!isoDay(startDate)) { toast("Pick a start date for the calendar.", "error"); return; }
@@ -4503,28 +4742,34 @@ function ContentPlannerView() {
     const market = countryOf(currentWebsiteId);
     const ticket = tracker.beginAnalysis(currentWebsiteId, "contentIdeas");
     try {
-      const input = buildCalendarInput(b, { startDate });
+      const { kept, replace } = mode === "replace" ? splitForRegenerate(b.contentIdeas) : { kept: b.contentIdeas, replace: [] };
+      const input = buildCalendarInput(b, { startDate, keep: kept, avoidTitles: b.rejectedIdeas || [], replaceTitles: replace.map((c) => c.title), size: mode === "replace" ? regenerateSize(kept.length) : undefined });
       const data = await postJson("/api/content-calendar", { ...input, country: market });
       // Topics are grounded in the crawl and its analyses; if the crawl changed meanwhile they'd be off-target.
       if (!analysisUsable(ticket, toast)) return;
       const cal = data.calendar;
       if (!cal.topics.length) { toast("No topics met the quality bar this time. Try again, or run Keyword Intelligence and AEO first for richer data.", "error"); return; }
-      mutate((arr) => [
-        ...arr,
-        ...cal.topics.map((t) => ({
+      const fresh = cal.topics.map((t) => ({
           id: uid("ci"), websiteId: currentWebsiteId, internalLinks: 0, status: "Idea",
           title: t.title, primaryKeyword: t.primaryKeyword, secondaryKeywords: t.secondaryKeywords, intent: t.intent, funnel: t.funnel, pillar: t.pillar, format: t.format,
           angle: t.angle, grounding: t.grounding, wordCountTarget: t.wordCountTarget, internalLinkTargets: t.internalLinkTargets, scheduledFor: t.scheduledFor,
           questions: [], outline: [], aeoRecs: "", geoRecs: "", rationale: t.rationale, source: "VertexRank AI Calendar",
-        })),
-      ]);
+        }));
+      // Decided at the moment of saving, so anything you marked while this was running is kept too.
+      mutate((arr) => (mode === "replace" ? [...arr.filter((x) => isMarked(x)), ...fresh] : [...arr, ...fresh]));
       setView("calendar");
-      toast(`Added ${cal.topics.length} topic${cal.topics.length === 1 ? "" : "s"} to the calendar${cal.warnings?.length ? ` — ${cal.warnings[0]}` : ""}`);
+      toast(mode === "replace"
+        ? `Replaced ${replace.length} idea${replace.length === 1 ? "" : "s"} with ${fresh.length} new one${fresh.length === 1 ? "" : "s"}. Kept the ${kept.length} you marked.${cal.warnings?.length ? ` ${cal.warnings[0]}` : ""}`
+        : `Added ${fresh.length} topic${fresh.length === 1 ? "" : "s"} to the calendar${cal.warnings?.length ? ` — ${cal.warnings[0]}` : ""}`);
     } catch (err) {
       toast(err.message || "Couldn't generate the calendar.", "error");
     } finally {
       setGeneratingIdeas(false);
     }
+  }
+  function askRegenerate() {
+    if (splitForRegenerate(b.contentIdeas).replace.length === 0) { generateIdeasWithAi({ mode: "replace" }); return; }
+    setConfirmRegen(true);
   }
   function saveDraft(id, draft) {
     mutate((arr) => arr.map((x) => (x.id === id ? { ...x, draft, status: x.status === "Idea" ? "Drafting" : x.status } : x)));
@@ -4540,11 +4785,15 @@ function ContentPlannerView() {
         </div>
         <div className="flex items-end gap-2">
           <Field label="Calendar starts"><TextInput type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} /></Field>
-          <div className="mb-3.5"><Button variant="soft" icon={generatingIdeas ? Loader2 : Sparkles} disabled={generatingIdeas} onClick={generateIdeasWithAi}>{generatingIdeas ? "Building… (up to a minute)" : "Generate 30-day calendar"}</Button></div>
+          <div className="mb-3.5 flex flex-wrap gap-2">
+            <Button variant="outline" icon={Plus} onClick={openAdd} disabled={generatingIdeas}>Add topic</Button>
+            {b.contentIdeas.length > 0 && <Button variant="soft" icon={generatingIdeas ? Loader2 : RefreshCw} disabled={generatingIdeas} onClick={askRegenerate} title="Replace the plain blue ideas with fresh ones. Topics you marked amber or green are kept.">{generatingIdeas ? "Building… (up to a minute)" : "Regenerate ideas"}</Button>}
+            <Button variant={b.contentIdeas.length ? "outline" : "soft"} icon={generatingIdeas ? Loader2 : Sparkles} disabled={generatingIdeas} onClick={() => generateIdeasWithAi()}>{generatingIdeas ? "Building… (up to a minute)" : b.contentIdeas.length ? "Add more topics" : "Generate 30-day calendar"}</Button>
+          </div>
         </div>
       </div>
-      <p className="text-xs" style={{ color: BRAND.inkSoft }}>Topics come from your real data: Search Console queries, keyword gaps, unanswered questions, GEO gaps and live-search checks. Only topics that pass a quality check are kept, so you may get fewer than 30 rather than filler. The more of those analyses you've run, the stronger the calendar.</p>
-      {b.contentIdeas.length === 0 ? <Card><EmptyState icon={FileText} title="No content calendar yet" body="Generate a 30-day calendar of specific, well-grounded topics from your crawl and everything VertexRank has measured." action={<Button variant="soft" icon={Sparkles} onClick={generateIdeasWithAi}>Generate 30-day calendar</Button>} /></Card> : (
+      <p className="text-xs" style={{ color: BRAND.inkSoft }}>Topics come from your real data: Search Console queries, keyword gaps, unanswered questions, GEO gaps and live-search checks. Only topics that pass a quality check are kept, so you may get fewer than 30 rather than filler. Mark each topic blue, amber or green yourself (even for content you wrote elsewhere). Delete the ones you don't like, then Regenerate: topics you marked amber or green are kept, and deleted ones won't come back.</p>
+      {b.contentIdeas.length === 0 ? <Card><EmptyState icon={FileText} title="No content calendar yet" body="Generate a 30-day calendar of specific, well-grounded topics from your crawl and everything VertexRank has measured." action={<Button variant="soft" icon={Sparkles} onClick={() => generateIdeasWithAi()}>Generate 30-day calendar</Button>} /></Card> : (
         <>
         {view === "calendar" && <ContentCalendarGrid items={b.contentIdeas} onOpen={setDrawer} />}
         {(view === "list" || b.contentIdeas.some((c) => !isoDay(c.scheduledFor))) && (
@@ -4562,9 +4811,9 @@ function ContentPlannerView() {
               <p className="text-xs mt-1" style={{ color: BRAND.inkSoft }}>{c.primaryKeyword || "No primary keyword set"}{c.scheduledFor ? ` · ${c.scheduledFor}` : ""}</p>
               <div className="flex gap-2 mt-3 flex-wrap">
                 <Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{c.intent}</Badge>
-                <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>{c.status}</Badge>
-                {c.draft && <Badge color={{ fg: BRAND.amber, bg: BRAND.amberSoft }}>Draft written</Badge>}
+                {c.draft && <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>Article saved</Badge>}
               </div>
+              <div className="mt-2" onClick={(e) => e.stopPropagation()}><StageMarker value={ideaStage(c)} onChange={(st) => setStage(c.id, st)} /></div>
             </Card>
           ))}
         </div>
@@ -4572,14 +4821,15 @@ function ContentPlannerView() {
         </>
       )}
 
-      <Modal open={!!modal} onClose={() => setModal(null)} title="Edit content idea" width={620}
+      <Modal open={!!modal} onClose={() => setModal(null)} title={modal?.mode === "add" ? "Add a content topic" : "Edit content idea"} width={620}
         footer={<><Button variant="outline" onClick={() => setModal(null)}>Cancel</Button><Button onClick={save}>Save</Button></>}>
         <Field label="Title"><TextInput value={form.title} onChange={(e) => setForm((f) => ({ ...f, title: e.target.value }))} /></Field>
         <Field label="Primary keyword"><TextInput value={form.primaryKeyword} onChange={(e) => setForm((f) => ({ ...f, primaryKeyword: e.target.value }))} /></Field>
         <div className="grid grid-cols-2 gap-3">
           <Field label="Search intent"><Select value={form.intent} onChange={(e) => setForm((f) => ({ ...f, intent: e.target.value }))}>{INTENTS.map((i) => <option key={i}>{i}</option>)}</Select></Field>
-          <Field label="Status"><Select value={form.status} onChange={(e) => setForm((f) => ({ ...f, status: e.target.value }))}>{["Idea", "Drafting", "Ready", "Published"].map((s) => <option key={s}>{s}</option>)}</Select></Field>
+          <Field label="Status"><Select value={form.status} onChange={(e) => setForm((f) => ({ ...f, status: e.target.value }))}>{STATUSES.map((s) => <option key={s} value={s}>{s === "Drafting" ? "Draft written" : s === "Ready" ? "Ready (draft written)" : s}</option>)}</Select></Field>
         </div>
+        <Field label="Publish date (optional)"><TextInput type="date" value={form.scheduledFor} onChange={(e) => setForm((f) => ({ ...f, scheduledFor: e.target.value }))} /></Field>
         <div className="mb-3.5">
           <Button size="sm" variant="soft" icon={generating ? Loader2 : Wand2} onClick={generateWithAi} disabled={generating}>
             {generating ? "Generating…" : "Draft the rest with AI"}
@@ -4596,10 +4846,16 @@ function ContentPlannerView() {
       <Modal open={!!drawer} onClose={() => setDrawer(null)} title={drawer?.title} width={640}>
         {drawer && (
           <div className="space-y-4">
-            <div className="flex gap-2 flex-wrap"><Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{drawer.intent}</Badge><Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>{drawer.status}</Badge>{drawer.funnel && <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>{drawer.funnel}</Badge>}{drawer.format && <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>{drawer.format}</Badge>}{drawer.scheduledFor && <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>Publish {drawer.scheduledFor}</Badge>}</div>
+            <div className="flex gap-2 flex-wrap"><Badge color={{ fg: BRAND.primary, bg: BRAND.primarySoft }}>{drawer.intent}</Badge>{drawer.funnel && <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>{drawer.funnel}</Badge>}{drawer.format && <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>{drawer.format}</Badge>}{drawer.scheduledFor && <Badge color={{ fg: BRAND.inkSoft, bg: BRAND.canvas }}>Publish {drawer.scheduledFor}</Badge>}</div>
+            <div>
+              <p className="text-xs font-semibold mb-1.5" style={{ color: BRAND.inkSoft }}>Mark as</p>
+              <StageMarker value={ideaStage(drawer)} onChange={(st) => setStage(drawer.id, st)} />
+              <p className="text-[11px] mt-1.5" style={{ color: BRAND.inkSoft }}>Blue = idea · amber = draft written · green = published. Works for content you wrote outside VertexRank too. Marked topics are kept when you regenerate.</p>
+            </div>
             <div className="flex gap-2 flex-wrap">
               <Button icon={FileText} onClick={() => { setWriter(drawer); setDrawer(null); }}>{drawer.draft ? "Open saved draft" : "Write the article"}</Button>
               <GenerateFixButton variant="soft" rec={{ title: `Publish: ${drawer.title}`, evidence: drawer.grounding?.text ? `Grounded in: ${drawer.grounding.text}${drawer.grounding.note ? ` (${drawer.grounding.note})` : ""}` : drawer.rationale, recommendedAction: `Create the page for "${drawer.primaryKeyword}": ${drawer.angle || drawer.rationale || ""}`, module: "Content Planner", source: drawer.source, actionType: "Content Update", urls: drawer.internalLinkTargets }} />
+              <Button variant="danger" icon={Trash2} onClick={() => setConfirmDelete(drawer)}>Delete</Button>
             </div>
             {drawer.grounding && (
               <div className="rounded-lg p-3" style={{ background: BRAND.canvas }}>
@@ -4627,7 +4883,10 @@ function ContentPlannerView() {
 
       {writer && <ArticleWriterModal idea={b.contentIdeas.find((x) => x.id === writer.id) || writer} onClose={() => setWriter(null)} onSave={(d) => saveDraft(writer.id, d)} />}
 
-      <ConfirmDialog open={!!confirmDelete} onClose={() => setConfirmDelete(null)} title="Delete content idea" body="This content idea will be permanently removed." onConfirm={() => del(confirmDelete.id)} />
+      <ConfirmDialog open={!!confirmDelete} onClose={() => setConfirmDelete(null)} title="Delete content idea" body="This content idea will be removed, and Regenerate won't suggest it again." onConfirm={() => del(confirmDelete.id)} />
+      <ConfirmDialog open={confirmRegen} onClose={() => setConfirmRegen(false)} title="Regenerate content ideas" confirmLabel="Regenerate" confirmIcon={RefreshCw} confirmVariant="primary"
+        body={`This replaces the ${splitForRegenerate(b.contentIdeas).replace.length} plain blue idea${splitForRegenerate(b.contentIdeas).replace.length === 1 ? "" : "s"} with fresh ones. The ${splitForRegenerate(b.contentIdeas).kept.length} topic${splitForRegenerate(b.contentIdeas).kept.length === 1 ? "" : "s"} you marked amber or green (or wrote a draft for) stay exactly as they are, and topics you deleted won't come back.`}
+        onConfirm={() => generateIdeasWithAi({ mode: "replace" })} />
     </div>
   );
 }
@@ -4637,6 +4896,20 @@ function ContentPlannerView() {
 const todayPlus = (n) => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
 const isoDay = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || "");
 const mondayOf = (iso) => { const d = new Date(`${iso}T00:00:00Z`); d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7)); return d; };
+
+const stageTone = (stage) => ({ idea: [BRAND.primary, BRAND.primarySoft], draft: [BRAND.amber, BRAND.amberSoft], published: [BRAND.visibility, BRAND.visibilitySoft] }[stage] || [BRAND.primary, BRAND.primarySoft]);
+
+/** Three buttons to mark a topic: Idea (blue), Draft written (amber), Published (green). You set it, so it works for content written anywhere. */
+function StageMarker({ value, onChange }) {
+  return (
+    <div className="inline-flex flex-wrap gap-1" role="group" aria-label="Mark this topic as">
+      {STAGES.map((st) => {
+        const on = value === st.id; const [fg, bg] = stageTone(st.id);
+        return <button key={st.id} type="button" aria-pressed={on} onClick={() => onChange(st.id)} className="vr-focus text-[11px] font-medium rounded px-2 py-1" style={{ background: on ? bg : "transparent", color: on ? fg : BRAND.inkSoft, border: `1px solid ${on ? fg : BRAND.line}` }}>{st.label}</button>;
+      })}
+    </div>
+  );
+}
 
 /** The month at a glance: topics laid out on their scheduled days, Monday to Sunday. */
 function ContentCalendarGrid({ items, onOpen }) {
@@ -4664,7 +4937,7 @@ function ContentCalendarGrid({ items, onOpen }) {
                 <div className="text-[10px] mb-1" style={{ color: BRAND.inkSoft }}>{day.slice(8) === "01" || day === w[0] ? new Date(`${day}T00:00:00Z`).toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" }) : Number(day.slice(8))}</div>
                 {(byDay.get(day) || []).map((c) => (
                   <button key={c.id} type="button" onClick={() => onOpen(c)} title={c.title} className="vr-focus block w-full text-left text-[11px] leading-snug rounded px-1.5 py-1 mb-1"
-                    style={{ background: c.status === "Published" ? BRAND.visibilitySoft : c.draft ? BRAND.amberSoft : BRAND.primarySoft, color: c.status === "Published" ? BRAND.visibility : c.draft ? BRAND.amber : BRAND.primary }}>
+                    style={{ background: stageTone(ideaStage(c))[1], color: stageTone(ideaStage(c))[0] }}>
                     <span className="line-clamp-3">{c.title}</span>
                   </button>
                 ))}
@@ -4672,7 +4945,7 @@ function ContentCalendarGrid({ items, onOpen }) {
             ))}
           </div>
         ))}
-        <p className="text-[10px] mt-2" style={{ color: BRAND.inkSoft }}>Blue = idea · amber = draft written · green = published. Click a topic to see why it's on the calendar and to write it.</p>
+        <p className="text-[10px] mt-2" style={{ color: BRAND.inkSoft }}>Blue = idea · amber = draft written · green = published. Click a topic to mark it, see why it's on the calendar, or write it.</p>
       </div>
     </Card>
   );

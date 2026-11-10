@@ -29,6 +29,6 @@ export async function POST(req) {
   const warnings = settled.filter((s) => s.status === "rejected").map(() => "One part of the calendar couldn't be generated, so it has fewer topics. Run it again to fill the gaps.");
 
   const { topics, rejected } = assembleCalendar(ok, input, startDate);
-  if (topics.length < CALENDAR_SIZE && warnings.length === 0) warnings.push(`Only ${topics.length} topics met the quality bar; weaker ones were dropped instead of padding the calendar. Generate again for more.`);
+  if (topics.length < input.size && warnings.length === 0) warnings.push(`Only ${topics.length} topics met the quality bar; weaker ones were dropped instead of padding the calendar. Generate again for more.`);
   return Response.json({ calendar: { topics, rejectedCount: rejected.length, warnings, startDate, generatedAt: new Date().toISOString() } });
 }
