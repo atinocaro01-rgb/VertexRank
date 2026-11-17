@@ -25,6 +25,8 @@ import { findSiteRank, sameSite, hostOf } from "../lib/serpMatch";
 import { slimCheck, upsertCheck, competitorProspects } from "../lib/serpInsights";
 import { buildFixInput, fixCacheKey } from "../lib/fixContext";
 import { buildCalendarInput } from "../lib/calendarContext";
+import { rate, weakVitals, fmtMetric, vitalsRec, upsertPageSpeed, METRIC_LABEL } from "../lib/pagespeed";
+import { refreshCandidates, thinPages, contentIdeaFromRefresh, fixRecForRefresh } from "../lib/contentRefresh";
 import { enrichQueries, filterQueries, queriesToCsv, queriesForPage, contentIdeaFromQuery, fixRecForQuery, QUERY_FILTERS } from "../lib/searchTools";
 import { ideaStage, isMarked, splitForRegenerate, rememberRejected, regenerateSize, STAGES, STATUSES } from "../lib/contentIdeas";
 import { extractPagePhrases, mergeKeywordIdeas } from "../lib/keywordIntel";
@@ -310,6 +312,7 @@ function emptyBundle() {
     rejectedCompetitors: [], // competitors you deleted or dismissed: "Suggest with AI" never brings them back
     contentIdeas: [],
     rejectedIdeas: [], // content topics you deleted: regenerating never brings them back
+    pageSpeed: [], // Core Web Vitals results from Google PageSpeed Insights (lib/pagespeed.js)
     internalLinks: [],
     backlinks: [],
     actions: [],
@@ -2426,7 +2429,7 @@ function SiteAuditPanel() {
 
   // The audit also shows the deterministic market (country) checks for the website's selected target market.
   const country = normalizeCountry(websites.find((w) => w.id === currentWebsiteId)?.country);
-  const allIssues = useMemo(() => computeAuditIssuesForMarket(crawl, country), [crawl, country]);
+  const allIssues = useMemo(() => computeAuditIssuesForMarket(crawl, country, { gscReport: b.gscReport }), [crawl, country, b.gscReport]);
   const website = websites.find((w) => w.id === currentWebsiteId);
   const [prIssue, setPrIssue] = useState(null);
 
@@ -2487,6 +2490,8 @@ function SiteAuditPanel() {
           <span className="text-[10px] font-medium" style={{ color: BRAND.visibility }}>Avg. across {crawl.pagesCrawled} pages</span>
         </div>
       </Card>
+
+      <PageSpeedPanel />
 
       {worstPages.length > 0 && (
         <Card className="p-4">
@@ -4793,6 +4798,7 @@ function ContentPlannerView() {
         </div>
       </div>
       <p className="text-xs" style={{ color: BRAND.inkSoft }}>Topics come from your real data: Search Console queries, keyword gaps, unanswered questions, GEO gaps and live-search checks. Only topics that pass a quality check are kept, so you may get fewer than 30 rather than filler. Mark each topic blue, amber or green yourself (even for content you wrote elsewhere). Delete the ones you don't like, then Regenerate: topics you marked amber or green are kept, and deleted ones won't come back.</p>
+      <ContentRefreshPanel />
       {b.contentIdeas.length === 0 ? <Card><EmptyState icon={FileText} title="No content calendar yet" body="Generate a 30-day calendar of specific, well-grounded topics from your crawl and everything VertexRank has measured." action={<Button variant="soft" icon={Sparkles} onClick={() => generateIdeasWithAi()}>Generate 30-day calendar</Button>} /></Card> : (
         <>
         {view === "calendar" && <ContentCalendarGrid items={b.contentIdeas} onOpen={setDrawer} />}
@@ -4896,6 +4902,138 @@ function ContentPlannerView() {
 const todayPlus = (n) => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
 const isoDay = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || "");
 const mondayOf = (iso) => { const d = new Date(`${iso}T00:00:00Z`); d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7)); return d; };
+
+const RATING_TONE = { good: ["visibility", "visibilitySoft"], "needs improvement": ["amber", "amberSoft"], poor: ["red", "redSoft"] };
+const ratingColor = (r) => { const [fg, bg] = RATING_TONE[r] || ["inkSoft", "canvas"]; return { fg: BRAND[fg], bg: BRAND[bg] }; };
+
+/** Core Web Vitals for a handful of important pages, measured by Google's PageSpeed Insights. Real-user (field) numbers are what
+ *  Google ranks on; the lab test is one simulated load, shown as a fallback and for the "what to fix" list. See lib/pagespeed.js. */
+function PageSpeedPanel() {
+  const { bundle, setBundles, currentWebsiteId, toast, addAction } = useApp();
+  const b = bundle();
+  const crawl = b.siteCrawl;
+  const [strategy, setStrategy] = useState("mobile");
+  const [busy, setBusy] = useState("");
+  const [open, setOpen] = useState(null);
+  const results = b.pageSpeed || [];
+  const candidates = useMemo(() => {
+    const home = crawl?.startUrl || crawl?.pages?.[0]?.url;
+    return [...new Set([home, ...(b.gscReport?.pages || []).slice(0, 8).map((p) => p.page), ...(crawl?.pages || []).slice(0, 8).map((p) => p.url)].filter(Boolean))].slice(0, 5);
+  }, [crawl, b.gscReport]);
+  const latest = (url) => results.find((r) => r.url === url && r.strategy === strategy);
+  const isAdded = (r) => b.actions.some((a) => a.detail?.sourceId === `cwv:${r.strategy}:${r.url}`);
+  const pathOf = (u) => { try { const x = new URL(u); return (x.pathname + x.search) || "/"; } catch { return u; } };
+
+  async function check(url) {
+    const id = currentWebsiteId;
+    setBusy(url);
+    try {
+      const data = await postJson("/api/pagespeed", { url, strategy });
+      setBundles((prev) => { const site = prev[id]; return site ? { ...prev, [id]: { ...site, pageSpeed: upsertPageSpeed(site.pageSpeed, data.result) } } : prev; });
+      setOpen(url);
+      return true;
+    } catch (e) { toast(e.message || "Couldn't test that page.", "error"); return false; } finally { setBusy(""); }
+  }
+  async function checkAll() { for (const u of candidates) { if (!(await check(u))) break; } }
+  const chip = (label, metric, value, rating) => <Badge color={ratingColor(rating)}>{label} {fmtMetric(metric, value)}</Badge>;
+
+  if (candidates.length === 0) return null;
+  return (
+    <Card className="p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
+        <div className="flex items-center gap-2"><Zap size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">Page speed (Core Web Vitals)</h3><DataLabel kind="observed" title="Measured by Google PageSpeed Insights, not estimated by AI.">Google PageSpeed Insights</DataLabel></div>
+        <div className="flex items-center gap-2">
+          <div className="w-32"><Select value={strategy} onChange={(e) => setStrategy(e.target.value)}><option value="mobile">Mobile</option><option value="desktop">Desktop</option></Select></div>
+          <Button size="sm" variant="soft" icon={busy ? Loader2 : Zap} disabled={!!busy} onClick={checkAll}>{busy ? "Testing… (10–40 s per page)" : `Test ${candidates.length} key pages`}</Button>
+        </div>
+      </div>
+      <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Your homepage and most-visited pages. <strong>Real-user data</strong> (what Google ranks on) appears for pages with enough traffic; otherwise you see a single <strong>lab test</strong>, which finds causes but isn't what Google ranks on. Each test uses a little of Google's free quota.</p>
+      <div className="space-y-2">
+        {candidates.map((url) => {
+          const r = latest(url);
+          const weak = r ? weakVitals(r) : [];
+          return (
+            <div key={url} className="rounded-lg px-4 py-3" style={{ background: BRAND.canvas }}>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="min-w-0"><p className="text-sm font-medium break-all">{pathOf(url)}</p>{r && <p className="text-[11px]" style={{ color: BRAND.inkSoft }}>{r.strategy} · tested {timeAgo(r.fetchedAt) || "just now"}</p>}</div>
+                <div className="flex items-center gap-2">
+                  {r && <span className="vr-mono text-sm font-semibold" style={{ color: r.score >= 90 ? BRAND.visibility : r.score >= 50 ? BRAND.amber : BRAND.red }}>{r.score ?? "–"}<span className="text-[10px] font-normal" style={{ color: BRAND.inkSoft }}> /100</span></span>}
+                  {r && <button type="button" className="vr-focus text-xs underline" style={{ color: BRAND.primary }} onClick={() => setOpen(open === url ? null : url)}>{open === url ? "Hide" : "Details"}</button>}
+                  <Button size="sm" variant="outline" icon={busy === url ? Loader2 : RefreshCw} disabled={!!busy} onClick={() => check(url)}>{r ? "Re-test" : "Test"}</Button>
+                </div>
+              </div>
+              {r && (
+                <div className="flex flex-wrap gap-1.5 mt-2">
+                  {r.field ? (<>{r.field.lcp && chip("LCP", "lcp", r.field.lcp.value, r.field.lcp.rating)}{r.field.inp && chip("INP", "inp", r.field.inp.value, r.field.inp.rating)}{r.field.cls && chip("CLS", "cls", r.field.cls.value, r.field.cls.rating)}<span className="text-[11px] self-center" style={{ color: BRAND.inkSoft }}>real users, last 28 days</span></>)
+                    : (<>{chip("LCP", "lcp", r.lab.lcp, r.lab.lcpRating)}{chip("TBT", "tbt", r.lab.tbt, r.lab.tbtRating)}{chip("CLS", "cls", r.lab.cls, r.lab.clsRating)}<span className="text-[11px] self-center" style={{ color: BRAND.inkSoft }}>lab test only: not enough real-user data for this page</span></>)}
+                </div>
+              )}
+              {r && open === url && (
+                <div className="mt-3 space-y-2 text-xs">
+                  {weak.length === 0 ? <p style={{ color: BRAND.visibility }}>Every measured vital is in Google's "good" range.</p> : (
+                    <ul className="list-disc pl-4 space-y-0.5">{weak.map((w) => <li key={w.metric}>{METRIC_LABEL[w.metric]}: <strong>{fmtMetric(w.metric, w.value)}</strong> is {w.rating} ({w.source}).</li>)}</ul>
+                  )}
+                  {r.opportunities?.length > 0 && (<div><p className="font-semibold mb-1" style={{ color: BRAND.inkSoft }}>Biggest savings Lighthouse found</p><ul className="list-disc pl-4 space-y-0.5">{r.opportunities.map((o) => <li key={o.title}>{o.title}{o.display ? ` (${o.display})` : ""}</li>)}</ul></div>)}
+                  {weak.length > 0 && (
+                    <div className="flex flex-wrap gap-2 pt-1">
+                      <GenerateFixButton variant="soft" rec={vitalsRec(r)} />
+                      <Button size="sm" variant={isAdded(r) ? "outline" : "soft"} icon={isAdded(r) ? Check : ListPlus} disabled={isAdded(r)} onClick={() => { const rec = vitalsRec(r); addAction({ title: rec.title, type: "Technical Fix", status: "New", detail: { sourceId: `cwv:${r.strategy}:${r.url}`, module: rec.module, evidence: rec.evidence, recommendedAction: rec.recommendedAction, priority: rec.priority, source: rec.source } }); toast("Added to Action Center"); }}>{isAdded(r) ? "Added" : "Add to Action Center"}</Button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </Card>
+  );
+}
+
+/** Pages worth updating rather than replacing: losing clicks, impressions or position in Search Console, or thin but already shown.
+ *  One click adds the page to the Content Planner as a "Refresh" topic (kept when you regenerate). See lib/contentRefresh.js. */
+function ContentRefreshPanel() {
+  const { bundle, setBundles, currentWebsiteId, toast } = useApp();
+  const b = bundle();
+  const [shown, setShown] = useState(5);
+  const hasGsc = !!b.gscReport?.pages?.length;
+  const rows = useMemo(() => (hasGsc ? refreshCandidates(b.gscReport, b.siteCrawl, { limit: 20 }) : thinPages(b.siteCrawl)), [b.gscReport, b.siteCrawl, hasGsc]);
+  const planned = (c) => (b.contentIdeas || []).some((x) => x.source === "Content refresh" && x.grounding?.text === c.path);
+  if (!b.siteCrawl && !hasGsc) return null;
+  function plan(c) {
+    if (planned(c)) return;
+    setBundles((prev) => { const site = prev[currentWebsiteId] || emptyBundle(); return { ...prev, [currentWebsiteId]: { ...site, contentIdeas: [...site.contentIdeas, contentIdeaFromRefresh(c, uid("ci"), currentWebsiteId)] } }; });
+    toast("Added to the Content Planner as a refresh topic");
+  }
+  return (
+    <Card className="p-4">
+      <div className="flex flex-wrap items-center gap-2 mb-1"><RefreshCw size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">Pages to refresh</h3><DataLabel kind="observed" title="From Search Console's current vs previous period and your crawl.">{hasGsc ? "Search Console + crawl" : "Crawl only"}</DataLabel></div>
+      <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>{hasGsc ? `Pages losing clicks, impressions or ranking compared with the previous ${b.gscReport.days || 28} days, and thin pages that already get impressions. Updating a page that already has some visibility is usually faster than writing a new one.` : "Thin pages found in your crawl. Connect Search Console (Search data) to also find pages that are losing clicks or rankings."}</p>
+      {rows.length === 0 ? <p className="text-sm" style={{ color: BRAND.inkSoft }}>{hasGsc ? "No pages are clearly declining or thin right now." : "No thin pages found."}</p> : (
+        <div className="space-y-2">
+          {rows.slice(0, shown).map((c) => (
+            <div key={c.page} className="rounded-lg px-4 py-3" style={{ background: BRAND.canvas }}>
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium break-words">{c.title}</p>
+                  <p className="text-[11px] break-all" style={{ color: BRAND.inkSoft }}>{c.path}</p>
+                  <div className="flex flex-wrap gap-1.5 mt-1.5">{c.reasons.map((r) => <Badge key={r.kind} color={r.kind === "thin" ? { fg: BRAND.amber, bg: BRAND.amberSoft } : { fg: BRAND.red, bg: BRAND.redSoft }}>{r.text}</Badge>)}</div>
+                  {c.topQueries.length > 0 && <p className="text-[11px] mt-1.5" style={{ color: BRAND.inkSoft }}>Top queries: {c.topQueries.slice(0, 3).map((q) => `“${q.query}”`).join(", ")}</p>}
+                </div>
+                <div className="flex flex-wrap gap-1 shrink-0">
+                  <Button size="sm" variant={planned(c) ? "outline" : "soft"} icon={planned(c) ? Check : Plus} disabled={planned(c)} onClick={() => plan(c)}>{planned(c) ? "In planner" : "Plan refresh"}</Button>
+                  <GenerateFixButton variant="soft" rec={fixRecForRefresh(c)} />
+                </div>
+              </div>
+            </div>
+          ))}
+          {rows.length > shown && <Button size="sm" variant="outline" onClick={() => setShown((n) => n + 5)}>Show more ({rows.length - shown} left)</Button>}
+        </div>
+      )}
+    </Card>
+  );
+}
+
 
 const stageTone = (stage) => ({ idea: [BRAND.primary, BRAND.primarySoft], draft: [BRAND.amber, BRAND.amberSoft], published: [BRAND.visibility, BRAND.visibilitySoft] }[stage] || [BRAND.primary, BRAND.primarySoft]);
 
