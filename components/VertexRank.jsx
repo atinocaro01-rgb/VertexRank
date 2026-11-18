@@ -5794,20 +5794,23 @@ function LocalSeoView() {
 
 const PB_STATUS = { pass: ["visibility", "visibilitySoft", "Good"], warn: ["amber", "amberSoft", "Partly"], fail: ["red", "redSoft", "Fix"], todo: ["inkSoft", "canvas", "To do"], unknown: ["inkSoft", "canvas", "Not measured"], na: ["inkSoft", "canvas", "N/A"] };
 
-/** The 2026 SEO Playbook as a scorecard: 57 items in six groups, each checked from your data or ticked by you. See lib/playbook.js. */
+/** The SEO Playbook as a scorecard: items in eight groups, each checked from your data or ticked by you, with steps and a Generate fix button on every item that needs work. See lib/playbook.js. */
 function PlaybookScorecard() {
-  const { websites, bundle, setBundles, currentWebsiteId, setView } = useApp();
+  const { websites, bundle, setBundles, currentWebsiteId, setView, addAction, toast } = useApp();
   const b = bundle();
   const country = normalizeCountry(websites.find((w) => w.id === currentWebsiteId)?.country);
   const pb = useMemo(() => evaluatePlaybook(b, { country }), [b.siteCrawl, b.gscReport, b.pageSpeed, b.localProfile, b.localChecklist, b.playbookMarks, b.keywords, b.siteKeywordClusters, b.backlinks, b.competitors, b.serpChecks, country]); // eslint-disable-line react-hooks/exhaustive-deps
   const [open, setOpen] = useState(null);
+  const [howOpen, setHowOpen] = useState(null); // item whose "how to fix" steps are showing
+  const inActions = (id) => b.actions.some((a) => a.detail?.sourceId === `playbook:${id}`);
+  function toAction(i) { addAction({ title: i.rec.title, type: i.rec.actionType, status: "New", detail: { sourceId: `playbook:${i.id}`, module: i.rec.module, evidence: i.rec.evidence, recommendedAction: i.rec.recommendedAction, priority: i.rec.priority, source: i.rec.source } }); toast("Added to Action Center"); }
   const mark = (id, value) => setBundles((prev) => { const site = prev[currentWebsiteId]; if (!site) return prev; const m = { ...(site.playbookMarks || {}) }; if (value) m[id] = value; else delete m[id]; return { ...prev, [currentWebsiteId]: { ...site, playbookMarks: m } }; });
   const tone = (st) => { const [fg, bg] = PB_STATUS[st] || PB_STATUS.unknown; return { fg: BRAND[fg], bg: BRAND[bg] }; };
   const bar = (v) => (v === null ? BRAND.line : v >= 75 ? BRAND.visibility : v >= 45 ? BRAND.amber : BRAND.red);
   return (
     <Card className="p-5">
       <div className="flex flex-wrap items-center justify-between gap-3 mb-1">
-        <div className="flex items-center gap-2"><ListChecks size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">2026 SEO Playbook scorecard</h3></div>
+        <div className="flex items-center gap-2"><ListChecks size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">SEO Playbook scorecard</h3></div>
         <div className="flex items-center gap-2"><span className="text-xs" style={{ color: BRAND.inkSoft }}>{pb.overall.measured} of {pb.overall.total} items measured</span><span className="vr-mono text-lg font-semibold" style={{ color: bar(pb.overall.score) }}>{pb.overall.score === null ? "–" : `${pb.overall.score}%`}</span></div>
       </div>
       <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Every item from the playbook, checked from your crawl, Search Console, page speed tests and Local SEO data, or ticked by you where it can't be measured. Items that can't be measured yet are left out of the score, not counted as good or bad.</p>
@@ -5830,11 +5833,25 @@ function PlaybookScorecard() {
                       <p className="text-sm" style={{ textDecoration: i.status === "na" ? "line-through" : "none" }}>{i.text}</p>
                       <p className="text-[11px]" style={{ color: BRAND.inkSoft }}>{i.detail}</p>
                     </div>
-                    <div className="flex items-center gap-2 text-xs shrink-0">
+                    <div className="flex flex-wrap items-center gap-2 text-xs shrink-0">
                       {!i.auto && i.status !== "na" && <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={i.status === "pass"} onChange={(e) => mark(i.id, e.target.checked ? "done" : null)} />Done</label>}
                       {i.status === "na" ? <button type="button" className="vr-focus underline" onClick={() => mark(i.id, null)}>Undo N/A</button> : <button type="button" className="vr-focus underline" style={{ color: BRAND.inkSoft }} onClick={() => mark(i.id, "na")}>N/A</button>}
-                      {i.auto && i.status !== "pass" && i.status !== "na" && <button type="button" className="vr-focus underline" style={{ color: BRAND.primary }} onClick={() => setView(i.view)}>Open</button>}
+                      {i.status !== "pass" && i.status !== "na" && i.view && <button type="button" className="vr-focus underline" style={{ color: BRAND.primary }} onClick={() => setView(i.view)}>Open</button>}
                     </div>
+                    {i.rec && (
+                      <div className="basis-full flex flex-wrap items-center gap-1.5 pt-1">
+                        <Button size="sm" variant="outline" icon={howOpen === i.id ? ChevronUp : Info} onClick={() => setHowOpen(howOpen === i.id ? null : i.id)}>How to fix</Button>
+                        <GenerateFixButton variant="soft" rec={i.rec} />
+                        <Button size="sm" variant={inActions(i.id) ? "outline" : "soft"} icon={inActions(i.id) ? Check : ListPlus} disabled={inActions(i.id)} onClick={() => toAction(i)}>{inActions(i.id) ? "Added" : "Add to Action Center"}</Button>
+                        {i.urls?.length > 0 && <span className="text-[11px]" style={{ color: BRAND.inkSoft }}>{i.urls.length} {i.urls.length === 1 ? "page" : "pages"} affected</span>}
+                      </div>
+                    )}
+                    {i.rec && howOpen === i.id && (
+                      <div className="basis-full text-xs rounded-lg px-3 py-2" style={{ background: BRAND.canvas }}>
+                        <p>{i.how}</p>
+                        {i.urls?.length > 0 && <ul className="mt-1.5 space-y-0.5 break-all" style={{ color: BRAND.inkSoft }}>{i.urls.slice(0, 5).map((u) => <li key={u}>{(() => { try { const x = new URL(u); return x.pathname + x.search || "/"; } catch { return u; } })()}</li>)}{i.urls.length > 5 && <li>and {i.urls.length - 5} more</li>}</ul>}
+                      </div>
+                    )}
                   </li>
                 ))}
               </ul>

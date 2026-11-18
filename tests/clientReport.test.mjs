@@ -24,7 +24,7 @@ test("buildReportData gathers each section from saved data only", () => {
   assert.equal(d.search.refresh[0].path, "/a");
   assert.equal(d.vitals[0].basis, "lab test"); assert.match(d.vitals[0].weak[0], /Largest Contentful Paint 5\.2 s \(poor\)/);
   assert.deepEqual(d.content.counts, { idea: 1, draft: 1, published: 1 }); assert.deepEqual(d.content.upcoming.map((u) => u.title), ["Idea post", "Draft post"]);
-  assert.equal(d.playbook.groups.length, 6);
+  assert.equal(d.playbook.groups.length, 8);
   assert.ok(d.highlights.some((h) => h.kind === "win" && /Clicks from Google up 20%/.test(h.text)));
   assert.ok(d.highlights.some((h) => h.kind === "watch" && /Impressions down 10%/.test(h.text)));
   assert.ok(d.highlights.some((h) => /1 recommended fix has been marked done/.test(h.text)));

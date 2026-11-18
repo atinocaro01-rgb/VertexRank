@@ -7,12 +7,12 @@ const sw = (over = {}) => ({ orphanPages: [], weakLinkedPages: [], duplicateTitl
 const crawl = (pages, siteWide = sw()) => ({ domain: "s.com", startUrl: "https://s.com/", pages, siteWide });
 const item = (r, id) => r.groups.flatMap((g) => g.items).find((i) => i.id === id);
 
-test("57 items in six groups; with no data every auto item is 'unknown' and manual items are 'to do'", () => {
+test("82 items in eight groups; with no data crawl-based items are 'unknown' and anything not done is 'to do'", () => {
   const r = evaluatePlaybook({});
   assert.deepEqual(r.groups.map((g) => g.id), PLAYBOOK_GROUPS.map((g) => g.id));
-  assert.equal(r.overall.total, 57); assert.equal(r.hasCrawl, false);
+  assert.equal(r.overall.total, 82); assert.equal(r.hasCrawl, false); assert.equal(r.groups.length, 8);
   assert.equal(item(r, "t_https").status, "unknown"); assert.equal(item(r, "t_toxic").status, "todo");
-  assert.equal(item(r, "c_related").status, "todo"); assert.equal(item(r, "a_competitors").status, "todo");
+  assert.equal(item(r, "c_related").status, "todo"); assert.equal(item(r, "a_competitors").status, "todo"); assert.equal(item(r, "s_gsc").status, "todo");
 });
 
 test("a clean crawl passes the technical and on-page checks", () => {
@@ -70,5 +70,62 @@ test("scores: pass 1, partly 0.5, fix 0; unknown and N/A are left out", () => {
   assert.equal(item(r, "a_competitors").status, "pass"); assert.equal(item(r, "a_shifts").status, "pass");
   assert.equal(adv.measured, 9 - 0); // all advanced items are either manual (to do) or auto with data
   assert.equal(adv.score, Math.round(((2) / 9) * 100));
-  assert.equal(evaluatePlaybook({ siteCrawl: crawl([]) }).groups[0].items[0].status, "unknown");
+  assert.equal(evaluatePlaybook({ siteCrawl: crawl([]) }).groups.find((g) => g.id === "technical").items[0].status, "unknown");
+});
+
+const pgs = (urls, over = {}) => urls.map((u, i) => page({ url: u, ...(over[u] || {}) }));
+
+test("new technical items: clean URLs, click depth, redirects (permanent vs temporary) and http links", () => {
+  const urls = ["https://s.com/", "https://s.com/a", "https://s.com/b", "https://s.com/c", "https://s.com/d"];
+  const link = (from, to) => ({ [from]: { internalLinkUrls: [to] } });
+  const over = { ...link("https://s.com/", "https://s.com/a"), ...link("https://s.com/a", "https://s.com/b"), ...link("https://s.com/b", "https://s.com/c"), ...link("https://s.com/c", "https://s.com/d") };
+  const r = evaluatePlaybook({ siteCrawl: crawl(pgs(urls, over)) });
+  assert.equal(item(r, "t_depth").status, "warn"); assert.match(item(r, "t_depth").detail, /1 of 5 .*more than 3 clicks/); assert.deepEqual(item(r, "t_depth").urls, ["https://s.com/d"]);
+  assert.equal(item(r, "t_clean_urls").status, "pass");
+  const messy = evaluatePlaybook({ siteCrawl: crawl(pgs(["https://s.com/", "https://s.com/Blog_Post?id=3", "https://s.com/ok", "https://s.com/ok2", "https://s.com/ok3", "https://s.com/ok4"])) });
+  assert.equal(item(messy, "t_clean_urls").status, "warn"); assert.deepEqual(item(messy, "t_clean_urls").urls, ["https://s.com/Blog_Post?id=3"]);
+  const temp = evaluatePlaybook({ siteCrawl: crawl(pgs(["https://s.com/", "https://s.com/a"], { "https://s.com/a": { redirectChain: [{ status: 302, from: "https://s.com/old", to: "https://s.com/a" }] }, "https://s.com/": { redirectChain: [] } })) });
+  assert.equal(item(temp, "t_302").status, "fail"); // 1 of 2 pages
+  const perm = evaluatePlaybook({ siteCrawl: crawl(pgs(["https://s.com/", "https://s.com/a"], { "https://s.com/a": { redirectChain: [{ status: 301, from: "https://s.com/old", to: "https://s.com/a" }] }, "https://s.com/": { redirectChain: [] } })) });
+  assert.equal(item(perm, "t_302").status, "pass");
+  assert.equal(item(evaluatePlaybook({ siteCrawl: crawl([page({ redirectChain: undefined })]) }), "t_302").status, "unknown");
+  const http = evaluatePlaybook({ siteCrawl: crawl(pgs(["https://s.com/", "https://s.com/a"], { "https://s.com/a": { internalLinkUrls: ["http://s.com/x"] } })) });
+  assert.equal(item(http, "t_http_links").status, "fail"); assert.deepEqual(item(http, "t_http_links").urls, ["https://s.com/a"]);
+});
+
+test("setup, content and AI items follow the data they depend on", () => {
+  const empty = evaluatePlaybook({});
+  assert.equal(item(empty, "ai_visibility").status, "todo");
+  const have = evaluatePlaybook({ gscReport: { totals: { clicks: 1 }, property: "sc-domain:s.com", queries: [] }, aeoQuestions: Array.from({ length: 6 }, (_, i) => ({ q: i })), competitors: [{ name: "a", crawlSummary: {} }], siteGeoAnalysis: { ok: true }, siteKeywordClusters: { clusters: [{}, {}, {}], keywords: new Array(12).fill({}), cannibalization: [] } });
+  for (const id of ["s_gsc", "c_paa", "c_comp_kw", "ai_visibility", "c_clusters", "c_cannibal", "c_related"]) assert.equal(item(have, id).status, "pass", id);
+  const clash = evaluatePlaybook({ siteKeywordClusters: { clusters: [{}], keywords: [], cannibalization: [{ pages: [{ url: "https://s.com/a" }, { url: "https://s.com/b" }] }] } });
+  assert.equal(item(clash, "c_cannibal").status, "warn"); assert.deepEqual(item(clash, "c_cannibal").urls, ["https://s.com/a", "https://s.com/b"]);
+  const noindex = evaluatePlaybook({ siteCrawl: crawl([page()], sw({ technical: { findings: [{ id: "tech_home_noindex", category: "Technical", severity: "Critical", title: "The homepage is set to noindex", urls: ["https://s.com/"] }], coverage: { sitemap: { found: true, listed: 1 }, robots: { fetched: true } } } })) });
+  assert.equal(item(noindex, "s_index").status, "fail");
+});
+
+test("every item that needs work carries steps, a fix input and a valid action type; passing and N/A items carry none", () => {
+  const TYPES = ["Meta Fix", "Content Update", "Schema Markup", "Internal Link", "Technical Fix", "FAQ Addition"];
+  const r = evaluatePlaybook({ playbookMarks: { c_intent: "na" } });
+  const all = r.groups.flatMap((g) => g.items);
+  assert.ok(all.every((i) => i.how && i.how.length > 20 && i.view), "every item has how-to steps and a screen to open");
+  for (const i of all) {
+    if (i.status === "pass" || i.status === "na") { assert.equal(i.rec, null, i.id); continue; }
+    assert.ok(i.rec.title && i.rec.evidence && i.rec.recommendedAction === i.how, i.id);
+    assert.ok(TYPES.includes(i.rec.actionType), `${i.id}: ${i.rec.actionType}`);
+    assert.ok(["High", "Medium", "Low"].includes(i.rec.priority) && /^Playbook: /.test(i.rec.module), i.id);
+  }
+  assert.equal(item(r, "c_intent").rec, null);
+  // a failing crawl item hands its affected pages to the fix
+  const bad = evaluatePlaybook({ siteCrawl: crawl(Array.from({ length: 4 }, (_, i) => page({ url: `https://s.com/p${i}`, schemaTypes: [], issues: [{ category: "On-Page", severity: "Medium", title: "Missing H1 heading" }] }))) });
+  assert.equal(item(bad, "o_h1").rec.priority, "High"); assert.equal(item(bad, "o_h1").rec.urls.length, 4); assert.equal(item(bad, "o_h1").rec.actionType, "Meta Fix");
+  assert.equal(item(bad, "t_schema").rec.actionType, "Schema Markup");
+  const manual = item(r, "t_toxic");
+  assert.equal(manual.status, "todo"); assert.match(manual.rec.evidence, /Not yet done/); assert.equal(manual.rec.priority, "Low");
+});
+
+test("ticking a manual item removes its fix; unique ids across the whole scorecard", () => {
+  assert.equal(item(evaluatePlaybook({ playbookMarks: { s_ga4: "done" } }), "s_ga4").rec, null);
+  const ids = evaluatePlaybook({}).groups.flatMap((g) => g.items.map((i) => i.id));
+  assert.equal(new Set(ids).size, ids.length);
 });
