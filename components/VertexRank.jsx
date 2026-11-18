@@ -25,6 +25,7 @@ import { findSiteRank, sameSite, hostOf } from "../lib/serpMatch";
 import { slimCheck, upsertCheck, competitorProspects } from "../lib/serpInsights";
 import { buildFixInput, fixCacheKey } from "../lib/fixContext";
 import { buildCalendarInput } from "../lib/calendarContext";
+import { buildCoverageIndex, existingTitlesFor, splitCovered, relayDays, refreshCandidateFor } from "../lib/contentCoverage";
 import { runLocalChecks, localIdeaFromArea, cleanProfile, parseAreas, EMPTY_PROFILE, LOCAL_CHECKLIST, checklistProgress, checklistMarkdown } from "../lib/localSeo";
 import { rate, weakVitals, fmtMetric, vitalsRec, upsertPageSpeed, METRIC_LABEL } from "../lib/pagespeed";
 import { refreshCandidates, thinPages, contentIdeaFromRefresh, fixRecForRefresh } from "../lib/contentRefresh";
@@ -314,6 +315,8 @@ function emptyBundle() {
     rejectedCompetitors: [], // competitors you deleted or dismissed: "Suggest with AI" never brings them back
     contentIdeas: [],
     rejectedIdeas: [], // content topics you deleted: regenerating never brings them back
+    contentIndex: null, // posts read from the site feed/sitemap { posts, counts, notes, scannedAt } (lib/contentIndex.js)
+    pastedTitles: [], // existing titles you pasted by hand (blogs hosted elsewhere)
     localProfile: { ...EMPTY_PROFILE }, // business name/address/phone/offer/areas you typed in Local SEO
     localChecklist: {}, // { [itemId]: { done, at } } the Google Business Profile / citations / reviews items you ticked
     pageSpeed: [], // Core Web Vitals results from Google PageSpeed Insights (lib/pagespeed.js)
@@ -4656,6 +4659,7 @@ function ContentPlannerView() {
   const [view, setView] = useState("calendar"); // calendar | list
   const [writer, setWriter] = useState(null);
   const [confirmRegen, setConfirmRegen] = useState(false);
+  const [skipped, setSkipped] = useState([]); // generated topics that repeat existing content, shown so you can refresh that page or add anyway
   const blankForm = { title: "", primaryKeyword: "", secondaryKeywords: "", intent: "Informational", status: "Idea", scheduledFor: "", questions: "", outline: "", aeoRecs: "", geoRecs: "" };
   const [form, setForm] = useState(blankForm);
 
@@ -4743,6 +4747,22 @@ function ContentPlannerView() {
   // quality gate, so it may return fewer than 30 rather than pad the month with weak ideas. See lib/contentCalendar.js.
   // mode "add": appends new topics around what is already there. mode "replace" (Regenerate): swaps the plain blue ideas for fresh
   // ones and keeps everything you marked amber or green (or wrote a draft for), plus never re-suggests topics you deleted.
+  const topicToIdea = (t) => ({
+    id: uid("ci"), websiteId: currentWebsiteId, internalLinks: 0, status: "Idea",
+    title: t.title, primaryKeyword: t.primaryKeyword, secondaryKeywords: t.secondaryKeywords, intent: t.intent, funnel: t.funnel, pillar: t.pillar, format: t.format,
+    angle: t.angle, grounding: t.grounding, wordCountTarget: t.wordCountTarget, internalLinkTargets: t.internalLinkTargets, scheduledFor: t.scheduledFor,
+    questions: [], outline: [], aeoRecs: "", geoRecs: "", rationale: t.rationale, source: "VertexRank AI Calendar",
+  });
+  function refreshInstead(item) {
+    updateSite((site) => ({ ...site, contentIdeas: [...site.contentIdeas, contentIdeaFromRefresh(refreshCandidateFor(item), uid("ci"), currentWebsiteId)] }));
+    setSkipped((arr) => arr.filter((x) => x !== item));
+    toast("Added to the Content Planner as a refresh topic");
+  }
+  function addAnyway(item) {
+    mutate((arr) => [...arr, { ...topicToIdea({ ...item.topic, scheduledFor: "" }) }]);
+    setSkipped((arr) => arr.filter((x) => x !== item));
+    toast("Added to the Content Planner (unscheduled)");
+  }
   async function generateIdeasWithAi({ mode = "add" } = {}) {
     const siteMeta = siteMetaFrom(b);
     if (!siteMeta) { toast("Add a website first — a full-site crawl starts automatically and powers this.", "error"); return; }
@@ -4752,24 +4772,26 @@ function ContentPlannerView() {
     const ticket = tracker.beginAnalysis(currentWebsiteId, "contentIdeas");
     try {
       const { kept, replace } = mode === "replace" ? splitForRegenerate(b.contentIdeas) : { kept: b.contentIdeas, replace: [] };
-      const input = buildCalendarInput(b, { startDate, keep: kept, avoidTitles: b.rejectedIdeas || [], replaceTitles: replace.map((c) => c.title), size: mode === "replace" ? regenerateSize(kept.length) : undefined });
+      // Everything the site already has: crawled pages, posts read from its feed/sitemap, titles you pasted, and the topics you keep.
+      const index = buildCoverageIndex({ crawl: b.siteCrawl, report: b.gscReport, posts: b.contentIndex?.posts, pasted: b.pastedTitles, planned: kept });
+      const input = buildCalendarInput(b, { startDate, keep: kept, avoidTitles: b.rejectedIdeas || [], replaceTitles: replace.map((c) => c.title), size: mode === "replace" ? regenerateSize(kept.length) : undefined, extraTitles: existingTitlesFor(index) });
       const data = await postJson("/api/content-calendar", { ...input, country: market });
       // Topics are grounded in the crawl and its analyses; if the crawl changed meanwhile they'd be off-target.
       if (!analysisUsable(ticket, toast)) return;
       const cal = data.calendar;
       if (!cal.topics.length) { toast("No topics met the quality bar this time. Try again, or run Keyword Intelligence and AEO first for richer data.", "error"); return; }
-      const fresh = cal.topics.map((t) => ({
-          id: uid("ci"), websiteId: currentWebsiteId, internalLinks: 0, status: "Idea",
-          title: t.title, primaryKeyword: t.primaryKeyword, secondaryKeywords: t.secondaryKeywords, intent: t.intent, funnel: t.funnel, pillar: t.pillar, format: t.format,
-          angle: t.angle, grounding: t.grounding, wordCountTarget: t.wordCountTarget, internalLinkTargets: t.internalLinkTargets, scheduledFor: t.scheduledFor,
-          questions: [], outline: [], aeoRecs: "", geoRecs: "", rationale: t.rationale, source: "VertexRank AI Calendar",
-        }));
+      // Second line of defence after the title check on the server: drop topics whose keyword an existing page already covers (or ranks for).
+      const { fresh: okTopics, covered } = splitCovered(cal.topics, index);
+      setSkipped(covered);
+      if (okTopics.length === 0) { toast(`All ${covered.length} new topic${covered.length === 1 ? "" : "s"} repeated content you already have, so nothing was changed. See "Skipped as repeats" below.`, "error"); return; }
+      const fresh = relayDays(okTopics, startDate, kept.map((c) => c.scheduledFor).filter(isoDay)).map(topicToIdea);
       // Decided at the moment of saving, so anything you marked while this was running is kept too.
       mutate((arr) => (mode === "replace" ? [...arr.filter((x) => isMarked(x)), ...fresh] : [...arr, ...fresh]));
       setView("calendar");
+      const skippedNote = covered.length ? ` Skipped ${covered.length} that repeated existing content.` : "";
       toast(mode === "replace"
-        ? `Replaced ${replace.length} idea${replace.length === 1 ? "" : "s"} with ${fresh.length} new one${fresh.length === 1 ? "" : "s"}. Kept the ${kept.length} you marked.${cal.warnings?.length ? ` ${cal.warnings[0]}` : ""}`
-        : `Added ${fresh.length} topic${fresh.length === 1 ? "" : "s"} to the calendar${cal.warnings?.length ? ` — ${cal.warnings[0]}` : ""}`);
+        ? `Replaced ${replace.length} idea${replace.length === 1 ? "" : "s"} with ${fresh.length} new one${fresh.length === 1 ? "" : "s"}. Kept the ${kept.length} you marked.${skippedNote}${cal.warnings?.length ? ` ${cal.warnings[0]}` : ""}`
+        : `Added ${fresh.length} topic${fresh.length === 1 ? "" : "s"} to the calendar.${skippedNote}${cal.warnings?.length ? ` ${cal.warnings[0]}` : ""}`);
     } catch (err) {
       toast(err.message || "Couldn't generate the calendar.", "error");
     } finally {
@@ -4802,6 +4824,27 @@ function ContentPlannerView() {
         </div>
       </div>
       <p className="text-xs" style={{ color: BRAND.inkSoft }}>Topics come from your real data: Search Console queries, keyword gaps, unanswered questions, GEO gaps and live-search checks. Only topics that pass a quality check are kept, so you may get fewer than 30 rather than filler. Mark each topic blue, amber or green yourself (even for content you wrote elsewhere). Delete the ones you don't like, then Regenerate: topics you marked amber or green are kept, and deleted ones won't come back.</p>
+      <ExistingContentPanel />
+      {skipped.length > 0 && (
+        <Card className="p-4">
+          <div className="flex items-center justify-between gap-2 mb-1"><div className="flex items-center gap-2"><ShieldCheck size={16} style={{ color: BRAND.amber }} /><h3 className="font-semibold vr-display">Skipped as repeats ({skipped.length})</h3></div><Button size="sm" variant="outline" onClick={() => setSkipped([])}>Dismiss all</Button></div>
+          <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>These topics were generated but left out because you already have content on them. Compared by words only, so check any you disagree with and use Add anyway.</p>
+          <div className="space-y-2">
+            {skipped.map((c) => (
+              <div key={c.topic.title} className="rounded-lg px-4 py-3 flex flex-wrap items-start justify-between gap-2" style={{ background: BRAND.canvas }}>
+                <div className="min-w-0">
+                  <p className="text-sm font-medium break-words">{c.topic.title}</p>
+                  <p className="text-xs mt-1 break-words" style={{ color: BRAND.inkSoft }}>Skipped because {c.reason}: {c.by.source === "planner" ? "already in your planner as" : ""} “{c.by.title}”{c.by.path ? ` (${c.by.path})` : ""}.</p>
+                </div>
+                <div className="flex gap-1 shrink-0">
+                  {c.by.url && <Button size="sm" variant="soft" icon={RefreshCw} onClick={() => refreshInstead(c)}>Refresh that page</Button>}
+                  <Button size="sm" variant="outline" icon={Plus} onClick={() => addAnyway(c)}>Add anyway</Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
       <ContentRefreshPanel />
       {b.contentIdeas.length === 0 ? <Card><EmptyState icon={FileText} title="No content calendar yet" body="Generate a 30-day calendar of specific, well-grounded topics from your crawl and everything VertexRank has measured." action={<Button variant="soft" icon={Sparkles} onClick={() => generateIdeasWithAi()}>Generate 30-day calendar</Button>} /></Card> : (
         <>
@@ -4990,6 +5033,57 @@ function PageSpeedPanel() {
           );
         })}
       </div>
+    </Card>
+  );
+}
+
+/** What the site has already published: crawled pages plus posts read from its own feed/sitemap, and titles you paste. The calendar
+ *  never repeats any of it. See lib/contentIndex.js and lib/contentCoverage.js. */
+function ExistingContentPanel() {
+  const { websites, bundle, setBundles, currentWebsiteId, toast } = useApp();
+  const b = bundle();
+  const [scanning, setScanning] = useState(false);
+  const [paste, setPaste] = useState(null); // null = closed, string = textarea content
+  const siteUrl = b.siteCrawl?.startUrl || websites.find((w) => w.id === currentWebsiteId)?.url || "";
+  const idx = b.contentIndex;
+  const crawled = (b.siteCrawl?.pages || []).filter((p) => p.title).length;
+  const pasted = (b.pastedTitles || []).length;
+  const known = buildCoverageIndex({ crawl: b.siteCrawl, report: b.gscReport, posts: idx?.posts, pasted: b.pastedTitles }).length;
+  if (!siteUrl) return null;
+
+  async function scan() {
+    const id = currentWebsiteId;
+    setScanning(true);
+    try {
+      const data = await postJson("/api/site-content-index", { url: siteUrl });
+      setBundles((prev) => { const site = prev[id]; return site ? { ...prev, [id]: { ...site, contentIndex: data.index } } : prev; });
+      toast(data.index.posts.length ? `Found ${data.index.posts.length} existing post${data.index.posts.length === 1 ? "" : "s"} on your site.` : (data.index.notes?.[0] || "No posts found."), data.index.posts.length ? undefined : "error");
+    } catch (e) { toast(e.message || "Couldn't read the site's posts.", "error"); } finally { setScanning(false); }
+  }
+  function savePaste() {
+    const lines = [...new Set(String(paste || "").split(/\n+/).map((l) => l.replace(/\s+/g, " ").trim().slice(0, 200)).filter(Boolean))].slice(0, 300);
+    setBundles((prev) => { const site = prev[currentWebsiteId]; return site ? { ...prev, [currentWebsiteId]: { ...site, pastedTitles: lines } } : prev; });
+    setPaste(null);
+    toast(`${lines.length} title${lines.length === 1 ? "" : "s"} saved. New ideas will avoid them.`);
+  }
+  return (
+    <Card className="p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
+        <div className="flex items-center gap-2"><BookOpen size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">Existing content (so ideas don't repeat)</h3></div>
+        <div className="flex gap-2">
+          <Button size="sm" variant="soft" icon={scanning ? Loader2 : RefreshCw} disabled={scanning} onClick={scan}>{scanning ? "Reading…" : idx ? "Re-scan blog" : "Scan blog (feed & sitemap)"}</Button>
+          <Button size="sm" variant="outline" icon={FileText} onClick={() => setPaste((b.pastedTitles || []).join("\n"))}>Paste titles</Button>
+        </div>
+      </div>
+      <p className="text-xs" style={{ color: BRAND.inkSoft }}>
+        New ideas are checked against <strong>{known}</strong> things you already have: {crawled} crawled pages{idx ? `, ${idx.posts.length} posts from your feed/sitemap` : ""}{pasted ? `, ${pasted} pasted titles` : ""} and your planner. The crawl only reaches the first {b.siteCrawl?.pages?.length || 30}-60 pages, so scan the blog to include older posts.
+      </p>
+      {idx && <p className="text-[11px] mt-1" style={{ color: BRAND.inkSoft }}>Last scanned {timeAgo(idx.scannedAt) || "just now"}: {idx.counts.wordpress} from the WordPress API, {idx.counts.feed} from feeds, {idx.counts.sitemap} from the sitemap (titles guessed from the URL).{idx.notes?.length ? ` ${idx.notes.join(" ")}` : ""}</p>}
+      <Modal open={paste !== null} onClose={() => setPaste(null)} title="Paste your existing titles" width={560}
+        footer={<><Button variant="outline" onClick={() => setPaste(null)}>Cancel</Button><Button onClick={savePaste}>Save titles</Button></>}>
+        <p className="text-xs mb-2" style={{ color: BRAND.inkSoft }}>For a blog hosted somewhere else (Medium, Substack, another site) or posts the scan can't reach. One title per line, up to 300.</p>
+        <TextArea rows={10} value={paste || ""} onChange={(e) => setPaste(e.target.value)} placeholder={"How to write schemes of work\nGrade 9 teacher checklist\n…"} />
+      </Modal>
     </Card>
   );
 }

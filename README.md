@@ -75,6 +75,7 @@ Optional environment variables:
 - `VR_GLOBAL_DAILY_AI_CALLS`: total LLM-spending calls per day across all visitors; over it, AI features return a "daily capacity" message.
 - `VR_GLOBAL_DAILY_CRAWLS`: total site crawls per day across all visitors.
 - `PAGESPEED_API_KEY`: optional Google API key (enable the "PageSpeed Insights API" in Google Cloud) for the Core Web Vitals check in SEO Audit. Without it Google applies a small shared free limit, so tests may fail with a quota message.
+- `VR_GLOBAL_DAILY_CONTENTINDEX`: total "Scan blog" runs per day across all visitors (reads a site's own feed and sitemap; no AI).
 - `VR_GLOBAL_DAILY_PAGESPEED`: total Core Web Vitals tests per day across all visitors.
 - `VR_GLOBAL_DAILY_SERP`: total live-search requests per day across all visitors (see Live search results below). Set this below your SerpApi allowance divided by 30.
 

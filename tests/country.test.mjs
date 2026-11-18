@@ -49,8 +49,8 @@ test("EVERY route that calls the LLM validates the country and puts the market b
 test("every client call to an AI route sends the country", () => {
   const src = readFileSync(new URL("../components/VertexRank.jsx", import.meta.url), "utf8");
   const calls = [...src.matchAll(/postJson\(\s*(?:"(\/api\/[a-z-]+)"|m\.url)[\s\S]*?\)\s*[;\n.]/g)];
-  // /api/pagespeed only measures a page with Google PageSpeed Insights: no LLM, so no target market to send.
-  const needing = calls.filter((m) => m[1] !== "/api/site-scan" && m[1] !== "/api/pagespeed");
+  // /api/pagespeed (Google PageSpeed Insights) and /api/site-content-index (reads the site's own feed/sitemap) use no LLM, so there is no target market to send.
+  const needing = calls.filter((m) => m[1] !== "/api/site-scan" && m[1] !== "/api/pagespeed" && m[1] !== "/api/site-content-index");
   assert.ok(needing.length >= 10);
   // The crawl-time module runner sends the validated market with both its quick (signals-only) and full request.
   for (const m of needing) {
