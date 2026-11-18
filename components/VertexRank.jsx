@@ -7,7 +7,7 @@ import {
   ChevronDown, ChevronLeft, ChevronRight, Loader2, AlertTriangle, CheckCircle2,
   RefreshCw, Wand2, Zap, Search,
   SlidersHorizontal, ArrowUpDown, Info, Sparkles, ChevronUp, Building2, Newspaper,
-  Podcast, Handshake, BookOpen, MapPin, Bot, Target, ShieldCheck, ListPlus, Copy, Download, Upload, GitPullRequest, Eye
+  Podcast, Handshake, BookOpen, MapPin, Bot, Target, ShieldCheck, ListPlus, Save, Copy, Download, Upload, GitPullRequest, Eye
 } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
 import { DataLabel } from "./DataLabel";
@@ -25,6 +25,7 @@ import { findSiteRank, sameSite, hostOf } from "../lib/serpMatch";
 import { slimCheck, upsertCheck, competitorProspects } from "../lib/serpInsights";
 import { buildFixInput, fixCacheKey } from "../lib/fixContext";
 import { buildCalendarInput } from "../lib/calendarContext";
+import { runLocalChecks, localIdeaFromArea, cleanProfile, parseAreas, EMPTY_PROFILE, LOCAL_CHECKLIST, checklistProgress, checklistMarkdown } from "../lib/localSeo";
 import { rate, weakVitals, fmtMetric, vitalsRec, upsertPageSpeed, METRIC_LABEL } from "../lib/pagespeed";
 import { refreshCandidates, thinPages, contentIdeaFromRefresh, fixRecForRefresh } from "../lib/contentRefresh";
 import { enrichQueries, filterQueries, queriesToCsv, queriesForPage, contentIdeaFromQuery, fixRecForQuery, QUERY_FILTERS } from "../lib/searchTools";
@@ -259,6 +260,7 @@ const NAV = [
   { id: "aeo", label: "AEO", icon: MessageCircleQuestion },
   { id: "geo", label: "GEO / AI Visibility", icon: RadarIcon },
   { id: "competitors", label: "Competitors", icon: Users },
+  { id: "local", label: "Local SEO", icon: MapPin },
   { id: "content", label: "Content Planner", icon: FileText },
   { id: "links", label: "Internal Links", icon: Link2 },
   { id: "backlinks", label: "Backlink Radar", icon: Rss },
@@ -312,6 +314,8 @@ function emptyBundle() {
     rejectedCompetitors: [], // competitors you deleted or dismissed: "Suggest with AI" never brings them back
     contentIdeas: [],
     rejectedIdeas: [], // content topics you deleted: regenerating never brings them back
+    localProfile: { ...EMPTY_PROFILE }, // business name/address/phone/offer/areas you typed in Local SEO
+    localChecklist: {}, // { [itemId]: { done, at } } the Google Business Profile / citations / reviews items you ticked
     pageSpeed: [], // Core Web Vitals results from Google PageSpeed Insights (lib/pagespeed.js)
     internalLinks: [],
     backlinks: [],
@@ -5545,6 +5549,143 @@ function InternalLinksView() {
 
 /* ============================== Backlink Radar ============================== */
 
+const LOCAL_STATUS = { pass: ["visibility", "visibilitySoft", "OK"], warn: ["amber", "amberSoft", "Check"], fail: ["red", "redSoft", "Missing"], info: ["inkSoft", "canvas", "Info"] };
+
+/** Local SEO: checks your own pages for name/address/phone consistency, LocalBusiness markup, a Maps link and a page per service area,
+ *  plus a checklist you tick by hand for what can't be read automatically (Google Business Profile, citations, reviews).
+ *  The logic and its limits live in lib/localSeo.js. */
+function LocalSeoView() {
+  const { websites, bundle, setBundles, currentWebsiteId, toast, addAction, setView } = useApp();
+  const b = bundle();
+  const saved = b.localProfile || EMPTY_PROFILE;
+  const [draft, setDraft] = useState(saved);
+  useEffect(() => { setDraft(b.localProfile || EMPTY_PROFILE); }, [currentWebsiteId]); // eslint-disable-line react-hooks/exhaustive-deps
+  const dirty = JSON.stringify(cleanProfile(draft)) !== JSON.stringify(cleanProfile(saved));
+  const result = useMemo(() => runLocalChecks(b.siteCrawl, saved), [b.siteCrawl, saved]);
+  const checklist = b.localChecklist || {};
+  const total = checklistProgress(checklist);
+  const set = (k) => (e) => setDraft((d) => ({ ...d, [k]: e.target.value }));
+  if (!currentWebsiteId) return <EmptyState icon={Globe2} title="Select a website" body="Choose a website from the top bar to run local SEO checks." />;
+
+  function siteUpdate(fn) { setBundles((prev) => { const site = prev[currentWebsiteId] || emptyBundle(); return { ...prev, [currentWebsiteId]: fn(site) }; }); }
+  function saveProfile() { siteUpdate((site) => ({ ...site, localProfile: cleanProfile(draft) })); toast("Business details saved"); }
+  function tick(id, done) { siteUpdate((site) => ({ ...site, localChecklist: { ...(site.localChecklist || {}), [id]: { done, at: new Date().toISOString() } } })); }
+  const inActions = (id) => b.actions.some((a) => a.detail?.sourceId === `local:${id}`);
+  function toAction(c) { addAction({ title: c.rec.title, type: c.rec.actionType, status: "New", detail: { sourceId: `local:${c.id}`, module: c.rec.module, evidence: c.rec.evidence, recommendedAction: c.rec.recommendedAction, priority: c.rec.priority, source: c.rec.source } }); toast("Added to Action Center"); }
+  const planned = (area) => { const kw = localIdeaFromArea(area, saved.offer, "x").primaryKeyword; return (b.contentIdeas || []).some((x) => x.primaryKeyword === kw); };
+  function planArea(area) {
+    if (planned(area)) return;
+    siteUpdate((site) => ({ ...site, contentIdeas: [...site.contentIdeas, localIdeaFromArea(area, saved.offer, uid("ci"), currentWebsiteId)] }));
+    toast("Added to the Content Planner. Open it to write a page that is genuinely about this area.");
+  }
+  const tone = (st) => { const [fg, bg] = LOCAL_STATUS[st] || LOCAL_STATUS.info; return { fg: BRAND[fg], bg: BRAND[bg] }; };
+  const counts = result.checks.reduce((m, c) => ({ ...m, [c.status]: (m[c.status] || 0) + 1 }), {});
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-4">
+        <div className="flex items-center gap-2 mb-1"><MapPin size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">Your business details</h3></div>
+        <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Type them exactly as they appear on your Google Business Profile. The checks below compare your website with what you enter here. Nothing is guessed and nothing leaves your workspace.</p>
+        <div className="grid sm:grid-cols-2 gap-x-4">
+          <Field label="Business name"><TextInput value={draft.name} onChange={set("name")} placeholder="e.g. Mwangi Plumbing Ltd" /></Field>
+          <Field label="Main phone number"><TextInput value={draft.phone} onChange={set("phone")} placeholder="e.g. +254 700 000 000" /></Field>
+        </div>
+        <Field label="Address"><TextInput value={draft.address} onChange={set("address")} placeholder="Street, area, city" /></Field>
+        <div className="grid sm:grid-cols-2 gap-x-4">
+          <Field label="What you offer (used to draft area pages)"><TextInput value={draft.offer} onChange={set("offer")} placeholder="e.g. plumbing services" /></Field>
+          <Field label="Areas or cities you serve (comma separated)"><TextInput value={draft.areas} onChange={set("areas")} placeholder="e.g. Nairobi, Thika, Kiambu" /></Field>
+        </div>
+        <Button icon={Save} disabled={!dirty} onClick={saveProfile}>{dirty ? "Save details" : "Saved"}</Button>
+      </Card>
+
+      {!b.siteCrawl ? (
+        <SiteCrawlGate body="The automatic local checks (name, address and phone on your pages, LocalBusiness markup, a Google Maps link and area pages) read your crawled pages. Run a site crawl first. The checklist below works without one." />
+      ) : (
+        <>
+          <Card className="p-4">
+            <div className="flex flex-wrap items-center gap-2 mb-1"><ListChecks size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">Checked from your website</h3><DataLabel kind="observed" title="Read from the pages in your last crawl.">Crawl (observed)</DataLabel>
+              {result.checks.length > 0 && <span className="text-xs" style={{ color: BRAND.inkSoft }}>{counts.pass || 0} OK · {counts.warn || 0} to check · {counts.fail || 0} missing</span>}</div>
+            {result.recrawl && <p className="text-xs mb-2 rounded-lg px-3 py-2" style={{ background: BRAND.amberSoft, color: BRAND.amber }}>Your last crawl is from before these checks existed, so phone numbers and footer text weren't recorded. Re-crawl your site (Websites) for complete results.</p>}
+            <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Only the footer, address blocks, the start of each page and your structured data are searched, so details placed elsewhere can be missed. These checks can't see your Google Business Profile or other websites.</p>
+            <div className="space-y-2">
+              {result.checks.map((c) => (
+                <div key={c.id} className="rounded-lg px-4 py-3" style={{ background: BRAND.canvas }}>
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2"><Badge color={tone(c.status)}>{LOCAL_STATUS[c.status][2]}</Badge><p className="text-sm font-medium">{c.title}</p></div>
+                      <p className="text-xs mt-1" style={{ color: BRAND.inkSoft }}>{c.detail}</p>
+                    </div>
+                    {c.rec && (
+                      <div className="flex flex-wrap gap-1 shrink-0">
+                        <GenerateFixButton variant="soft" rec={c.rec} />
+                        <Button size="sm" variant={inActions(c.id) ? "outline" : "soft"} icon={inActions(c.id) ? Check : ListPlus} disabled={inActions(c.id)} onClick={() => toAction(c)}>{inActions(c.id) ? "Added" : "Add to Action Center"}</Button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Card>
+
+          <Card className="p-4">
+            <div className="flex items-center gap-2 mb-1"><Globe2 size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">Pages for the areas you serve</h3></div>
+            {result.areas.length === 0 ? <p className="text-sm" style={{ color: BRAND.inkSoft }}>Add the areas or cities you serve above to see which have their own page.</p> : (
+              <>
+                <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>A page counts as dedicated when the area is in its URL, title or H1. Each area page should have genuinely local content, not another city's page with the name swapped.</p>
+                <div className="space-y-2">
+                  {result.areas.map((a) => (
+                    <div key={a.area} className="rounded-lg px-4 py-3 flex flex-wrap items-center justify-between gap-2" style={{ background: BRAND.canvas }}>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2"><Badge color={tone(a.status === "page" ? "pass" : a.status === "mention" ? "warn" : "fail")}>{a.status === "page" ? "Has a page" : a.status === "mention" ? "Mentioned only" : "No page"}</Badge><p className="text-sm font-medium">{a.area}</p></div>
+                        {a.urls.length > 0 && <p className="text-[11px] mt-1 break-all" style={{ color: BRAND.inkSoft }}>{a.urls.map((u) => { try { const x = new URL(u); return x.pathname + x.search || "/"; } catch { return u; } }).join(", ")}</p>}
+                      </div>
+                      {a.status !== "page" && <Button size="sm" variant={planned(a.area) ? "outline" : "soft"} icon={planned(a.area) ? Check : Plus} disabled={planned(a.area)} onClick={() => planArea(a.area)}>{planned(a.area) ? "In planner" : "Plan a page"}</Button>}
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </Card>
+        </>
+      )}
+
+      <Card className="p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
+          <div className="flex items-center gap-2"><ClipboardCheck size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">Checklist you tick yourself</h3><span className="text-xs" style={{ color: BRAND.inkSoft }}>{total.done} of {total.total} done</span></div>
+          <CopyButton label="Copy checklist" variant="soft" getText={() => checklistMarkdown(checklist)} />
+        </div>
+        <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>VertexRank can't read your Google Business Profile, other websites' listings or your reviews, so these are yours to tick off. Your ticks are saved with this website.</p>
+        <div className="space-y-4">
+          {LOCAL_CHECKLIST.map((g) => {
+            const pr = checklistProgress(checklist, g.id);
+            return (
+              <div key={g.id}>
+                <div className="flex items-center justify-between gap-2 mb-1"><p className="text-sm font-semibold">{g.title}</p><span className="text-xs vr-mono" style={{ color: BRAND.inkSoft }}>{pr.done}/{pr.total}</span></div>
+                <div className="h-1.5 rounded-full mb-2" style={{ background: BRAND.line }}><div className="h-1.5 rounded-full" style={{ width: `${(pr.done / pr.total) * 100}%`, background: BRAND.visibility }} /></div>
+                <p className="text-xs mb-2" style={{ color: BRAND.inkSoft }}>{g.intro}</p>
+                <ul className="space-y-1.5">
+                  {g.items.map((i) => {
+                    const done = !!checklist[i.id]?.done;
+                    return (
+                      <li key={i.id} className="flex items-start gap-2.5 rounded-lg px-3 py-2" style={{ background: BRAND.canvas }}>
+                        <input type="checkbox" className="mt-1" id={`lc_${i.id}`} checked={done} onChange={(e) => tick(i.id, e.target.checked)} />
+                        <label htmlFor={`lc_${i.id}`} className="min-w-0 cursor-pointer">
+                          <span className="text-sm block" style={{ textDecoration: done ? "line-through" : "none", color: done ? BRAND.inkSoft : BRAND.ink }}>{i.text}</span>
+                          <span className="text-[11px] block" style={{ color: BRAND.inkSoft }}>{i.how}</span>
+                        </label>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
 function BacklinksView() {
   const { bundle, setBundles, currentWebsiteId, toast } = useApp();
   const b = bundle();
@@ -5839,7 +5980,7 @@ function VertexRankApp() {
 
   const views = {
     dashboard: Dashboard, opportunities: OpportunitiesView, search: SearchDataView, scanner: ScannerView, audit: AuditView, actions: ActionCenter, keywords: KeywordsView,
-    aeo: AeoView, geo: GeoView, competitors: CompetitorsView, content: ContentPlannerView, links: InternalLinksView, backlinks: BacklinksView,
+    aeo: AeoView, geo: GeoView, competitors: CompetitorsView, local: LocalSeoView, content: ContentPlannerView, links: InternalLinksView, backlinks: BacklinksView,
   };
   const ViewComp = views[view] || Dashboard;
 
