@@ -25,6 +25,9 @@ import { findSiteRank, sameSite, hostOf } from "../lib/serpMatch";
 import { slimCheck, upsertCheck, competitorProspects } from "../lib/serpInsights";
 import { buildFixInput, fixCacheKey } from "../lib/fixContext";
 import { buildCalendarInput } from "../lib/calendarContext";
+import { evaluatePlaybook } from "../lib/playbook";
+import { buildReportData, cleanReportSettings, REPORT_SECTIONS, DEFAULT_REPORT_SETTINGS } from "../lib/clientReport";
+import { renderReportHtml } from "../lib/reportHtml";
 import { buildCoverageIndex, existingTitlesFor, splitCovered, relayDays, refreshCandidateFor } from "../lib/contentCoverage";
 import { runLocalChecks, localIdeaFromArea, cleanProfile, parseAreas, EMPTY_PROFILE, LOCAL_CHECKLIST, checklistProgress, checklistMarkdown } from "../lib/localSeo";
 import { rate, weakVitals, fmtMetric, vitalsRec, upsertPageSpeed, METRIC_LABEL } from "../lib/pagespeed";
@@ -262,6 +265,7 @@ const NAV = [
   { id: "geo", label: "GEO / AI Visibility", icon: RadarIcon },
   { id: "competitors", label: "Competitors", icon: Users },
   { id: "local", label: "Local SEO", icon: MapPin },
+  { id: "report", label: "Client Report", icon: FileText },
   { id: "content", label: "Content Planner", icon: FileText },
   { id: "links", label: "Internal Links", icon: Link2 },
   { id: "backlinks", label: "Backlink Radar", icon: Rss },
@@ -315,6 +319,8 @@ function emptyBundle() {
     rejectedCompetitors: [], // competitors you deleted or dismissed: "Suggest with AI" never brings them back
     contentIdeas: [],
     rejectedIdeas: [], // content topics you deleted: regenerating never brings them back
+    playbookMarks: {}, // { [itemId]: "done" | "na" } the Playbook items you ticked or marked not applicable
+    reportSettings: { ...DEFAULT_REPORT_SETTINGS }, // Client Report: prepared by, client name, notes, sections
     contentIndex: null, // posts read from the site feed/sitemap { posts, counts, notes, scannedAt } (lib/contentIndex.js)
     pastedTitles: [], // existing titles you pasted by hand (blogs hosted elsewhere)
     localProfile: { ...EMPTY_PROFILE }, // business name/address/phone/offer/areas you typed in Local SEO
@@ -1191,6 +1197,8 @@ function Dashboard() {
           </div>
         </div>
       </Card>
+
+      <PlaybookScorecard />
 
       <Card className="p-5">
         <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
@@ -5780,6 +5788,117 @@ function LocalSeoView() {
   );
 }
 
+const PB_STATUS = { pass: ["visibility", "visibilitySoft", "Good"], warn: ["amber", "amberSoft", "Partly"], fail: ["red", "redSoft", "Fix"], todo: ["inkSoft", "canvas", "To do"], unknown: ["inkSoft", "canvas", "Not measured"], na: ["inkSoft", "canvas", "N/A"] };
+
+/** The 2026 SEO Playbook as a scorecard: 57 items in six groups, each checked from your data or ticked by you. See lib/playbook.js. */
+function PlaybookScorecard() {
+  const { websites, bundle, setBundles, currentWebsiteId, setView } = useApp();
+  const b = bundle();
+  const country = normalizeCountry(websites.find((w) => w.id === currentWebsiteId)?.country);
+  const pb = useMemo(() => evaluatePlaybook(b, { country }), [b.siteCrawl, b.gscReport, b.pageSpeed, b.localProfile, b.localChecklist, b.playbookMarks, b.keywords, b.siteKeywordClusters, b.backlinks, b.competitors, b.serpChecks, country]); // eslint-disable-line react-hooks/exhaustive-deps
+  const [open, setOpen] = useState(null);
+  const mark = (id, value) => setBundles((prev) => { const site = prev[currentWebsiteId]; if (!site) return prev; const m = { ...(site.playbookMarks || {}) }; if (value) m[id] = value; else delete m[id]; return { ...prev, [currentWebsiteId]: { ...site, playbookMarks: m } }; });
+  const tone = (st) => { const [fg, bg] = PB_STATUS[st] || PB_STATUS.unknown; return { fg: BRAND[fg], bg: BRAND[bg] }; };
+  const bar = (v) => (v === null ? BRAND.line : v >= 75 ? BRAND.visibility : v >= 45 ? BRAND.amber : BRAND.red);
+  return (
+    <Card className="p-5">
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-1">
+        <div className="flex items-center gap-2"><ListChecks size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">2026 SEO Playbook scorecard</h3></div>
+        <div className="flex items-center gap-2"><span className="text-xs" style={{ color: BRAND.inkSoft }}>{pb.overall.measured} of {pb.overall.total} items measured</span><span className="vr-mono text-lg font-semibold" style={{ color: bar(pb.overall.score) }}>{pb.overall.score === null ? "–" : `${pb.overall.score}%`}</span></div>
+      </div>
+      <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Every item from the playbook, checked from your crawl, Search Console, page speed tests and Local SEO data, or ticked by you where it can't be measured. Items that can't be measured yet are left out of the score, not counted as good or bad.</p>
+      <div className="space-y-1.5">
+        {pb.groups.map((g) => (
+          <div key={g.id} className="rounded-lg" style={{ background: BRAND.canvas }}>
+            <button type="button" className="vr-focus w-full flex items-center gap-3 px-4 py-2.5 text-left" aria-expanded={open === g.id} onClick={() => setOpen(open === g.id ? null : g.id)}>
+              <span className="text-sm font-medium w-32 shrink-0">{g.title}</span>
+              <span className="flex-1 h-2 rounded-full" style={{ background: BRAND.line }}><span className="block h-2 rounded-full" style={{ width: `${g.score ?? 0}%`, background: bar(g.score) }} /></span>
+              <span className="vr-mono text-sm w-12 text-right">{g.score === null ? "–" : `${g.score}%`}</span>
+              <span className="text-[11px] w-24 text-right hidden sm:block" style={{ color: BRAND.inkSoft }}>{g.measured}/{g.total} measured</span>
+              {open === g.id ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+            </button>
+            {open === g.id && (
+              <ul className="px-4 pb-3 space-y-1.5">
+                {g.items.map((i) => (
+                  <li key={i.id} className="flex flex-wrap items-start gap-x-3 gap-y-1 rounded-lg px-3 py-2" style={{ background: BRAND.surface || "#fff" }}>
+                    <Badge color={tone(i.status)}>{PB_STATUS[i.status][2]}</Badge>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm" style={{ textDecoration: i.status === "na" ? "line-through" : "none" }}>{i.text}</p>
+                      <p className="text-[11px]" style={{ color: BRAND.inkSoft }}>{i.detail}</p>
+                    </div>
+                    <div className="flex items-center gap-2 text-xs shrink-0">
+                      {!i.auto && i.status !== "na" && <label className="flex items-center gap-1 cursor-pointer"><input type="checkbox" checked={i.status === "pass"} onChange={(e) => mark(i.id, e.target.checked ? "done" : null)} />Done</label>}
+                      {i.status === "na" ? <button type="button" className="vr-focus underline" onClick={() => mark(i.id, null)}>Undo N/A</button> : <button type="button" className="vr-focus underline" style={{ color: BRAND.inkSoft }} onClick={() => mark(i.id, "na")}>N/A</button>}
+                      {i.auto && i.status !== "pass" && i.status !== "na" && <button type="button" className="vr-focus underline" style={{ color: BRAND.primary }} onClick={() => setView(i.view)}>Open</button>}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+/** Client-ready report: pick what to include, add your name and a note, then save it as a PDF (the browser's print dialog) or
+ *  download it as one HTML file. The report itself is built by lib/clientReport.js and lib/reportHtml.js. */
+function ClientReportView() {
+  const { websites, bundle, setBundles, currentWebsiteId, toast } = useApp();
+  const b = bundle();
+  const site = websites.find((w) => w.id === currentWebsiteId);
+  const [draft, setDraft] = useState(() => cleanReportSettings(b.reportSettings));
+  useEffect(() => { setDraft(cleanReportSettings(b.reportSettings)); }, [currentWebsiteId]); // eslint-disable-line react-hooks/exhaustive-deps
+  const frame = useRef(null);
+  const country = normalizeCountry(site?.country);
+  const html = useMemo(() => renderReportHtml(buildReportData(b, { url: site?.url, name: site?.name }, { country, settings: draft })), [b, site, country, draft]);
+  if (!currentWebsiteId) return <EmptyState icon={Globe2} title="Select a website" body="Choose a website from the top bar to build its report." />;
+  const dirty = JSON.stringify(cleanReportSettings(draft)) !== JSON.stringify(cleanReportSettings(b.reportSettings));
+  const set = (k) => (e) => setDraft((d) => ({ ...d, [k]: e.target.value }));
+  const toggle = (id) => setDraft((d) => ({ ...d, sections: { ...d.sections, [id]: !d.sections[id] } }));
+  function save() { setBundles((prev) => { const s = prev[currentWebsiteId]; return s ? { ...prev, [currentWebsiteId]: { ...s, reportSettings: cleanReportSettings(draft) } } : prev; }); toast("Report settings saved"); }
+  function printPdf() {
+    const w = frame.current?.contentWindow;
+    if (!w) return;
+    w.focus(); w.print(); // in the print dialog choose "Save as PDF" as the destination
+  }
+  function downloadHtml() {
+    const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `seo-report-${String(site?.url || "site").replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase()}-${new Date().toISOString().slice(0, 10)}.html`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  return (
+    <div className="space-y-4">
+      <Card className="p-4">
+        <div className="flex items-center gap-2 mb-1"><FileText size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">Client report</h3></div>
+        <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Built only from data already in VertexRank (crawl, Search Console, page speed, planner, Local SEO). Sections with no data say so rather than showing made-up numbers. Review the preview before sending it.</p>
+        <div className="grid sm:grid-cols-2 gap-x-4">
+          <Field label="Prepared by (your name or agency)"><TextInput value={draft.preparedBy} onChange={set("preparedBy")} placeholder="e.g. Acme Digital" /></Field>
+          <Field label="Prepared for (client name)"><TextInput value={draft.clientName} onChange={set("clientName")} placeholder="e.g. Mwangi Plumbing" /></Field>
+        </div>
+        <Field label="Note at the top (optional)"><TextArea rows={3} value={draft.notes} onChange={set("notes")} placeholder="A short summary or context for the reader" /></Field>
+        <p className="text-xs font-semibold mb-1.5" style={{ color: BRAND.inkSoft }}>Include</p>
+        <div className="flex flex-wrap gap-x-4 gap-y-1.5 mb-3">
+          {REPORT_SECTIONS.map((x) => <label key={x.id} className="flex items-center gap-1.5 text-sm cursor-pointer"><input type="checkbox" checked={draft.sections[x.id] !== false} onChange={() => toggle(x.id)} />{x.label}</label>)}
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button icon={Download} onClick={printPdf}>Save as PDF</Button>
+          <Button variant="outline" icon={Download} onClick={downloadHtml}>Download HTML</Button>
+          <Button variant="outline" icon={Save} disabled={!dirty} onClick={save}>{dirty ? "Save settings" : "Settings saved"}</Button>
+        </div>
+        <p className="text-[11px] mt-2" style={{ color: BRAND.inkSoft }}>Save as PDF opens your browser's print dialog: choose "Save as PDF" as the destination. Turn on "Background graphics" if colours look missing.</p>
+      </Card>
+      <Card className="p-2">
+        <iframe ref={frame} title="Report preview" srcDoc={html} className="w-full rounded" style={{ height: 760, border: `1px solid ${BRAND.line}`, background: "#fff" }} />
+      </Card>
+    </div>
+  );
+}
+
 function BacklinksView() {
   const { bundle, setBundles, currentWebsiteId, toast } = useApp();
   const b = bundle();
@@ -6074,7 +6193,7 @@ function VertexRankApp() {
 
   const views = {
     dashboard: Dashboard, opportunities: OpportunitiesView, search: SearchDataView, scanner: ScannerView, audit: AuditView, actions: ActionCenter, keywords: KeywordsView,
-    aeo: AeoView, geo: GeoView, competitors: CompetitorsView, local: LocalSeoView, content: ContentPlannerView, links: InternalLinksView, backlinks: BacklinksView,
+    aeo: AeoView, geo: GeoView, competitors: CompetitorsView, local: LocalSeoView, report: ClientReportView, content: ContentPlannerView, links: InternalLinksView, backlinks: BacklinksView,
   };
   const ViewComp = views[view] || Dashboard;
 
