@@ -7,7 +7,7 @@ import {
   ChevronDown, ChevronLeft, ChevronRight, Loader2, AlertTriangle, CheckCircle2,
   RefreshCw, Wand2, Zap, Search,
   SlidersHorizontal, ArrowUpDown, Info, Sparkles, ChevronUp, Building2, Newspaper,
-  Podcast, Handshake, BookOpen, MapPin, Bot, Target, ShieldCheck, ListPlus, Save, Copy, Download, Upload, GitPullRequest, Eye
+  Podcast, Handshake, BookOpen, MapPin, Bot, Target, ShieldCheck, ListPlus, Save, Code2, Copy, Download, Upload, GitPullRequest, Eye
 } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
 import { DataLabel } from "./DataLabel";
@@ -25,6 +25,7 @@ import { findSiteRank, sameSite, hostOf } from "../lib/serpMatch";
 import { slimCheck, upsertCheck, competitorProspects } from "../lib/serpInsights";
 import { buildFixInput, fixCacheKey } from "../lib/fixContext";
 import { buildCalendarInput } from "../lib/calendarContext";
+import { SCHEMA_TYPES, DAYS, emptyLocalSchema, cleanLocalSchema, prefillFromCrawl, buildLocalBusinessJsonLd, jsonLdScript } from "../lib/localSchema";
 import { evaluatePlaybook } from "../lib/playbook";
 import { buildReportData, cleanReportSettings, REPORT_SECTIONS, DEFAULT_REPORT_SETTINGS } from "../lib/clientReport";
 import { renderReportHtml } from "../lib/reportHtml";
@@ -323,6 +324,7 @@ function emptyBundle() {
     reportSettings: { ...DEFAULT_REPORT_SETTINGS }, // Client Report: prepared by, client name, notes, sections
     contentIndex: null, // posts read from the site feed/sitemap { posts, counts, notes, scannedAt } (lib/contentIndex.js)
     pastedTitles: [], // existing titles you pasted by hand (blogs hosted elsewhere)
+    localSchema: emptyLocalSchema(), // LocalBusiness JSON-LD form fields (lib/localSchema.js)
     localProfile: { ...EMPTY_PROFILE }, // business name/address/phone/offer/areas you typed in Local SEO
     localChecklist: {}, // { [itemId]: { done, at } } the Google Business Profile / citations / reviews items you ticked
     pageSpeed: [], // Core Web Vitals results from Google PageSpeed Insights (lib/pagespeed.js)
@@ -5700,6 +5702,8 @@ function LocalSeoView() {
         <Button icon={Save} disabled={!dirty} onClick={saveProfile}>{dirty ? "Save details" : "Saved"}</Button>
       </Card>
 
+      <LocalSchemaCard profile={draft} />
+
       {!b.siteCrawl ? (
         <SiteCrawlGate body="The automatic local checks (name, address and phone on your pages, LocalBusiness markup, a Google Maps link and area pages) read your crawled pages. Run a site crawl first. The checklist below works without one." />
       ) : (
@@ -5896,6 +5900,101 @@ function ClientReportView() {
         <iframe ref={frame} title="Report preview" srcDoc={html} className="w-full rounded" style={{ height: 760, border: `1px solid ${BRAND.line}`, background: "#fff" }} />
       </Card>
     </div>
+  );
+}
+
+const SCHEMA_LEVEL = { error: ["red", "redSoft", "Fix"], warn: ["amber", "amberSoft", "Add"], tip: ["inkSoft", "canvas", "Tip"] };
+
+/** Builds ready-to-paste LocalBusiness JSON-LD from the business details above plus a few extra fields. Only what you enter is used;
+ *  nothing is guessed. The logic and its rules are in lib/localSchema.js. */
+function LocalSchemaCard({ profile }) {
+  const { websites, bundle, setBundles, currentWebsiteId, toast } = useApp();
+  const b = bundle();
+  const saved = useMemo(() => cleanLocalSchema(b.localSchema), [b.localSchema]);
+  const [draft, setDraft] = useState(saved);
+  useEffect(() => { setDraft(saved); }, [currentWebsiteId]); // eslint-disable-line react-hooks/exhaustive-deps
+  const site = websites.find((w) => w.id === currentWebsiteId);
+  const siteUrl = useMemo(() => {
+    try { if (b.siteCrawl?.startUrl) return new URL(b.siteCrawl.startUrl).origin; } catch { /* fall through */ }
+    const host = String(site?.url || "").replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+    return host ? `https://${host}` : "";
+  }, [b.siteCrawl, site]);
+  const out = useMemo(() => buildLocalBusinessJsonLd(profile, draft, { siteUrl }), [profile, draft, siteUrl]);
+  const code = useMemo(() => jsonLdScript(out.jsonLd), [out]);
+  const existing = useMemo(() => prefillFromCrawl(b.siteCrawl), [b.siteCrawl]);
+  const dirty = JSON.stringify(cleanLocalSchema(draft)) !== JSON.stringify(saved);
+  const set = (k) => (e) => setDraft((d) => ({ ...d, [k]: e.target.value }));
+  const setHour = (k, field, value) => setDraft((d) => ({ ...d, hours: { ...d.hours, [k]: { ...d.hours[k], [field]: value } } }));
+  const tone = (lv) => { const [fg, bg] = SCHEMA_LEVEL[lv]; return { fg: BRAND[fg], bg: BRAND[bg] }; };
+  function save() { setBundles((prev) => { const st = prev[currentWebsiteId]; return st ? { ...prev, [currentWebsiteId]: { ...st, localSchema: cleanLocalSchema(draft) } } : prev; }); toast("Schema details saved"); }
+  function fillFromSite() { setDraft((d) => { const n = { ...d }; for (const [k, v] of Object.entries(existing.fields)) if (!n[k] || (k === "type" && n.type === "LocalBusiness")) n[k] = v; return n; }); toast("Filled empty fields from your site's existing markup. Check them."); }
+  function useAddressLine() { setDraft((d) => ({ ...d, street: cleanProfile(profile).address })); }
+  const errors = out.issues.filter((i) => i.level === "error").length;
+
+  return (
+    <Card className="p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
+        <div className="flex items-center gap-2"><Code2 size={16} style={{ color: BRAND.primary }} /><h3 className="font-semibold vr-display">LocalBusiness schema generator</h3></div>
+        <Badge color={out.ready ? { fg: BRAND.visibility, bg: BRAND.visibilitySoft } : { fg: BRAND.red, bg: BRAND.redSoft }}>{out.ready ? "Ready to publish" : `${errors} to fix first`}</Badge>
+      </div>
+      <p className="text-xs mb-3" style={{ color: BRAND.inkSoft }}>Structured data states your business name, address, phone and hours in a form search engines read directly. It's built only from what you enter here and in "Your business details" above, and it must match what visitors can see on the page and in your Google Business Profile.</p>
+      {existing.found && <div className="rounded-lg px-3 py-2 mb-3 text-xs flex flex-wrap items-center justify-between gap-2" style={{ background: BRAND.canvas }}><span>Your site already has LocalBusiness markup{existing.name ? ` for "${existing.name}"` : ""}. Fill the empty fields from it to save retyping, then check them.</span><Button size="sm" variant="soft" onClick={fillFromSite}>Fill from my site</Button></div>}
+
+      <div className="grid sm:grid-cols-2 gap-x-4">
+        <Field label="Business type"><Select value={draft.type} onChange={set("type")}>{SCHEMA_TYPES.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</Select></Field>
+        <Field label="Price range (optional)"><TextInput value={draft.priceRange} onChange={set("priceRange")} placeholder="e.g. $$ or KES 500-5,000" /></Field>
+      </div>
+      <Field label="Street address"><div className="flex gap-2"><TextInput value={draft.street} onChange={set("street")} placeholder="e.g. 12 Kenyatta Avenue" />{cleanProfile(profile).address && !draft.street && <Button size="sm" variant="outline" onClick={useAddressLine} title="Copy your single address line here, then trim it to just the street">Use my address line</Button>}</div></Field>
+      <div className="grid sm:grid-cols-4 gap-x-3">
+        <Field label="City / town"><TextInput value={draft.locality} onChange={set("locality")} /></Field>
+        <Field label="Region / county"><TextInput value={draft.region} onChange={set("region")} /></Field>
+        <Field label="Postal code"><TextInput value={draft.postalCode} onChange={set("postalCode")} /></Field>
+        <Field label="Country (2 letters)"><TextInput value={draft.country} onChange={set("country")} placeholder="KE" /></Field>
+      </div>
+      <div className="grid sm:grid-cols-2 gap-x-4">
+        <Field label="Public email (optional)"><TextInput value={draft.email} onChange={set("email")} placeholder="hello@yourbusiness.com" /></Field>
+        <Field label="Google Maps link (optional)"><TextInput value={draft.mapUrl} onChange={set("mapUrl")} placeholder="https://maps.app.goo.gl/…" /></Field>
+        <Field label="Photo link (a real photo of your business)"><TextInput value={draft.image} onChange={set("image")} placeholder="https://yoursite.com/photo.jpg" /></Field>
+        <Field label="Logo link (optional)"><TextInput value={draft.logo} onChange={set("logo")} placeholder="https://yoursite.com/logo.png" /></Field>
+        <Field label="Latitude (optional)"><TextInput value={draft.lat} onChange={set("lat")} placeholder="-1.2864" /></Field>
+        <Field label="Longitude (optional)"><TextInput value={draft.lng} onChange={set("lng")} placeholder="36.8172" /></Field>
+      </div>
+      <Field label="Short description (optional, one or two sentences)"><TextArea rows={2} value={draft.description} onChange={set("description")} /></Field>
+      <Field label="Your real profiles, one link per line (Facebook, Instagram, LinkedIn, Google Business Profile…)"><TextArea rows={3} value={draft.sameAs} onChange={set("sameAs")} placeholder={"https://www.facebook.com/yourbusiness\nhttps://www.instagram.com/yourbusiness"} /></Field>
+
+      <p className="text-xs font-semibold mb-1.5" style={{ color: BRAND.inkSoft }}>Opening hours (24-hour time; leave a day blank or tick Closed if you're not open)</p>
+      <div className="space-y-1 mb-3">
+        {DAYS.map(([k, label]) => (
+          <div key={k} className="flex flex-wrap items-center gap-2 text-sm">
+            <span className="w-24">{label}</span>
+            <input type="time" aria-label={`${label} opens`} value={draft.hours[k].open} disabled={draft.hours[k].closed} onChange={(e) => setHour(k, "open", e.target.value)} className="rounded border px-2 py-1 text-sm" style={{ borderColor: BRAND.line }} />
+            <span style={{ color: BRAND.inkSoft }}>to</span>
+            <input type="time" aria-label={`${label} closes`} value={draft.hours[k].close} disabled={draft.hours[k].closed} onChange={(e) => setHour(k, "close", e.target.value)} className="rounded border px-2 py-1 text-sm" style={{ borderColor: BRAND.line }} />
+            <label className="flex items-center gap-1 text-xs cursor-pointer"><input type="checkbox" checked={draft.hours[k].closed} onChange={(e) => setHour(k, "closed", e.target.checked)} />Closed</label>
+          </div>
+        ))}
+      </div>
+
+      {out.issues.length > 0 && (
+        <ul className="space-y-1 mb-3">
+          {out.issues.map((i, n) => <li key={n} className="flex items-start gap-2 text-xs"><Badge color={tone(i.level)}>{SCHEMA_LEVEL[i.level][2]}</Badge><span className="min-w-0">{i.text}</span></li>)}
+        </ul>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2 mb-2">
+        <CopyButton label="Copy code" variant="soft" getText={() => code} />
+        <Button size="sm" variant="outline" icon={Save} disabled={!dirty} onClick={save}>{dirty ? "Save these details" : "Saved"}</Button>
+      </div>
+      <pre className="text-[11px] rounded-lg p-3 overflow-x-auto max-h-80 vr-mono" style={{ background: BRAND.canvas }}>{code}</pre>
+      <div className="text-xs mt-3 space-y-1" style={{ color: BRAND.inkSoft }}>
+        <p className="font-semibold">How to add it</p>
+        <ol className="list-decimal pl-4 space-y-0.5">
+          <li>Paste the whole block into the HTML of your homepage (or contact page), inside the &lt;head&gt; or just before &lt;/body&gt;. On WordPress, a header/footer code plugin does this without editing theme files.</li>
+          <li>Use it once per page, and make sure the name, address, phone and hours are the same as on the page and in your Google Business Profile.</li>
+          <li>Test it with Google's Rich Results Test, publish, then re-crawl your site here. The "LocalBusiness structured data" check below will confirm it.</li>
+        </ol>
+      </div>
+    </Card>
   );
 }
 
